@@ -1,0 +1,149 @@
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include <stdint.h>
+#include <cstdint>
+#include "api/dataflow/dataflow_api.h"
+#include "api/dataflow/noc.h"
+#include "api/dataflow/dataflow_buffer.h"
+#include "api/dataflow/endpoints.h"
+#include "api/core_local_mem.h"
+#include "api/tensor/noc_traits.h"
+#include "experimental/kernel_args.h"
+#if !defined(ARCH_QUASAR)
+// ckernel::load_blocking (the store drain below) is WH/BH only: Quasar's ckernel.h has no load_blocking,
+// and from a data-movement build it #errors unless COMPILE_FOR_TRISC is defined. The Quasar branch uses a
+// fence instead. Same guard as data_movement/common/kernels/common.hpp.
+#include "ckernel.h"
+#endif
+
+template <typename DFB>
+inline __attribute__((always_inline)) void fill_pad_dfb_with_val(
+    Noc& noc, DFB& dfb, const uint32_t num_bytes_risc, uint32_t num_noc_transfer, const uint32_t val) {
+    volatile tt_l1_ptr uint32_t* ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(dfb.get_write_ptr());
+
+    const uint32_t num_words = (num_bytes_risc + sizeof(uint32_t) - 1) / sizeof(uint32_t);
+    for (uint32_t i = 0; i < num_words; ++i) {
+        ptr[i] = val;
+    }
+    // The seed above is baby-RISCV stores and the loop-back noc.async_read below uses it as its source.
+    // A store can retire before its write-request lands in L1, and the RISCV core and the NoC are
+    // different L1 clients with no program-order guarantee between them
+    // (WormholeB0/TensixTile/BabyRISCV/MemoryOrdering.md). Read back the last seeded word so the seed
+    // is processed before the first loop-back read is issued. Same guard as the interleaved reader of
+    // this op (reader_pad_dims_rm_interleaved_v2.cpp) and #50374.
+#if defined(ARCH_QUASAR)
+    // Quasar DM: get_write_ptr() is the uncached alias, so the seed already targets TL1; the fence orders
+    // those stores before the loop-back read. Same as tt_memmove in data_movement/common/kernels/common.hpp.
+    __asm__ __volatile__("fence" ::: "memory");
+#else
+    if (num_words > 0) {
+        (void)ckernel::load_blocking(ptr + num_words - 1);
+    }
+#endif
+
+    uint32_t pad_val_addr = dfb.get_write_ptr();
+    uint32_t l1_write_addr = pad_val_addr;
+
+    for (uint32_t i = 0; i < num_noc_transfer; ++i) {
+        CoreLocalMem<uint32_t> dst(l1_write_addr);
+        noc.async_read(
+            UnicastEndpoint{},
+            dst,
+            num_bytes_risc,
+            {.noc_x = (uint32_t)my_x[noc.get_noc_id()],
+             .noc_y = (uint32_t)my_y[noc.get_noc_id()],
+             .addr = pad_val_addr},
+            {.offset_bytes = 0});
+        l1_write_addr += num_bytes_risc;
+    }
+    noc.async_read_barrier();
+}
+
+template <typename DFB>
+inline __attribute__((always_inline)) void fill_pad_dfb_with_zero(
+    Noc& noc, DFB& dfb, const uint32_t num_bytes_risc, uint32_t num_noc_transfer) {
+    noc.async_write_zeros(dfb, num_bytes_risc * num_noc_transfer);
+    noc.write_zeros_l1_barrier();
+}
+
+void kernel_main() {
+    auto num_sticks_per_core = get_arg(args::num_sticks_per_core);
+    auto start_id = get_arg(args::start_id);
+    auto front_pad_n = get_arg(args::front_pad_n);
+    auto front_pad_c = get_arg(args::front_pad_c);
+    auto front_pad_h = get_arg(args::front_pad_h);
+
+    constexpr auto N = get_arg(args::N);
+    constexpr auto H = get_arg(args::H);
+    constexpr auto C = get_arg(args::C);
+    constexpr auto stick_size_bytes = get_arg(args::stick_size_bytes);
+    constexpr auto N_padded = get_arg(args::N_padded);
+    constexpr auto H_padded = get_arg(args::H_padded);
+    constexpr auto C_padded = get_arg(args::C_padded);
+    constexpr auto num_zero_pad_sticks_read = get_arg(args::num_zero_pad_sticks_read);
+    constexpr auto zero_pad_stick_size = get_arg(args::zero_pad_stick_size);
+
+    constexpr bool not_pad_by_zero = get_arg(args::not_pad_by_zero) == 1;
+    uint32_t packed_pad_value = 0;
+    uint32_t row_major_min_bytes = 0;
+    uint32_t num_sticks_padded_read = 0;
+    if constexpr (not_pad_by_zero) {
+        packed_pad_value = get_arg(args::packed_pad_value);
+        row_major_min_bytes = get_arg(args::row_major_min_bytes);
+        num_sticks_padded_read = get_arg(args::num_sticks_padded_read);
+    }
+
+    DataflowBuffer dfb_pad_exp(dfb::pad);
+    DataflowBuffer dfb_out0_exp(dfb::out_shard);
+
+    Noc noc;
+
+    const uint32_t pad_val_addr = dfb_pad_exp.get_read_ptr();
+
+    if constexpr (not_pad_by_zero) {
+        fill_pad_dfb_with_val(noc, dfb_pad_exp, row_major_min_bytes, num_sticks_padded_read, packed_pad_value);
+    } else {
+        fill_pad_dfb_with_zero(noc, dfb_pad_exp, zero_pad_stick_size, num_zero_pad_sticks_read);
+    }
+
+    uint32_t l1_write_addr = dfb_out0_exp.get_write_ptr();
+
+    uint32_t i_stick = start_id;
+    uint32_t curr_c = get_arg(args::start_dim_offset_c), curr_h = get_arg(args::start_dim_offset_h),
+             curr_n = get_arg(args::start_dim_offset_n);
+    for (uint32_t iter = 0; iter < num_sticks_per_core; ++iter) {
+        bool read_stick = (curr_h >= front_pad_h and curr_h < H) and (curr_c >= front_pad_c and curr_c < C) and
+                          (curr_n >= front_pad_n and curr_n < N);
+
+        if (read_stick) {
+            l1_write_addr += stick_size_bytes;
+            i_stick++;
+
+        } else {
+            CoreLocalMem<uint32_t> dst(l1_write_addr);
+            noc.async_read(
+                UnicastEndpoint{},
+                dst,
+                stick_size_bytes,
+                {.noc_x = (uint32_t)my_x[noc.get_noc_id()],
+                 .noc_y = (uint32_t)my_y[noc.get_noc_id()],
+                 .addr = pad_val_addr},
+                {.offset_bytes = 0});
+            l1_write_addr += stick_size_bytes;
+        }
+
+        curr_h++;
+        if (curr_h == H_padded) {
+            curr_c++;
+            curr_h = 0;
+            if (curr_c == C_padded) {
+                curr_n++;
+                curr_c = 0;
+            }
+        }
+    }
+
+    noc.async_read_barrier();
+}

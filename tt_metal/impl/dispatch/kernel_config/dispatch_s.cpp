@@ -1,0 +1,489 @@
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+#include "dispatch_s.hpp"
+
+#include <algorithm>
+#include <span>
+#include <tt_metal.hpp>
+#include "impl/buffers/semaphore.hpp"
+#include <tt-metalium/host_api.hpp>
+#include <tt-metalium/kernel_types.hpp>
+#include <map>
+#include <string>
+#include <variant>
+#include <vector>
+
+#include <tt_stl/assert.hpp>
+#include <tt-logger/tt-logger.hpp>
+#include "dispatch/command_queue_common.hpp"
+#include "device.hpp"
+#include "dispatch.hpp"
+#include "fd_kernel.hpp"
+#include "dispatch/dispatch_settings.hpp"
+#include "hal_types.hpp"
+#include "prefetch.hpp"
+#include "context/context_descriptor.hpp"
+#include "debug/inspector/inspector.hpp"
+#include <tt-umd/types/core_coordinates.hpp>
+#include <tt-umd/types/xy_pair.hpp>
+
+#include "device/device_manager.hpp"
+#include <dispatch/dispatch_query_manager.hpp>
+#include <dispatch/dispatch_mem_map.hpp>
+#include "hostdev/realtime_profiler_msgs.h"
+
+#include "impl/context/metal_context.hpp"
+#include "impl/debug/dprint_server.hpp"
+#include "hostdev/device_print_structures.h"
+#include "hostdevcommon/dispatch_telemetry_types.hpp"
+
+using namespace tt::tt_metal;
+
+namespace {
+
+// Zeros selected realtime_profiler_msg_t fields on dispatch_s L1 (REALTIME_PROFILER_MSG carve): signalling
+// fields and record ring indices before the FIFO, then the record slots.
+void zero_dispatch_s_realtime_profiler_msg_fields(
+    IDevice* device, const CoreCoord& logical_core, tt::CoreType core_type, const Hal& hal, uint32_t msg_base_l1_addr) {
+    const auto& factory = hal.get_realtime_profiler_msgs_factory(HalProgrammableCoreType::TENSIX);
+    // WriteToDeviceL1(..., vector<uint32_t>&) requires a mutable vector (non-const ref overload).
+    std::vector<uint32_t> zero_word = {0u};
+
+    auto write_u32 = [&](uint32_t addr) {
+        tt::tt_metal::detail::WriteToDeviceL1(device, logical_core, addr, zero_word, core_type);
+    };
+
+    const uint32_t base = msg_base_l1_addr;
+    write_u32(
+        base + factory.offset_of<realtime_profiler_msgs::realtime_profiler_msg_t>(
+                   realtime_profiler_msgs::realtime_profiler_msg_t::Field::realtime_profiler_core_noc_xy));
+    write_u32(
+        base + factory.offset_of<realtime_profiler_msgs::realtime_profiler_msg_t>(
+                   realtime_profiler_msgs::realtime_profiler_msg_t::Field::realtime_profiler_remote_wr_idx_addr));
+    write_u32(
+        base + factory.offset_of<realtime_profiler_msgs::realtime_profiler_msg_t>(
+                   realtime_profiler_msgs::realtime_profiler_msg_t::Field::realtime_profiler_state));
+    write_u32(
+        base + factory.offset_of<realtime_profiler_msgs::realtime_profiler_msg_t>(
+                   realtime_profiler_msgs::realtime_profiler_msg_t::Field::record_wr_idx));
+    write_u32(
+        base + factory.offset_of<realtime_profiler_msgs::realtime_profiler_msg_t>(
+                   realtime_profiler_msgs::realtime_profiler_msg_t::Field::record_rd_idx));
+    write_u32(
+        base + factory.offset_of<realtime_profiler_msgs::realtime_profiler_msg_t>(
+                   realtime_profiler_msgs::realtime_profiler_msg_t::Field::record_full_wait_count));
+    write_u32(
+        base + factory.offset_of<realtime_profiler_msgs::realtime_profiler_msg_t>(
+                   realtime_profiler_msgs::realtime_profiler_msg_t::Field::program_id_fifo_start));
+    write_u32(
+        base + factory.offset_of<realtime_profiler_msgs::realtime_profiler_msg_t>(
+                   realtime_profiler_msgs::realtime_profiler_msg_t::Field::program_id_fifo_end));
+
+    // Zero every record slot, so a slot published before its id is written reads as unprofiled.
+    std::vector<uint32_t> zero_records(
+        REALTIME_PROFILER_RECORD_SLOTS * sizeof(realtime_profiler_record_t) / sizeof(uint32_t), 0u);
+    tt::tt_metal::detail::WriteToDeviceL1(
+        device,
+        logical_core,
+        base + factory.offset_of<realtime_profiler_msgs::realtime_profiler_msg_t>(
+                   realtime_profiler_msgs::realtime_profiler_msg_t::Field::records),
+        zero_records,
+        core_type);
+}
+
+}  // namespace
+
+DispatchSKernel::DispatchSKernel(
+    int node_id,
+    ChipId device_id,
+    ChipId servicing_device_id,
+    uint8_t cq_id,
+    noc_selection_t noc_selection,
+    const ContextDescriptor& descriptor,
+    dispatch_core_manager& dispatch_core_manager,
+    const GetControlPlaneFn& get_control_plane,
+    const GetDispatchQueryManagerFn& get_dispatch_query_manager,
+    const GetReadsDispatchCoresFn& get_reads_dispatch_cores) :
+    FDKernel(
+        node_id,
+        device_id,
+        servicing_device_id,
+        cq_id,
+        noc_selection,
+        descriptor,
+        dispatch_core_manager,
+        get_control_plane,
+        get_dispatch_query_manager,
+        get_reads_dispatch_cores) {
+    uint16_t channel = descriptor.cluster().get_assigned_channel_for_device(device_id);
+    this->logical_core_ = dispatch_core_manager.dispatcher_s_core(device_id, channel, cq_id_);
+    this->kernel_type_ = FDKernelType::DISPATCH;
+    // Log dispatch_s core info based on virtual core to inspector
+    auto virtual_core = this->GetVirtualCore();
+    Inspector::set_dispatch_s_core_info(virtual_core, DISPATCH_S, cq_id, device_id, servicing_device_id);
+}
+
+void DispatchSKernel::GenerateStaticConfigs() {
+    const auto& my_dispatch_constants = get_dispatch_mem_map();
+
+    uint32_t dispatch_s_buffer_base = 0xff;
+    if (get_dispatch_query_manager_ref().dispatch_s_enabled()) {
+        uint32_t dispatch_buffer_base = my_dispatch_constants.dispatch_buffer_base(cq_id_);
+        if (GetCoreType() == CoreType::WORKER || GetCoreType() == CoreType::DISPATCH) {
+            // dispatch_s shares the core with dispatch_d (Tensix WORKER or Quasar DE). Offset CB start idx.
+            dispatch_s_buffer_base = dispatch_buffer_base + (1 << DispatchSettings::DISPATCH_BUFFER_LOG_PAGE_SIZE) *
+                                                                my_dispatch_constants.dispatch_buffer_pages();
+        } else {
+            // dispatch_d and dispatch_s are on different cores. No shared resources: dispatch_s CB starts at base.
+            dispatch_s_buffer_base = dispatch_buffer_base;
+        }
+    }
+
+    static_config_.cb_base = dispatch_s_buffer_base;
+    static_config_.cb_log_page_size = DispatchSettings::DISPATCH_S_BUFFER_LOG_PAGE_SIZE;
+    static_config_.cb_size = my_dispatch_constants.dispatch_s_buffer_size();
+    // used by dispatch_s to sync with prefetch
+    static_config_.my_dispatch_cb_sem_id = CreateSemaphore(*program_, logical_core_, 0, GetCoreType());
+    // used by dispatch_d to signal that its shutdown handoff is ready
+    static_config_.dispatch_d_shutdown_sem_id = CreateSemaphore(*program_, logical_core_, 0, GetCoreType());
+    static_config_.dispatch_s_sync_sem_base_addr =
+        my_dispatch_constants.get_device_command_queue_addr(CommandQueueDeviceAddrType::DISPATCH_S_SYNC_SEM, cq_id_);
+    // used by dispatch_d to signal that dispatch_s can send go signal
+
+    static_config_.mcast_go_signal_addr =
+        descriptor_.hal().get_dev_addr(HalProgrammableCoreType::TENSIX, HalL1MemAddrType::GO_MSG);
+    static_config_.distributed_dispatcher = get_dispatch_query_manager_ref().distributed_dispatcher();
+    static_config_.first_stream_used = my_dispatch_constants.get_dispatch_stream_index(0);
+    static_config_.completion_counter_offset = my_dispatch_constants.get_completion_counter_offset(cq_id_);
+    static_config_.max_num_worker_sems = DispatchSettings::DISPATCH_MESSAGE_ENTRIES;
+    static_config_.realtime_profiler_msg_addr =
+        my_dispatch_constants.get_device_command_queue_addr(CommandQueueDeviceAddrType::REALTIME_PROFILER_MSG, cq_id_);
+    static_config_.dispatch_telemetry_addr =
+        my_dispatch_constants.get_device_command_queue_addr(CommandQueueDeviceAddrType::DISPATCH_TELEMETRY, cq_id_);
+    static_config_.dispatch_telemetry_disabled = descriptor_.rtoptions().get_dispatch_telemetry_disabled();
+    static_config_.dispatch_telemetry_control_addr = my_dispatch_constants.get_device_command_queue_addr(
+        CommandQueueDeviceAddrType::DISPATCH_TELEMETRY_CONTROL, cq_id_);
+
+    // Configuration for DEVICE_PRINT dispatch.
+    static_config_.device_print_dispatch_enabled = 0;
+    // Under an ATT map dispatch_s cannot compose the aggregator's raw NOC_XY / DRAM operands, so
+    // DPRINT stays on per-core L1 polling there.
+    const bool aggregation_enabled = !descriptor_.rtoptions().get_noc_att_map().has_value();
+    if (cq_id_ == 0 && !aggregation_enabled && descriptor_.metal_context().dprint_server()) {
+        log_debug(
+            tt::LogMetal,
+            "DPRINT dispatch_s DRAM aggregation disabled on device {}: an ATT NoC map is active",
+            device_->id());
+    }
+    // With multiple CQs there is one dispatch_s per CQ, but they all read the same per-core
+    // DEVICE_PRINT L1 buffers. Only enable the DRAM-aggregation work on cq_id 0 so the buffers
+    // aren't drained twice (which would race the host's rpos updates and reorder/drop messages).
+    if (cq_id_ == 0 && aggregation_enabled && get_dispatch_query_manager_ref().dispatch_s_enabled() &&
+        descriptor_.metal_context().dprint_server()) {
+        auto* dprint_server = descriptor_.metal_context().dprint_server().get();
+        auto print_cores = dprint_server->get_print_cores(device_->id());
+        if (!print_cores.empty()) {
+            const auto& hal = descriptor_.hal();
+
+            // A core can expose more than one DEVICE_PRINT buffer. So the dispatcher's NOC location count is the
+            // buffer count, not the print-core count.
+            uint32_t num_noc_locations = 0;
+            for (const auto& core_desc : print_cores) {
+                num_noc_locations +=
+                    static_cast<uint32_t>(dprint_server->get_core_buffers(device_->id(), core_desc).size());
+            }
+
+            // Overlay constraint: noc_locations and l1_cache share the same L1 bytes (the kernel
+            // copies noc_locations into LDM at init then reuses the L1 region as l1_cache). The
+            // initial noc_locations data must fit within the overlaid l1_cache region.
+            const uint32_t noc_locations_size =
+                static_cast<uint32_t>(sizeof(device_print_dispatch::NocLocationInputInfo)) * num_noc_locations;
+            const uint32_t l1_cache_size = my_dispatch_constants.dispatch_s_device_print_l1_cache_size();
+
+            // The kernel indexes NOC locations with uint8_t (DevicePrintDispatch's
+            // noc_locations_to_process), so it cannot address more than 256 of them.
+            constexpr uint32_t max_addressable_noc_locations = 256;
+
+            // Check if there is enough space in the buffer
+            if (noc_locations_size > l1_cache_size) {
+                log_warning(
+                    tt::LogMetal,
+                    "DPRINT dispatch_s DRAM aggregation disabled on device {}: l1_cache ({} bytes) is too "
+                    "small to hold noc_locations for {} print buffers ({} bytes). Falling back to per-core L1 "
+                    "polling; raise TT_METAL_DEVICE_PRINT_DISPATCH_L1_CACHE_BYTES to re-enable.",
+                    device_->id(),
+                    l1_cache_size,
+                    num_noc_locations,
+                    noc_locations_size);
+            } else if (num_noc_locations > max_addressable_noc_locations) {
+                log_warning(
+                    tt::LogMetal,
+                    "DPRINT dispatch_s DRAM aggregation disabled on device {}: {} print buffers exceed the maximum "
+                    "of {} the dispatch_s kernel can index. Falling back to per-core L1 polling; narrow "
+                    "TT_METAL_DPRINT_CORES to re-enable.",
+                    device_->id(),
+                    num_noc_locations,
+                    max_addressable_noc_locations);
+            } else {
+                const uint32_t dram_alignment = hal.get_alignment(HalMemType::DRAM);
+                const uint64_t dram_base = hal.get_dev_addr(HalDramMemAddrType::DEVICE_PRINT_DISPATCH);
+                const uint32_t dram_total_size = hal.get_dev_size(HalDramMemAddrType::DEVICE_PRINT_DISPATCH);
+
+                // dram_view 0's preferred worker NOC coords for the dispatch_s NOC.
+                auto dram_logical = device_->logical_core_from_dram_channel(0);
+                auto dram_virtual = device_->virtual_core_from_logical_core(dram_logical, CoreType::DRAM);
+                auto dram_noc = device_->virtual_noc0_coordinate(noc_selection_.non_dispatch_noc, dram_virtual);
+
+                const auto& rtoptions = descriptor_.rtoptions();
+                const uint64_t clock_mhz = static_cast<uint64_t>(device_->get_clock_rate_mhz());
+
+                static_config_.device_print_dispatch_enabled = 1;
+                static_config_.device_print_noc_locations_addr =
+                    my_dispatch_constants.device_print_dispatch_noc_locations_addr(cq_id_);
+                static_config_.device_print_noc_locations_count = num_noc_locations;
+                static_config_.device_print_l1_cache_addr =
+                    my_dispatch_constants.device_print_dispatch_l1_cache_addr(cq_id_);
+                static_config_.device_print_l1_cache_size = l1_cache_size;
+                static_config_.device_print_dram_x = dram_noc.x;
+                static_config_.device_print_dram_y = dram_noc.y;
+                static_config_.device_print_dram_rw_ptrs = dram_base;
+                static_config_.device_print_dram_buf_addr = dram_base + dram_alignment;
+                static_config_.device_print_dram_buf_size = dram_total_size - dram_alignment;
+                static_config_.device_print_cycles_for_stall =
+                    clock_mhz * rtoptions.get_device_print_dispatch_stall_us();
+                static_config_.device_print_cycles_for_full = clock_mhz * rtoptions.get_device_print_dispatch_full_us();
+            }
+        }
+    }
+}
+
+void DispatchSKernel::GenerateDependentConfigs() {
+    // Upstream
+    TT_ASSERT(upstream_kernels_.size() == 1);
+    auto* prefetch_kernel = dynamic_cast<PrefetchKernel*>(upstream_kernels_[0]);
+    TT_ASSERT(prefetch_kernel);
+    dependent_config_.upstream_logical_core = prefetch_kernel->GetLogicalCore();
+    dependent_config_.upstream_dispatch_cb_sem_id = prefetch_kernel->GetStaticConfig().my_dispatch_s_cb_sem_id;
+
+    // Downstream
+    TT_ASSERT(downstream_kernels_.size() == 1);
+    auto* dispatch_kernel = dynamic_cast<DispatchKernel*>(downstream_kernels_[0]);
+    TT_ASSERT(dispatch_kernel);
+    dependent_config_.downstream_logical_core = dispatch_kernel->GetLogicalCore();
+}
+
+void DispatchSKernel::CreateKernel() {
+    const auto& compute_grid_size = device_->compute_with_storage_grid_size();
+    CoreRange device_worker_cores = CoreRange({0, 0}, {compute_grid_size.x - 1, compute_grid_size.y - 1});
+    auto virtual_start = device_->virtual_core_from_logical_core(device_worker_cores.start_coord, CoreType::WORKER);
+    auto virtual_end = device_->virtual_core_from_logical_core(device_worker_cores.end_coord, CoreType::WORKER);
+    auto virtual_core_range = CoreRange(virtual_start, virtual_end);
+
+    auto my_virtual_core = device_->virtual_core_from_logical_core(logical_core_, GetCoreType());
+    auto upstream_virtual_core =
+        device_->virtual_core_from_logical_core(dependent_config_.upstream_logical_core.value(), GetCoreType());
+    auto downstream_virtual_core =
+        device_->virtual_core_from_logical_core(dependent_config_.downstream_logical_core.value(), GetCoreType());
+    auto downstream_s_virtual_core = device_->virtual_core_from_logical_core(UNUSED_LOGICAL_CORE, GetCoreType());
+
+    auto my_virtual_noc_coords = device_->virtual_noc0_coordinate(noc_selection_.non_dispatch_noc, my_virtual_core);
+    auto upstream_virtual_noc_coords =
+        device_->virtual_noc0_coordinate(noc_selection_.upstream_noc, upstream_virtual_core);
+    auto downstream_virtual_noc_coords =
+        device_->virtual_noc0_coordinate(noc_selection_.downstream_noc, downstream_virtual_core);
+    auto downstream_s_virtual_noc_coords =
+        device_->virtual_noc0_coordinate(noc_selection_.downstream_noc, downstream_s_virtual_core);
+
+    std::map<std::string, std::string> defines = {
+        {"MY_NOC_X", std::to_string(my_virtual_noc_coords.x)},
+        {"MY_NOC_Y", std::to_string(my_virtual_noc_coords.y)},
+        {"UPSTREAM_NOC_INDEX", std::to_string(noc_selection_.upstream_noc)},  // Unused, remove later
+        {"UPSTREAM_NOC_X", std::to_string(upstream_virtual_noc_coords.x)},
+        {"UPSTREAM_NOC_Y", std::to_string(upstream_virtual_noc_coords.y)},
+        {"DOWNSTREAM_NOC_X", std::to_string(downstream_virtual_noc_coords.x)},
+        {"DOWNSTREAM_NOC_Y", std::to_string(downstream_virtual_noc_coords.y)},
+        {"DOWNSTREAM_SUBORDINATE_NOC_X", std::to_string(downstream_s_virtual_noc_coords.x)},  // Unused, remove later
+        {"DOWNSTREAM_SUBORDINATE_NOC_Y", std::to_string(downstream_s_virtual_noc_coords.y)},  // Unused, remove later
+        {"CB_BASE", std::to_string(static_config_.cb_base.value())},
+        {"CB_LOG_PAGE_SIZE", std::to_string(static_config_.cb_log_page_size.value())},
+        {"CB_SIZE", std::to_string(static_config_.cb_size.value())},
+        {"MY_DISPATCH_CB_SEM_ID", std::to_string(static_config_.my_dispatch_cb_sem_id.value())},
+        {"DISPATCH_D_SHUTDOWN_SEM_ID", std::to_string(static_config_.dispatch_d_shutdown_sem_id.value())},
+        {"UPSTREAM_DISPATCH_CB_SEM_ID", std::to_string(dependent_config_.upstream_dispatch_cb_sem_id.value())},
+        {"DISPATCH_S_SYNC_SEM_BASE_ADDR", std::to_string(static_config_.dispatch_s_sync_sem_base_addr.value())},
+        {"MCAST_GO_SIGNAL_ADDR", std::to_string(static_config_.mcast_go_signal_addr.value())},
+        // Workers report done for a go to the dispatcher that sent it.
+        {"GO_DONE_NOC_X", std::to_string(my_virtual_core.x)},
+        {"GO_DONE_NOC_Y", std::to_string(my_virtual_core.y)},
+        {"MCAST_GO_RING_SIZE",
+         std::to_string(
+             descriptor_.hal().get_dev_msgs_factory(HalProgrammableCoreType::TENSIX).size_of<dev_msgs::go_ring_t>())},
+        {"DISTRIBUTED_DISPATCHER", std::to_string(static_config_.distributed_dispatcher.value())},
+        {"FIRST_STREAM_USED", std::to_string(static_config_.first_stream_used.value())},
+        {"COMPLETION_COUNTER_OFFSET", std::to_string(static_config_.completion_counter_offset.value())},
+        {"MAX_NUM_WORKER_SEMS", std::to_string(static_config_.max_num_worker_sems.value())},
+        {"WORKER_MCAST_GRID",
+         std::to_string(device_->get_noc_multicast_encoding(noc_selection_.downstream_noc, virtual_core_range))},
+        {"NUM_WORKER_CORES_TO_MCAST", std::to_string(device_worker_cores.size())},
+        {"REALTIME_PROFILER_MSG_ADDR", std::to_string(static_config_.realtime_profiler_msg_addr.value())},
+        {"DISPATCH_TELEMETRY_ADDR", std::to_string(static_config_.dispatch_telemetry_addr.value())},
+        {"DISPATCH_TELEMETRY_DISABLED", std::to_string(static_config_.dispatch_telemetry_disabled.value_or(false))},
+        {"DISPATCH_TELEMETRY_CONTROL_ADDR", std::to_string(static_config_.dispatch_telemetry_control_addr.value())},
+        {"DEVICE_PRINT_DISPATCH_ENABLED", std::to_string(static_config_.device_print_dispatch_enabled.value_or(0))},
+        // For each per-device dispatch_s build, MaxNocLocations equals the actual print-core count
+        // for that device — passed as a compile-time #define so DevicePrintDispatch<>'s LDM arrays
+        // (rw_noc_addresses, cache_buffer_offsets, cache_buffer_sizes, noc_locations_to_process)
+        // are sized to actual usage instead of device_print_dispatch::DEFAULT_MAX_NOC_LOCATIONS.
+        {"DEVICE_PRINT_MAX_NOC_LOCATIONS", std::to_string(static_config_.device_print_noc_locations_count.value_or(0))},
+        {"DEVICE_PRINT_NOC_LOCATIONS_ADDR", std::to_string(static_config_.device_print_noc_locations_addr.value_or(0))},
+        {"DEVICE_PRINT_NOC_LOCATIONS_COUNT",
+         std::to_string(static_config_.device_print_noc_locations_count.value_or(0))},
+        {"DEVICE_PRINT_L1_CACHE_ADDR", std::to_string(static_config_.device_print_l1_cache_addr.value_or(0))},
+        {"DEVICE_PRINT_L1_CACHE_SIZE", std::to_string(static_config_.device_print_l1_cache_size.value_or(0))},
+        {"DEVICE_PRINT_DRAM_X", std::to_string(static_config_.device_print_dram_x.value_or(0))},
+        {"DEVICE_PRINT_DRAM_Y", std::to_string(static_config_.device_print_dram_y.value_or(0))},
+        {"DEVICE_PRINT_DRAM_RW_PTRS", std::to_string(static_config_.device_print_dram_rw_ptrs.value_or(0)) + "ULL"},
+        {"DEVICE_PRINT_DRAM_BUF_ADDR", std::to_string(static_config_.device_print_dram_buf_addr.value_or(0)) + "ULL"},
+        {"DEVICE_PRINT_DRAM_BUF_SIZE", std::to_string(static_config_.device_print_dram_buf_size.value_or(0))},
+        {"DEVICE_PRINT_CYCLES_FOR_STALL",
+         std::to_string(static_config_.device_print_cycles_for_stall.value_or(0)) + "ULL"},
+        {"DEVICE_PRINT_CYCLES_FOR_FULL",
+         std::to_string(static_config_.device_print_cycles_for_full.value_or(0)) + "ULL"},
+    };
+
+    if (get_dispatch_query_manager_ref().fds_signalling_enabled()) {
+        defines["FDS_SIGNALLING"] = "1";
+    }
+
+    configure_kernel_variant(dispatch_kernel_file_names[DISPATCH_S], {}, defines);
+
+    if (GetCoreType() == CoreType::WORKER && device_->arch() != tt::ARCH::QUASAR) {
+        const std::string compute_kernel_path = "tt_metal/impl/dispatch/kernels/cq_dispatch_subordinate_compute.cpp";
+        std::map<std::string, std::string> compute_defines = {
+            {"DISPATCH_KERNEL", "1"},
+            {"FIRST_STREAM_INDEX", std::to_string(static_config_.first_stream_used.value())},
+            {"NUM_STREAMS_TO_MONITOR", std::to_string(static_config_.max_num_worker_sems.value())},
+            {"REALTIME_PROFILER_MSG_ADDR", std::to_string(static_config_.realtime_profiler_msg_addr.value())},
+            {"DISPATCH_TELEMETRY_ADDR", std::to_string(static_config_.dispatch_telemetry_addr.value())},
+            {"DISPATCH_TELEMETRY_DISABLED", std::to_string(static_config_.dispatch_telemetry_disabled.value_or(false))},
+            {"TOTAL_SUB_DEVICES", std::to_string(static_config_.max_num_worker_sems.value())},
+            {"DISPATCH_TELEMETRY_CONTROL_ADDR", std::to_string(static_config_.dispatch_telemetry_control_addr.value())},
+            {"NUM_WORKER_CORES", std::to_string(device_worker_cores.size())},
+        };
+        tt::tt_metal::ComputeConfig compute_config;
+        compute_config.defines = compute_defines;
+        tt::tt_metal::CreateKernel(*program_, compute_kernel_path, logical_core_, compute_config);
+    }
+}
+
+void DispatchSKernel::ConfigureCore() {
+    if (get_dispatch_query_manager_ref().dispatch_s_enabled()) {
+        TT_ASSERT(static_config_.realtime_profiler_msg_addr.has_value());
+        zero_dispatch_s_realtime_profiler_msg_fields(
+            device_,
+            logical_core_,
+            GetCoreType(),
+            descriptor_.hal(),
+            static_config_.realtime_profiler_msg_addr.value());
+
+        TT_ASSERT(static_config_.dispatch_telemetry_control_addr.has_value());
+        dispatch_telemetry_types::DispatchTelemetryControl zero_dispatch_telemetry_control{};
+        detail::WriteToDeviceL1(
+            device_,
+            logical_core_,
+            static_config_.dispatch_telemetry_control_addr.value(),
+            std::span<const uint8_t>(
+                reinterpret_cast<const uint8_t*>(&zero_dispatch_telemetry_control),
+                sizeof(zero_dispatch_telemetry_control)),
+            GetCoreType());
+    }
+
+    if (get_dispatch_query_manager_ref().distributed_dispatcher()) {
+        // Dispatch_s needs to init telemetry since it has a dedicated core
+        TT_ASSERT(static_config_.dispatch_telemetry_addr.has_value());
+        TT_ASSERT(static_config_.dispatch_telemetry_disabled.has_value());
+        dispatch_telemetry_types::DispatchCoreTelemetry zero_dispatch_telemetry{};
+        if (static_config_.dispatch_telemetry_disabled.value()) {
+            zero_dispatch_telemetry.signature = dispatch_telemetry_types::INVALID_TELEMETRY_SIGNATURE;
+        }
+        detail::WriteToDeviceL1(
+            device_,
+            logical_core_,
+            static_config_.dispatch_telemetry_addr.value(),
+            std::span<const uint8_t>(
+                reinterpret_cast<const uint8_t*>(&zero_dispatch_telemetry), sizeof(zero_dispatch_telemetry)),
+            GetCoreType());
+
+        // Just need to clear the dispatch message
+        std::vector<uint32_t> zero = {0x0};
+        const auto& my_dispatch_constants = get_dispatch_mem_map();
+        uint32_t dispatch_s_sync_sem_base_addr = my_dispatch_constants.get_device_command_queue_addr(
+            CommandQueueDeviceAddrType::DISPATCH_S_SYNC_SEM, cq_id_);
+        for (uint32_t i = 0; i < DispatchSettings::DISPATCH_MESSAGE_ENTRIES; i++) {
+            uint32_t dispatch_s_sync_sem_addr =
+                dispatch_s_sync_sem_base_addr + my_dispatch_constants.get_sync_offset(i);
+            detail::WriteToDeviceL1(device_, logical_core_, dispatch_s_sync_sem_addr, zero, GetCoreType());
+        }
+    }
+
+    // Configuration for DEVICE_PRINT dispatch if dispatch_s is enabled.
+    if (static_config_.device_print_dispatch_enabled.value_or(0) == 0) {
+        return;
+    }
+
+    // Build NocLocationInputInfo[] for every print core and write to dispatch_s L1.
+    auto print_cores = descriptor_.metal_context().dprint_server()->get_print_cores(device_->id());
+    if (print_cores.empty()) {
+        return;
+    }
+
+    auto& cluster = descriptor_.cluster();
+    std::vector<device_print_dispatch::NocLocationInputInfo> entries;
+    entries.reserve(print_cores.size());
+
+    for (const auto& core_desc : print_cores) {
+        auto virtual_core =
+            cluster.get_virtual_coordinate_from_logical_coordinates(device_->id(), core_desc.coord, core_desc.type);
+        for (const auto& buffer_info :
+             descriptor_.metal_context().dprint_server()->get_core_buffers(device_->id(), core_desc)) {
+            device_print_dispatch::NocLocationInputInfo entry{};
+            entry.x = virtual_core.x;
+            entry.y = virtual_core.y;
+            entry.rw_ptr_addr = buffer_info.get_read_write_pointer_address();
+            entry.buf_offset = buffer_info.buffer_offset;
+            entry.buf_size = buffer_info.buffer_size;
+            entry.use_dram_alignment = core_desc.type == CoreType::DRAM;
+            entries.push_back(entry);
+        }
+    }
+
+    // Sort the entries so that locations are ordered by distance descending from dispatch_s.
+    const auto& soc_desc = cluster.get_soc_desc(device_->id());
+    const auto my_noc0 = soc_desc.translate_coord_to(
+        device_->virtual_core_from_logical_core(logical_core_, GetCoreType()),
+        CoordSystem::TRANSLATED,
+        CoordSystem::NOC0);
+    auto noc_round_trip = [&](const device_print_dispatch::NocLocationInputInfo& entry) {
+        const auto noc0 =
+            soc_desc.translate_coord_to(tt_xy_pair(entry.x, entry.y), CoordSystem::TRANSLATED, CoordSystem::NOC0);
+        return (noc0.x != my_noc0.x ? soc_desc.grid_size.x : 0) + (noc0.y != my_noc0.y ? soc_desc.grid_size.y : 0);
+    };
+    std::stable_sort(entries.begin(), entries.end(), [&](const auto& a, const auto& b) {
+        // Prioritize entries that use DRAM alignment over those that do not.
+        if (a.use_dram_alignment != b.use_dram_alignment) {
+            return a.use_dram_alignment > b.use_dram_alignment;
+        }
+        return noc_round_trip(a) > noc_round_trip(b);
+    });
+
+    // Write the packed array bitwise to L1. Each entry is 12 bytes.
+    const uint32_t l1_addr = static_config_.device_print_noc_locations_addr.value();
+    const size_t total_bytes = entries.size() * sizeof(device_print_dispatch::NocLocationInputInfo);
+    detail::WriteToDeviceL1(
+        device_,
+        logical_core_,
+        l1_addr,
+        std::span(reinterpret_cast<const std::uint8_t*>(entries.data()), total_bytes),
+        GetCoreType());
+}

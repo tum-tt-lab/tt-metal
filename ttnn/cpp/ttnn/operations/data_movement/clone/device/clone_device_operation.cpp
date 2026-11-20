@@ -1,0 +1,118 @@
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include "clone_device_operation.hpp"
+#include "ttnn/device_operation.hpp"
+#include "ttnn/operations/data_movement/common/common.hpp"
+#include "ttnn/tensor/tensor_ops.hpp"
+#include <tt-metalium/constants.hpp>
+#include <tt-metalium/experimental/tensor_layout_apis_with_custom_alignment.hpp>
+
+namespace ttnn::operations::data_movement::clone {
+void CloneOperation::validate_inputs(
+    const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
+    const auto& input = tensor_args.input;
+    if (operation_attributes.dtype != input.dtype()) {
+        TT_FATAL(input.layout() == Layout::TILE, "Clone: data type conversion is only supported with tile layout");
+    }
+    TT_FATAL(input.storage_type() == StorageType::DEVICE, "Clone: input must be on device");
+    TT_FATAL(input.is_allocated(), "Clone: input must be allocated in buffer on device");
+
+    auto validate_tile_shape = [](const Tensor& tensor, const char* name) {
+        if (tensor.layout() != Layout::TILE) {
+            return;
+        }
+        const auto tile_shape = tensor.tensor_spec().tile().get_tile_shape();
+        TT_FATAL(
+            tile_shape[0] == tt::constants::TILE_HEIGHT && tile_shape[1] == tt::constants::TILE_WIDTH,
+            "Clone supports only {}x{} tiles, but {} has a {}x{} tile",
+            tt::constants::TILE_HEIGHT,
+            tt::constants::TILE_WIDTH,
+            name,
+            tile_shape[0],
+            tile_shape[1]);
+    };
+    validate_tile_shape(input, "the input tensor");
+
+    auto input_memory_layout = input.memory_config().memory_layout();
+    auto output_memory_layout = operation_attributes.memory_config.memory_layout();
+    bool input_sharded = input_memory_layout != TensorMemoryLayout::INTERLEAVED;
+    bool output_sharded = output_memory_layout != TensorMemoryLayout::INTERLEAVED;
+
+    if (input_sharded && output_sharded) {
+        TT_FATAL(
+            input_memory_layout == output_memory_layout,
+            "Clone: input and output must have the same memory layout when both are sharded");
+
+        auto input_shard_spec = input.buffer()->shard_spec();
+        auto output_shard_spec = operation_attributes.memory_config.shard_spec();
+
+        TT_FATAL(output_shard_spec.has_value(), "Clone: output memory config must have shard spec when sharded");
+
+        TT_FATAL(
+            input_shard_spec.tensor_shard_spec == output_shard_spec.value(),
+            "Clone: input and output shard specs must be identical (same grid, shape, and orientation)");
+    } else if (input_sharded || output_sharded) {
+        TT_FATAL(
+            false,
+            "Clone: mixed sharded/interleaved layout not currently supported. Both input and output must have the same "
+            "layout.");
+    }
+}
+
+void CloneOperation::validate_on_program_cache_miss(
+    const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
+    validate_inputs(operation_attributes, tensor_args);
+};
+
+CloneOperation::spec_return_value_t CloneOperation::compute_output_specs(
+    const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
+    const auto& input = tensor_args.input;
+    return tt::tt_metal::TensorSpec(
+        input.logical_shape(),
+        tt::tt_metal::experimental::tensor_layout_from_padded_shape(
+            operation_attributes.dtype,
+            tt::tt_metal::PageConfig(input.layout()),
+            operation_attributes.memory_config,
+            input.logical_shape(),
+            input.padded_shape()));
+};
+
+CloneOperation::tensor_return_value_t CloneOperation::create_output_tensors(
+    const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
+    auto spec = compute_output_specs(operation_attributes, tensor_args);
+    return create_device_tensor(spec, tensor_args.input.device());
+}
+
+tt::tt_metal::operation::OpPerformanceModelGeneral<CloneOperation::tensor_return_value_t>
+CloneOperation::create_op_performance_model(
+    const operation_attributes_t& /*op_attr*/, const tensor_args_t& inputs, const Tensor& output) {
+    const auto& input_tensor = inputs.input;
+    int ideal_dev_clock_cycles = common_tm_bw_model(input_tensor, output);
+    tt::tt_metal::operation::OpPerformanceModelGeneral<tensor_return_value_t> result(
+        {input_tensor}, {output}, ideal_dev_clock_cycles);
+    return result;
+}
+
+}  // namespace ttnn::operations::data_movement::clone
+
+namespace ttnn::prim {
+ttnn::Tensor clone(
+    const Tensor& input,
+    const std::optional<DataType>& dtype,
+    const std::optional<MemoryConfig>& memory_config,
+    const std::optional<DeviceComputeKernelConfig>& compute_kernel_config,
+    const std::optional<CoreRangeSet>& sub_core_grids) {
+    using OperationType = ttnn::operations::data_movement::clone::CloneOperation;
+    return ttnn::device_operation::launch<OperationType>(
+        OperationType::operation_attributes_t{
+            dtype.value_or(input.dtype()),
+            memory_config.value_or(input.memory_config()),
+            init_device_compute_kernel_config(
+                input.device()->arch(), compute_kernel_config, tt::tt_metal::MathFidelity::HiFi4),
+            sub_core_grids,
+        },
+        OperationType::tensor_args_t{input});
+}
+}  // namespace ttnn::prim

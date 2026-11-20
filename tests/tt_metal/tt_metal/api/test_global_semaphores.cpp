@@ -1,0 +1,181 @@
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include <gtest/gtest.h>
+#include <cstddef>
+#include <cstdint>
+#include <tt-metalium/core_coord.hpp>
+#include <tt-metalium/experimental/forge_backdoor/global_semaphore.hpp>
+#include <tt-metalium/global_semaphore.hpp>
+#include <tt-metalium/host_api.hpp>
+#include <vector>
+
+#include <tt-metalium/device.hpp>
+#include "mesh_dispatch_fixture.hpp"
+#include <tt-metalium/distributed.hpp>
+#include <tt-metalium/mesh_command_queue.hpp>
+#include <tt-metalium/hal_types.hpp>
+#include "llrt.hpp"
+#include "impl/context/metal_context.hpp"
+#include <tt-umd/types/xy_pair.hpp>
+
+namespace tt::tt_metal {
+
+TEST_F(MeshDispatchFixture, InitializeGlobalSemaphores) {
+    CoreRangeSet cores(CoreRange({0, 0}, {1, 1}));
+
+    auto cores_vec = corerange_to_cores(cores);
+    for (const auto& mesh_device : devices_) {
+        auto device_id = mesh_device->get_device_ids()[0];
+        {
+            uint32_t initial_value = 1;
+            auto global_semaphore = tt::tt_metal::GlobalSemaphore(*mesh_device, cores, initial_value);
+            auto address = global_semaphore.address();
+            distributed::Synchronize(*mesh_device, std::nullopt);
+            for (const auto& core : cores_vec) {
+                auto sem_vals = tt::tt_metal::MetalContext::instance().get_cluster().read_core(
+                    device_id, mesh_device->worker_core_from_logical_core(core), address, sizeof(uint32_t));
+
+                EXPECT_EQ(sem_vals[0], initial_value);
+            }
+        }
+        {
+            uint32_t initial_value = 2;
+            auto global_semaphore = tt::tt_metal::GlobalSemaphore(*mesh_device, cores, initial_value);
+            auto address = global_semaphore.address();
+            distributed::Synchronize(*mesh_device, std::nullopt);
+            for (const auto& core : cores_vec) {
+                auto sem_vals = tt::tt_metal::MetalContext::instance().get_cluster().read_core(
+                    device_id, mesh_device->worker_core_from_logical_core(core), address, sizeof(uint32_t));
+                EXPECT_EQ(sem_vals[0], initial_value);
+            }
+        }
+    }
+}
+
+TEST_F(MeshDispatchFixture, CreateMultipleGlobalSemaphoresOnSameCore) {
+    std::vector<CoreRangeSet> cores{
+        CoreRange({0, 0}, {1, 1}),
+        CoreRange({0, 0}, {2, 2}),
+        CoreRange({3, 1}, {5, 3}),
+    };
+    std::vector<std::vector<CoreCoord>> cores_vecs;
+    cores_vecs.reserve(cores.size());
+    std::vector<uint32_t> initial_values{1, 2, 3};
+    for (const auto& crs : cores) {
+        cores_vecs.push_back(corerange_to_cores(crs));
+    }
+    for (const auto& mesh_device : devices_) {
+        auto device_id = mesh_device->get_device_ids()[0];
+        {
+            std::vector<tt::tt_metal::GlobalSemaphore> global_semaphores;
+            global_semaphores.reserve(cores.size());
+            std::vector<DeviceAddr> addresses;
+            addresses.reserve(cores.size());
+            for (size_t i = 0; i < cores.size(); i++) {
+                global_semaphores.push_back(tt::tt_metal::GlobalSemaphore(*mesh_device, cores[i], initial_values[i]));
+                addresses.push_back(global_semaphores[i].address());
+            }
+            distributed::Synchronize(*mesh_device, std::nullopt);
+            for (size_t i = 0; i < cores.size(); i++) {
+                const auto& address = addresses[i];
+                const auto& initial_value = initial_values[i];
+                const auto& cores_vec = cores_vecs[i];
+                for (const auto& core : cores_vec) {
+                    auto sem_vals = tt::tt_metal::MetalContext::instance().get_cluster().read_core(
+                        device_id,
+                        mesh_device->worker_core_from_logical_core(core),
+                        address,
+                        sizeof(uint32_t));
+                    EXPECT_EQ(sem_vals[0], initial_value);
+                }
+            }
+        }
+    }
+}
+
+TEST_F(MeshDispatchFixture, ResetGlobalSemaphores) {
+    CoreRangeSet cores(CoreRange({0, 0}, {1, 1}));
+
+    auto cores_vec = corerange_to_cores(cores);
+    for (const auto& mesh_device : devices_) {
+        auto device_id = mesh_device->get_device_ids()[0];
+        {
+            uint32_t initial_value = 1;
+            uint32_t reset_value = 2;
+            std::vector<uint32_t> overwrite_value = {2};
+            auto global_semaphore = tt::tt_metal::GlobalSemaphore(*mesh_device, cores, initial_value);
+            auto address = global_semaphore.address();
+            distributed::Synchronize(*mesh_device, std::nullopt);
+            for (const auto& core : cores_vec) {
+                auto sem_vals = tt::tt_metal::MetalContext::instance().get_cluster().read_core(
+                    device_id, mesh_device->worker_core_from_logical_core(core), address, sizeof(uint32_t));
+                tt::tt_metal::MetalContext::instance().get_cluster().write_core(
+                    device_id, mesh_device->worker_core_from_logical_core(core), overwrite_value, address);
+                EXPECT_EQ(sem_vals[0], initial_value);
+            }
+            tt::tt_metal::MetalContext::instance().get_cluster().l1_barrier(device_id);
+            for (const auto& core : cores_vec) {
+                auto sem_vals = tt::tt_metal::MetalContext::instance().get_cluster().read_core(
+                    device_id, mesh_device->worker_core_from_logical_core(core), address, sizeof(uint32_t));
+
+                EXPECT_EQ(sem_vals[0], overwrite_value[0]);
+            }
+            global_semaphore.reset_semaphore_value(reset_value);
+            distributed::Synchronize(*mesh_device, std::nullopt);
+            for (const auto& core : cores_vec) {
+                auto sem_vals = tt::tt_metal::MetalContext::instance().get_cluster().read_core(
+                    device_id, mesh_device->worker_core_from_logical_core(core), address, sizeof(uint32_t));
+                tt::tt_metal::MetalContext::instance().get_cluster().write_core(
+                    device_id, mesh_device->worker_core_from_logical_core(core), overwrite_value, address);
+                EXPECT_EQ(sem_vals[0], reset_value);
+            }
+        }
+    }
+}
+
+// Runs in both fast and slow dispatch: the queue is passed explicitly, and with slow dispatch it is simply not used.
+TEST_F(MeshDispatchFixture, GlobalSemaphoresWithExplicitQueue) {
+    CoreRangeSet cores(CoreRange({0, 0}, {1, 1}));
+    auto cores_vec = corerange_to_cores(cores);
+    for (const auto& mesh_device : devices_) {
+        auto device_id = mesh_device->get_device_ids()[0];
+        auto& cq = mesh_device->mesh_command_queue(0);
+        auto global_semaphore = tt::tt_metal::GlobalSemaphore(cq, cores, /*initial_value=*/4);
+        auto address = global_semaphore.address();
+        distributed::Synchronize(*mesh_device, std::nullopt);
+        auto read_value = [&](const CoreCoord& core) {
+            return tt::tt_metal::MetalContext::instance()
+                .get_cluster()
+                .read_core(device_id, mesh_device->worker_core_from_logical_core(core), address, sizeof(uint32_t))[0];
+        };
+        for (const auto& core : cores_vec) {
+            EXPECT_EQ(read_value(core), 4u);
+        }
+        global_semaphore.reset_semaphore_value(8, cq);
+        distributed::Synchronize(*mesh_device, std::nullopt);
+        for (const auto& core : cores_vec) {
+            EXPECT_EQ(read_value(core), 8u);
+        }
+    }
+}
+
+// Runs in both fast and slow dispatch: a command queue id the device does not have is rejected even with slow
+// dispatch, where the queue would not be used for the write.
+TEST_F(MeshDispatchFixture, GlobalSemaphoresRejectOutOfRangeCqId) {
+    CoreRangeSet cores(CoreRange({0, 0}, {0, 0}));
+    for (const auto& mesh_device : devices_) {
+        const uint8_t out_of_range_cq_id = mesh_device->num_hw_cqs();
+        EXPECT_ANY_THROW(
+            tt::tt_metal::GlobalSemaphore(*mesh_device, cores, /*initial_value=*/1, BufferType::L1, out_of_range_cq_id));
+
+        auto global_semaphore = tt::tt_metal::GlobalSemaphore(*mesh_device, cores, /*initial_value=*/1);
+        EXPECT_ANY_THROW(global_semaphore.reset_semaphore_value(2, out_of_range_cq_id));
+
+        EXPECT_ANY_THROW(tt::tt_metal::experimental::CreateGlobalSemaphore(
+            *mesh_device, cores, /*initial_value=*/3, BufferType::L1, global_semaphore.address(), out_of_range_cq_id));
+    }
+}
+
+} // namespace tt::tt_metal

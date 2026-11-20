@@ -1,0 +1,325 @@
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include "fabric_builder.hpp"
+#include "tt_metal/fabric/fabric_router_builder.hpp"
+#include "tt_metal/fabric/compute_mesh_router_builder.hpp"
+#include "tt_metal/fabric/fabric_context.hpp"
+#include "tt_metal/fabric/fabric_builder_context.hpp"
+#include "tt_metal/fabric/builder/fabric_edge_capability.hpp"
+#include "tt_metal/fabric/builder/protected_domain_effect.hpp"
+#include "tt_metal/fabric/graph/graph_fabric_build_session.hpp"
+#include <tt-metalium/experimental/fabric/control_plane.hpp>
+#include "dispatch/kernel_config/relay_mux.hpp"
+#include "llrt/tt_cluster.hpp"
+#include <enchantum/enchantum.hpp>
+#include <tt_stl/fmt.hpp>
+#include <set>
+
+namespace tt::tt_fabric {
+
+FabricBuilder::FabricBuilder(
+    tt::tt_metal::IDevice* device,
+    tt::tt_metal::Program& program,
+    FabricContext& fabric_context,
+    CoreType dispatch_core_type) :
+    device_(device),
+    program_(program),
+    fabric_context_(fabric_context),
+    builder_context_(fabric_context.get_builder_context()),
+    dispatch_core_type_(dispatch_core_type),
+    local_node_(fabric_context.get_control_plane().get_fabric_node_id_from_physical_chip_id(device->id())),
+    wrap_around_mesh_(fabric_context_.is_wrap_around_mesh(local_node_.mesh_id)) {
+    // Bind this node's ring predicates once: every router on the chip shares them.
+    chip_facts_.protected_ring_queries = make_protected_ring_queries(fabric_context_.get_control_plane(), local_node_);
+
+    // Determine if this device has tunneling dispatch
+    const auto& cluster = fabric_context_.get_cluster();
+    auto mmio_device_id = cluster.get_associated_mmio_device(device_->id());
+    auto tunnels_from_mmio = cluster.get_devices_controlled_by_mmio_device(mmio_device_id);
+    TT_ASSERT(!tunnels_from_mmio.empty());
+    device_has_dispatch_tunnel_ = (tunnels_from_mmio.size() - 1) > 0;
+}
+
+void FabricBuilder::discover_channels() {
+    auto& control_plane = fabric_context_.get_control_plane();
+    const bool is_2D_routing = fabric_context_.is_2D_routing_enabled();
+    bool is_galaxy_cluster = fabric_context_.get_cluster().is_galaxy_cluster();
+
+    auto is_dispatch_link = [&](chan_id_t eth_chan, uint32_t dispatch_link_idx) {
+        auto link_idx = control_plane.get_routing_plane_id(local_node_, eth_chan);
+        return device_has_dispatch_tunnel_ && link_idx == dispatch_link_idx;
+    };
+
+    // Discover active channels and neighbors
+    for (const auto& direction : FabricContext::routing_directions) {
+        auto active_eth_chans = control_plane.get_active_fabric_eth_routing_planes_in_direction(local_node_, direction);
+        if (active_eth_chans.empty()) {
+            continue;
+        }
+
+        auto neighbors = control_plane.get_chip_neighbors(local_node_, direction);
+        auto intra_chip_neighbors = neighbors.find(local_node_.mesh_id);
+
+        TT_FATAL(neighbors.size() == 1, "Multiple neighbor meshes per direction is unsupported");
+        TT_FATAL(
+            std::set<ChipId>(neighbors.begin()->second.begin(), neighbors.begin()->second.end()).size() == 1,
+            "Multiple neighbors per direction is currently unsupported");
+
+        // 1D fabric only supports intramesh connections
+        if (!is_2D_routing) {
+            bool has_inter_mesh_connections = (intra_chip_neighbors == neighbors.end());
+            TT_FATAL(!has_inter_mesh_connections, "1D routing does not support intermesh connections");
+        }
+
+        // Cache neighbor and channel info
+        FabricNodeId neighbor_fabric_node_id = FabricNodeId(neighbors.begin()->first, neighbors.begin()->second[0]);
+
+        // Classify the edge once, here: the answer is threaded into the per-router build rather
+        // than re-derived per consumer. A same-mesh Z on a mesh without validated express intent
+        // means topology intent and the neighbor graph disagree, and catching that at discovery
+        // gives a far better message than whatever fails later.
+        //
+        // An express chord needs no rejection here any more: it is wired like any other direction, on
+        // the fifth VC0 sender, with its guard derived from the protected-ring effects.
+        chip_facts_.per_direction_capabilities.at(direction) =
+            classify_fabric_edge(control_plane, local_node_, neighbor_fabric_node_id, direction);
+
+        chip_neighbors_.emplace(direction, neighbor_fabric_node_id);
+        channels_by_direction_[direction] = active_eth_chans;
+
+        // Identify and cache dispatch links, and reserve them in control plane
+        uint32_t dispatch_link_idx = tt::tt_metal::RelayMux::get_dispatch_link_index(
+            control_plane, is_galaxy_cluster, local_node_, neighbor_fabric_node_id, device_);
+        size_t num_dispatch_links = 0;
+        for (const auto& eth_chan : active_eth_chans) {
+            if (is_dispatch_link(eth_chan, dispatch_link_idx)) {
+                dispatch_links_.insert(eth_chan);
+                num_dispatch_links++;
+            }
+        }
+        control_plane.reserve_routing_planes(local_node_, direction, num_dispatch_links);
+    }
+}
+
+void FabricBuilder::create_routers() {
+    const auto& control_plane = fabric_context_.get_control_plane();
+    const auto& cluster = fabric_context_.get_cluster();
+
+    // Create router builders
+    for (const auto& [direction, eth_channels] : channels_by_direction_) {
+        const auto& neighbor_node = chip_neighbors_.at(direction);
+
+        for (const auto& eth_chan : eth_channels) {
+            bool is_dispatch = dispatch_links_.contains(eth_chan);
+
+            RouterLocation location{
+                .eth_chan = eth_chan,
+                .remote_node = neighbor_node,
+                .direction = direction,
+                .is_dispatch_link = is_dispatch,
+            };
+
+            cluster.register_sim_fabric_endpoint_direction(
+                device_->id(), eth_chan, control_plane.routing_direction_to_eth_direction(direction));
+            routers_.insert({eth_chan, make_router(location)});
+        }
+    }
+
+    // Configure dispatch links
+    if (device_has_dispatch_tunnel_) {
+        for (const auto& dispatch_chan : dispatch_links_) {
+            routers_.at(dispatch_chan)->configure_for_dispatch();
+        }
+    }
+
+    for (const auto& [eth_chan, router] : routers_) {
+        if (auto layout = router->get_channel_layout()) {
+            builder_context_.publish_router_channel_layout(local_node_, eth_chan, *layout);
+        }
+    }
+
+    // Record build state
+    builder_context_.set_num_fabric_initialized_routers(device_->id(), routers_.size());
+    if (!routers_.empty()) {
+        master_router_chan_ = pick_master_router_chan();
+        builder_context_.set_fabric_master_router_chan(device_->id(), master_router_chan_);
+    }
+}
+
+chan_id_t FabricBuilder::pick_master_router_chan() const { return routers_.begin()->first; }
+
+std::unique_ptr<FabricRouterBuilder> FabricBuilder::make_router(const RouterLocation& location) {
+    return FabricRouterBuilder::create(
+        fabric_context_, dispatch_core_type_, device_, program_, local_node_, location, chip_facts_);
+}
+
+std::vector<FabricBuilder::RouterConnectionPair> FabricBuilder::get_router_connection_pairs() const {
+    std::vector<RouterConnectionPair> pairs;
+
+    const bool is_2D_routing = fabric_context_.is_2D_routing_enabled();
+    const size_t num_intra_chip_neighbors = chip_neighbors_.size();
+
+    // Check if we can connect two directions
+    auto can_connect = [&](RoutingDirection dir1, RoutingDirection dir2) {
+        return chip_neighbors_.contains(dir1) && chip_neighbors_.contains(dir2) &&
+               channels_by_direction_.contains(dir1) && channels_by_direction_.contains(dir2);
+    };
+
+    // Add connection pairs for two directions
+    auto add_direction_pairs = [&](RoutingDirection dir1, RoutingDirection dir2) {
+        if (!can_connect(dir1, dir2)) {
+            return;
+        }
+
+        const auto& chans_dir1 = channels_by_direction_.at(dir1);
+        const auto& chans_dir2 = channels_by_direction_.at(dir2);
+        uint32_t num_links = std::min(chans_dir1.size(), chans_dir2.size());
+
+        for (uint32_t link = 0; link < num_links; link++) {
+            pairs.push_back(RouterConnectionPair{
+                .chan1 = chans_dir1[link],
+                .chan2 = chans_dir2[link],
+                .link_idx = link,
+                .num_links = num_links,
+            });
+        }
+    };
+
+    if (is_2D_routing) {
+        // 2D Routing - connect all orthogonal direction pairs
+        add_direction_pairs(RoutingDirection::N, RoutingDirection::S);
+        add_direction_pairs(RoutingDirection::E, RoutingDirection::W);
+        add_direction_pairs(RoutingDirection::N, RoutingDirection::E);
+        add_direction_pairs(RoutingDirection::N, RoutingDirection::W);
+        add_direction_pairs(RoutingDirection::S, RoutingDirection::E);
+        add_direction_pairs(RoutingDirection::S, RoutingDirection::W);
+
+        // Z router connections - connect Z routers to all 4 mesh directions
+        add_direction_pairs(RoutingDirection::Z, RoutingDirection::N);
+        add_direction_pairs(RoutingDirection::Z, RoutingDirection::S);
+        add_direction_pairs(RoutingDirection::Z, RoutingDirection::E);
+        add_direction_pairs(RoutingDirection::Z, RoutingDirection::W);
+    } else if (wrap_around_mesh_ && num_intra_chip_neighbors == 2) {
+        // 1D Routing wrap the corner chips, fold the internal connections
+        auto it = chip_neighbors_.begin();
+        auto dir1 = it->first;
+        it++;
+        auto dir2 = it->first;
+        add_direction_pairs(dir1, dir2);
+    } else {
+        // 1D Routing - connect opposite directions
+        add_direction_pairs(RoutingDirection::N, RoutingDirection::S);
+        add_direction_pairs(RoutingDirection::E, RoutingDirection::W);
+    }
+
+    return pairs;
+}
+
+void FabricBuilder::connect_routers() {
+    const auto topology = fabric_context_.get_fabric_topology();
+    const bool is_galaxy = fabric_context_.is_ubb_galaxy();
+
+    // If NeighborExchange topology is used, message forwarding is not supported, and thus there is no need to connect
+    // routers on the same device together
+    if (topology == Topology::NeighborExchange) {
+        return;
+    }
+
+    // Get connection pairs based on topology
+    auto connection_pairs = get_router_connection_pairs();
+
+    // Connect each pair: local turns between two routers on this device (one router's receiver
+    // feeds the other's sender, which transmits over its own eth link to a neighbor device).
+    // This is the single establishment pass for every connection -- the boundary turns (to and
+    // from the intermesh Z router) are wired here by the same path as every other local turn, so
+    // no second pass is needed. The link_idx pairing preserves plane identity across the turn;
+    // that is what lets the connection and channel mappings stay plane-independent archetypes
+    // (they carry no eth channel) -- the plane enters only here.
+    for (const auto& pair : connection_pairs) {
+        auto& router1 = routers_.at(pair.chan1);
+        auto& router2 = routers_.at(pair.chan2);
+
+        router1->configure_connection(*router2, pair.link_idx, pair.num_links, topology, is_galaxy);
+    }
+}
+
+void FabricBuilder::compile_ancillary_kernels() {
+    // Router-associated ancillary kernels
+    for (auto& [eth_chan, router_builder] : routers_) {
+        router_builder->compile_ancillary_kernels(program_);
+    }
+
+    // Device-level kernels for missing directions (e.g., UDM mode)
+    compile_kernels_for_missing_directions();
+}
+
+void FabricBuilder::compile_kernels_for_missing_directions() {
+    // Only applicable in UDM mode
+    if (fabric_context_.get_fabric_tensix_config() != FabricTensixConfig::UDM) {
+        return;
+    }
+
+    const auto& tensix_config = builder_context_.get_tensix_config();
+    if (!tensix_config.has_missing_directions(device_->id())) {
+        return;
+    }
+
+    const auto& missing_directions = tensix_config.get_missing_directions(device_->id());
+
+    for (const auto& [routing_plane_id, missing_dir] : missing_directions) {
+        // Routine step of UDM's core-budget fallback (see fabric_tensix_builder.cpp), not an
+        // error -- every device in UDM mode with fewer mux cores than directions logs this once
+        // per missing direction, so it belongs at debug rather than warning.
+        log_debug(
+            tt::LogMetal,
+            "Building missing direction tensix builder for fabric_node {}, routing_plane {}, direction {}",
+            local_node_,
+            routing_plane_id,
+            static_cast<uint32_t>(missing_dir));
+
+        // Build and compile tensix builder for this missing (routing_plane_id, direction) pair
+        auto tensix_builder = FabricTensixDatamoverBuilder::build_for_missing_direction(
+            fabric_context_, device_, program_, local_node_, routing_plane_id, missing_dir);
+        tensix_builder.create_and_compile(program_);
+    }
+}
+
+KernelCreationContext FabricBuilder::kernel_creation_context() const {
+    uint32_t router_channels_mask = 0;
+    for (const auto& [router_chan, _] : routers_) {
+        router_channels_mask |= (1 << static_cast<uint32_t>(router_chan));
+    }
+
+    return KernelCreationContext{
+        .is_2D_routing = fabric_context_.is_2D_routing_enabled(),
+        .master_router_chan = master_router_chan_,
+        .num_local_fabric_routers = routers_.size(),
+        .router_channels_mask = router_channels_mask,
+    };
+}
+
+void FabricBuilder::create_kernels() {
+    const KernelCreationContext ctx = kernel_creation_context();
+    for (auto& [eth_chan, router_builder] : routers_) {
+        router_builder->create_kernel(program_, ctx);
+    }
+}
+
+std::unique_ptr<FabricBuilder> FabricBuildSession::make_device_builder(
+    tt::tt_metal::IDevice* device,
+    tt::tt_metal::Program& program,
+    FabricContext& fabric_context,
+    CoreType dispatch_core_type) const {
+    return std::make_unique<FabricBuilder>(device, program, fabric_context, dispatch_core_type);
+}
+
+std::unique_ptr<FabricBuildSession> create_fabric_build_session(FabricContext& fabric_context) {
+    if (fabric_context.get_rtoptions().get_fabric_graph_builder()) {
+        return std::make_unique<graph::GraphFabricBuildSession>(fabric_context);
+    }
+    return std::make_unique<FabricBuildSession>();
+}
+
+}  // namespace tt::tt_fabric

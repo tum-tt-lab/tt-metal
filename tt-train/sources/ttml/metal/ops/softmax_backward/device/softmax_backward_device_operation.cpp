@@ -1,0 +1,87 @@
+// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include "softmax_backward_device_operation.hpp"
+
+#include "metal/common/tensor_validation.hpp"
+#include "tt_stl/assert.hpp"
+#include "ttnn/device_operation.hpp"
+#include "ttnn/tensor/tensor.hpp"
+#include "ttnn/types.hpp"
+
+using namespace tt::tt_metal;
+
+namespace ttml::metal::ops::softmax_backward::device {
+
+void SoftmaxBackwardDeviceOperation::validate_on_program_cache_miss(
+    const operation_attributes_t& attributes, const tensor_args_t& tensor_args) {
+    const auto& softmax_output = tensor_args.softmax_output;
+    const auto& upstream_grad = tensor_args.upstream_grad;
+    TT_FATAL(
+        softmax_output.logical_shape() == upstream_grad.logical_shape(),
+        "Softmax output and upstream gradient tensors must have the same shape");
+    // The kernels address every tensor through TensorAccessor, so any memory layout is accepted, and the output
+    // inherits the input's memory config.
+    const DeviceTensorRequirements any_memory_layout{
+        .dtypes = {DataType::BFLOAT16, DataType::FLOAT32}, .memory_layout = std::nullopt};
+    check_device_tensor(softmax_output, "SoftmaxBackward", "softmax_output", any_memory_layout);
+    check_device_tensor(upstream_grad, "SoftmaxBackward", "upstream_grad", any_memory_layout);
+    check_same_device(upstream_grad, softmax_output, "SoftmaxBackward", "upstream_grad", "softmax_output");
+    TT_FATAL(
+        upstream_grad.dtype() == softmax_output.dtype(),
+        "Softmax output and upstream gradient must have the same dtype");
+    const auto rank = softmax_output.logical_shape().rank();
+    TT_FATAL(
+        attributes.dim == rank - 1,
+        "Currently only supporting softmax_backward on last dimension (got dim={}, rank={})",
+        attributes.dim,
+        rank);
+}
+
+SoftmaxBackwardDeviceOperation::spec_return_value_t SoftmaxBackwardDeviceOperation::compute_output_specs(
+    const operation_attributes_t& /*operation_attributes*/, const tensor_args_t& tensor_args) {
+    const auto& input_tensor = tensor_args.softmax_output;
+    return {
+        input_tensor.logical_shape(),
+        tt::tt_metal::TensorLayout(
+            input_tensor.dtype(), tt::tt_metal::PageConfig(input_tensor.layout()), input_tensor.memory_config())};
+}
+
+SoftmaxBackwardDeviceOperation::tensor_return_value_t SoftmaxBackwardDeviceOperation::create_output_tensors(
+    const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
+    auto output_spec = compute_output_specs(operation_attributes, tensor_args);
+    return ttnn::create_device_tensor(output_spec, tensor_args.softmax_output.device());
+}
+
+tt::tt_metal::operation::OpPerformanceModelGeneral<SoftmaxBackwardDeviceOperation::tensor_return_value_t>
+SoftmaxBackwardDeviceOperation::create_op_performance_model(
+    const operation_attributes_t& /*operation_attributes*/,
+    const tensor_args_t& tensor_args,
+    tensor_return_value_t& tensor_return_value) {
+    const auto& softmax_output = tensor_args.softmax_output;
+    const auto& upstream_grad = tensor_args.upstream_grad;
+    const auto& output_tensor = tensor_return_value;
+    // Placeholder; tt-train build does not depend on ttnn data_movement common_tm_bw_model.
+    constexpr int ideal_dev_clock_cycles = 0;
+    tt::tt_metal::operation::OpPerformanceModelGeneral<tensor_return_value_t> result(
+        {softmax_output, upstream_grad}, output_tensor, ideal_dev_clock_cycles);
+    return result;
+}
+
+}  // namespace ttml::metal::ops::softmax_backward::device
+
+namespace ttnn::prim {
+
+ttnn::Tensor ttml_softmax_backward(
+    const ttnn::Tensor& softmax_output,
+    const ttnn::Tensor& upstream_grad,
+    uint32_t dim,
+    const std::optional<tt::tt_metal::CoreRangeSet>& sub_core_grids) {
+    using OperationType = ttml::metal::ops::softmax_backward::device::SoftmaxBackwardDeviceOperation;
+    auto operation_attributes = OperationType::operation_attributes_t{dim, sub_core_grids};
+    auto tensor_args = OperationType::tensor_args_t{softmax_output, upstream_grad};
+    return ttnn::device_operation::launch<OperationType>(operation_attributes, tensor_args);
+}
+
+}  // namespace ttnn::prim

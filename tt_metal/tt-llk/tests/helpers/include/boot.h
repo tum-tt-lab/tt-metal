@@ -1,0 +1,260 @@
+// SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <array>
+#include <cstdint>
+
+#include "cfg_defines.h"
+#include "ckernel.h"
+#include "ckernel_helper.h"
+#if defined(ARCH_QUASAR)
+#include "ckernel_trisc_common.h"
+#endif
+
+// C-runtime related linker symbols
+extern volatile char __ldm_bss_start[], __ldm_bss_end[];
+extern volatile char __loader_init_start[], __loader_init_end[];
+extern volatile char __ldm_data_start[], __ldm_data_end[];
+extern const std::uint32_t __stack_top[];
+extern void (*__init_array_start[])(void);
+extern void (*__init_array_end[])(void);
+
+// TODO @ajankovicTT find out why GCC generates unwinding tables on coverage,
+// even though -fno-asynchronous-unwind-tables -fno-exceptions flags are set
+void* __gxx_personality_v0;
+
+// Mirror of tt-metal firmware's configure_gathering() (tt_metal/hw/inc/internal/firmware_common.h).
+// Blackhole boots with instruction gathering on; tt-metal firmware disables it on every RISC.
+// The guard matches tt-metal's, so defining ENABLE_GATHERING both leaves gathering on and
+// switches on the load_replay_buf record-window bracketing in ckernel.h.
+TT_ALWAYS_INLINE void configure_gathering()
+{
+#if defined(ARCH_BLACKHOLE) && !defined(ENABLE_GATHERING)
+    asm(R"ASM(
+        .option push
+        li   t1, 0x2
+        csrrs zero, 0x7c0, t1
+        li   t1, 0x1
+        slli t1, t1, 18
+        fence
+        csrrs zero, 0x7c0, t1
+        li   t1, 0x2
+        csrrc zero, 0x7c0, t1
+        fence
+        .option pop
+         )ASM" ::
+            : "t1");
+#endif
+}
+
+#if defined(ARCH_WORMHOLE) || defined(ARCH_BLACKHOLE)
+// STREAM_SCRATCH_0 of overlay stream 0 (24 bits, host readable, outside L1 and the Tensix register bus): BRISC marks the
+// launch done there (brisc.cpp), so the host waits on a kernel without touching anything the kernel uses.
+namespace host_signal
+{
+#if defined(ARCH_WORMHOLE)
+constexpr std::uint32_t STREAM_SCRATCH_REG_INDEX = 248;
+#else
+constexpr std::uint32_t STREAM_SCRATCH_REG_INDEX = 36;
+#endif
+constexpr std::uint32_t NOC_OVERLAY_START_ADDR = 0xFFB40000;
+
+constexpr std::uint32_t LAUNCH_DONE_MASK = 0xFFFFFF; // the register's 24 bits (HOST_SIGNAL_MASK on the host)
+
+TT_ALWAYS_INLINE volatile std::uint32_t* launch_done()
+{
+    return reinterpret_cast<volatile std::uint32_t*>(NOC_OVERLAY_START_ADDR + STREAM_SCRATCH_REG_INDEX * 4);
+}
+} // namespace host_signal
+#elif defined(ARCH_QUASAR)
+// Quasar has no overlay streams: TT_CLUSTER_CTRL_SCRATCH_28..31 (host readable, outside L1, unused elsewhere) carry the
+// TRISC completion flags in slots 0..3, so the host can wait on a kernel without reading its L1.
+namespace host_signal
+{
+constexpr std::uint32_t CLUSTER_CTRL_SCRATCH_28 = 0x030000B0;
+
+TT_ALWAYS_INLINE void write([[maybe_unused]] std::uint32_t slot, [[maybe_unused]] std::uint32_t value)
+{
+#if !defined(TT_METAL_TTSIM) // ttsim models no cluster control scratch registers; the host polls L1 there
+    *reinterpret_cast<volatile std::uint32_t*>(CLUSTER_CTRL_SCRATCH_28 + slot * 4) = value;
+#endif
+}
+} // namespace host_signal
+#endif
+
+__attribute__((no_profile_instrument_function)) TT_ALWAYS_INLINE void do_crt0()
+{
+    asm volatile(
+        ".option push\n"
+        ".option norelax\n"
+        "la gp, __global_pointer$\n"
+        ".option pop" ::
+            : "memory");
+
+    // Set stack pointer
+    asm volatile("la sp, %0" : : "i"(__stack_top) : "memory");
+
+    // Before any global constructor or Tensix instruction can run.
+    configure_gathering();
+
+    // Initialize .bss
+    for (volatile std::uint32_t* p = (volatile std::uint32_t*)__ldm_bss_start; p < (volatile std::uint32_t*)__ldm_bss_end; p++)
+    {
+        *p = 0;
+    }
+
+    // Copy .loader_init to .ldm_data
+    if ((std::uint32_t)__loader_init_start != (std::uint32_t)__loader_init_end)
+    {
+        volatile std::uint32_t* src = (volatile std::uint32_t*)__loader_init_start;
+        volatile std::uint32_t* dst = (volatile std::uint32_t*)__ldm_data_start;
+        volatile std::uint32_t* end = (volatile std::uint32_t*)__ldm_data_end;
+        while (dst < end)
+        {
+            *dst++ = *src++;
+        }
+    }
+
+    // Execute global constructors
+    for (void (**temp_constructor)(void) = __init_array_start; temp_constructor < __init_array_end; temp_constructor++)
+    {
+        (*temp_constructor)();
+    }
+}
+
+void _init(void)
+{
+}
+
+void _fini(void)
+{
+}
+
+using mailbox_t = volatile std::uint32_t*;
+
+#ifdef ARCH_WORMHOLE
+constexpr std::uint32_t TRISC_START_BASE    = 0x16DFF0;
+constexpr std::uint32_t TRISC_CONFIG_REGS[] = {TRISC_RESET_PC_SEC0_PC_ADDR32, TRISC_RESET_PC_SEC1_PC_ADDR32, TRISC_RESET_PC_SEC2_PC_ADDR32};
+
+mailbox_t trisc_start_addresses = reinterpret_cast<mailbox_t>(TRISC_START_BASE);
+#endif
+
+TT_ALWAYS_INLINE void device_setup()
+{
+#if defined(ARCH_WORMHOLE)
+    // Use array-based initialization for consecutive TRISC addresses
+    volatile std::uint32_t tt_reg_ptr* cfg_regs = reinterpret_cast<volatile std::uint32_t tt_reg_ptr*>(TENSIX_CFG_BASE);
+
+    for (unsigned int i = 0; i < std::size(TRISC_CONFIG_REGS); ++i)
+    {
+        cfg_regs[TRISC_CONFIG_REGS[i]] = trisc_start_addresses[i];
+    }
+    cfg_regs[TRISC_RESET_PC_OVERRIDE_Reset_PC_Override_en_ADDR32] = 0b111;
+#endif
+#if defined(ARCH_BLACKHOLE) && !defined(ARCH_QUASAR) // Ugly hack for now
+    ckernel::reg_write(RISCV_DEBUG_REG_DEST_CG_CTRL, 0);
+#endif
+#if defined(ARCH_BLACKHOLE) || defined(ARCH_QUASAR)
+    TTI_ZEROACC(ckernel::p_zeroacc::CLR_ALL, 0, 0, 1, 0);
+#else
+    TTI_ZEROACC(ckernel::p_zeroacc::CLR_ALL, 0, 0);
+#endif
+
+#if defined(ARCH_QUASAR)
+    // Reset all dest dvalid bits for all clients
+    TTI_CLEARDVALID(0, 0, 0xf, 0xf, 0, 0);
+    volatile std::uint32_t* dvalid_cfg                      = reinterpret_cast<volatile std::uint32_t*>(TENSIX_CFG_BASE);
+    dvalid_cfg[UNPACK_TO_DEST_DVALID_CTRL_wait_mask_ADDR32] = 0;
+    dvalid_cfg[MATH_DEST_DVALID_CTRL_wait_mask_ADDR32]      = 0;
+    dvalid_cfg[SFPU_DEST_DVALID_CTRL_wait_mask_ADDR32]      = 0;
+    dvalid_cfg[PACK_DEST_DVALID_CTRL_wait_mask_ADDR32]      = 0;
+    TTI_SEMINIT(1, 0, 0, ckernel::trisc::semaphore::t6_sem(ckernel::trisc::semaphore::PACK_UNPACK));
+    TTI_SEMINIT(2, 0, 0, ckernel::trisc::semaphore::t6_sem(ckernel::trisc::semaphore::MATH_PACK));
+#endif
+
+// Enable CC stack
+#if defined(ARCH_QUASAR)
+    TTI_SFPENCC(3, 10);
+#else
+    TTI_SFPENCC(3, 0, 0, 10);
+#endif
+
+    TTI_NOP;
+
+    // Set default sfpu constant register state
+    TTI_SFPCONFIG(0, 11, 1); // loading -1 to LREG11 where sfpi expects it
+
+#ifndef ARCH_QUASAR
+    // Initialize tensix semaphores
+    ckernel::t6_semaphore_init(ckernel::semaphore::UNPACK_TO_DEST, 0, 1);
+    ckernel::t6_semaphore_init(ckernel::semaphore::MATH_DONE, 0, 1);
+    // A kernel that ends with a dest section still posted would otherwise stall the next math init.
+    ckernel::t6_semaphore_init(ckernel::semaphore::MATH_PACK, 0, 2);
+#if defined(LLK_BARRIER_ON_TRISC)
+    // barrier.h is already in scope and has reserved the raw names, so go through its own.
+    // Every peer posts its arrival before the action thread takes any, so the count reaches NUM_THREADS - 1.
+    ckernel::t6_semaphore_init(llk_barrier::ARRIVE_SEM, 0, llk_barrier::NUM_THREADS - 1);
+    ckernel::t6_semaphore_init(llk_barrier::RELEASE_SEM, 0, 1);
+#else
+    // barrier.h's ARRIVE_SEM, for a boot without barrier.h in scope, such as BRISC's.
+    ckernel::t6_semaphore_init(ckernel::semaphore::PACK_DONE, 0, 2);
+    ckernel::t6_semaphore_init(ckernel::semaphore::UNPACK_OPERAND_SYNC, 0, 1);
+#endif
+    // The REG_RMW mutex keeps its last grantee across kernels (chip reset only) and the unpack and pack inits race for
+    // it, so take and release it here: every launch then starts with the same thread ahead in its round robin.
+    TTI_ATGETM(ckernel::mutex::REG_RMW);
+    TTI_ATRELM(ckernel::mutex::REG_RMW);
+#endif
+}
+
+#if defined(ARCH_QUASAR)
+constexpr std::uint32_t TRISC_SOFT_RESET_MASK = 0x7000; // TRISC1..3 (TRISC0 is bit 11): what unpack releases
+#else
+constexpr std::uint32_t TRISC_SOFT_RESET_MASK  = RISCV_SOFT_RESET_0_TRISCS;
+constexpr std::uint32_t TRISC1_SOFT_RESET_MASK = 0x2000; // math: tensix.h has no per TRISC bit
+static_assert((TRISC1_SOFT_RESET_MASK & RISCV_SOFT_RESET_0_TRISCS) == TRISC1_SOFT_RESET_MASK);
+#endif
+
+#ifndef ARCH_QUASAR
+
+// Include functions that have ckernel definitions of underlying callees
+
+TT_ALWAYS_INLINE void enable_branch_prediction()
+{
+    volatile std::uint32_t* tt_reg_ptr cfg_ptr = ckernel::get_cfg_pointer();
+    cfg_ptr[DISABLE_RISC_BP_Disable_main_ADDR32] &= ~DISABLE_RISC_BP_Disable_main_MASK;
+}
+
+TT_ALWAYS_INLINE void disable_branch_prediction()
+{
+    volatile std::uint32_t* tt_reg_ptr cfg_ptr = ckernel::get_cfg_pointer();
+    cfg_ptr[DISABLE_RISC_BP_Disable_main_ADDR32] |= DISABLE_RISC_BP_Disable_main_MASK;
+}
+
+template <typename T, typename U, typename = std::enable_if_t<std::is_trivially_copyable_v<T> && std::is_trivially_assignable_v<T&, U> > >
+inline void commit_store(volatile T* ptr, U&& val)
+{
+    ckernel::store_blocking(ptr, val);
+
+    do
+    {
+        asm volatile("nop");
+    } while (ckernel::load_blocking(ptr) != val);
+}
+
+#endif
+
+TT_ALWAYS_INLINE void clear_trisc_soft_reset()
+{
+    std::uint32_t soft_reset = ckernel::reg_read(RISCV_DEBUG_REG_SOFT_RESET_0);
+    soft_reset &= ~TRISC_SOFT_RESET_MASK;
+    ckernel::reg_write(RISCV_DEBUG_REG_SOFT_RESET_0, soft_reset);
+
+    do
+    {
+        asm volatile("nop");
+    } while (ckernel::reg_read(RISCV_DEBUG_REG_SOFT_RESET_0) != soft_reset);
+}

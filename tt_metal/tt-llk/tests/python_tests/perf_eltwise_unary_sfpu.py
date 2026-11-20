@@ -1,0 +1,408 @@
+# SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+# SPDX-License-Identifier: Apache-2.0
+
+import os
+
+import pytest
+from conftest import skip_for_blackhole, skip_for_quasar, skip_for_wormhole
+from helpers.constraints import distinct_dest_accumulation_modes
+from helpers.data_format_inference import unpacks_to_dest
+from helpers.format_config import DataFormat
+from helpers.llk_params import (
+    ApproximationMode,
+    DestAccumulation,
+    DestSync,
+    FastMode,
+    FusedSort,
+    MathOperation,
+    StableSort,
+)
+from helpers.param_config import input_output_formats, parametrize
+from helpers.perf.core import ALL_PERF_RUN_TYPES
+from helpers.sfpu_domains import sfpu_unary_ops
+from test_eltwise_unary_sfpu import eltwise_unary_sfpu
+
+_OPS_WITHOUT_DEST_ACC = {
+    MathOperation.Abs,
+    # Acosh/Asinh now select their log1p polynomial precision from the dest-accum
+    # (is_fp32_dest_acc_en) flag, so both modes are exercised.
+    MathOperation.Celu,
+    MathOperation.Cos,
+    MathOperation.Elu,
+    MathOperation.Exp2,
+    MathOperation.Exp,
+    MathOperation.Fill,
+    MathOperation.Gelu,
+    MathOperation.GeluTanh,
+    MathOperation.Hardsigmoid,
+    MathOperation.Log,
+    MathOperation.Neg,
+    MathOperation.Silu,
+    MathOperation.Sin,
+    MathOperation.Square,
+    MathOperation.Threshold,
+    MathOperation.ReluMax,
+    MathOperation.ReluMin,
+}
+
+# The swept ops whose dispatcher reads FAST_MODE (sfpu_operations.h); for any other op,
+# fast_mode Yes and No build the same kernel.
+_OPS_WITH_FAST_MODE = {
+    MathOperation.Rsqrt,
+    MathOperation.Sqrt,
+}
+
+_OPS_WITH_STABLE_SORT = {
+    MathOperation.TopKLocalSort,
+    MathOperation.TopKMerge,
+    MathOperation.TopKRebuild,
+}
+
+# The defuse sweep belongs to the fused engine only.
+_OPS_FUSED_ONLY = {MathOperation.TopKDefuse}
+
+
+def _get_dest_acc_modes(mathop, formats):
+    if mathop in _OPS_FUSED_ONLY:
+        return [DestAccumulation.Yes]
+    if mathop in _OPS_WITHOUT_DEST_ACC:
+        return [DestAccumulation.No]
+    # TestConfig promotes dest_acc=No to Yes for outlier format combos, so asking
+    # for both would record two rows with an identical key (the same kernel twice).
+    return distinct_dest_accumulation_modes(
+        formats, [DestAccumulation.Yes, DestAccumulation.No]
+    )
+
+
+def _get_fast_modes(mathop):
+    if mathop in _OPS_WITH_FAST_MODE:
+        return [FastMode.Yes, FastMode.No]
+    return [FastMode.No]
+
+
+def _get_fused_sort_modes(mathop):
+    if mathop in _OPS_FUSED_ONLY:
+        return [FusedSort.Yes]
+    if mathop in _OPS_WITH_STABLE_SORT:
+        return [FusedSort.Yes, FusedSort.No]
+    return [FusedSort.No]
+
+
+def _get_stable_sort_modes(mathop):
+    if mathop in _OPS_WITH_STABLE_SORT:
+        return [StableSort.Yes, StableSort.No]
+    return [StableSort.No]
+
+
+# Every op with a unary SFPU kernel, taken from the same registry the correctness sweep
+# in test_eltwise_unary_sfpu.py drives, so an op cannot be added there and silently skip perf.
+# _UNARY_OPS_NOT_SWEPT is deliberately *not* subtracted: those ops (the topk halves) are
+# exempt from the correctness sweep precisely because they are perf-only, so they belong
+# here. Sorted so the parametrize ids are stable across runs.
+PERF_SWEEP_OPS = sorted(sfpu_unary_ops(), key=lambda op: op.name)
+
+# Five PerfRunTypes per variant, so every registry op against every _FULL_FORMAT_PAIRS pair
+# would multiply the ELF builds and profiled runs on llk_perf_tests.yaml's five shards
+# (97 ops x 16 pairs was ~30k, against ~6.4k before the reroute) -- and it buys little,
+# since an SFPU kernel's math cost is its instruction sequence while the format pair moves
+# unpack/pack cycles, which these ops already characterise. So every op is still swept
+# (with its own dest_acc / fast_mode / stable_sort / approx_mode), but only the pre-reroute
+# set carries the full _FULL_FORMAT_PAIRS matrix.
+_FULL_FORMAT_MATRIX_OPS = frozenset(
+    {
+        MathOperation.Reciprocal,
+        MathOperation.Sqrt,
+        MathOperation.Rsqrt,
+        MathOperation.Silu,
+        MathOperation.Gelu,
+        MathOperation.GeluTanh,
+        MathOperation.Exp,
+        MathOperation.TopKLocalSort,
+        MathOperation.TopKMerge,
+        MathOperation.TopKRebuild,
+    }
+)
+
+_FULL_FORMATS = [
+    DataFormat.Float32,
+    DataFormat.Float16_b,
+    DataFormat.Bfp8_b,
+]
+
+# Float16_b in and out: the SFPU's native 16-bit exponent-B format, so the measurement is
+# the kernel's own cost with no unpack/pack conversion folded in.
+_REPRESENTATIVE_FORMAT = [DataFormat.Float16_b]
+
+_FULL_FORMAT_PAIRS = input_output_formats(_FULL_FORMATS)
+_REPRESENTATIVE_FORMAT_PAIRS = input_output_formats(_REPRESENTATIVE_FORMAT)
+
+# An op named here but no longer in the sweep would silently stop being measured on the
+# full matrix, which is the one regression this split can cause.
+_UNSWEPT_FULL_MATRIX_OPS = sorted(
+    op.name for op in _FULL_FORMAT_MATRIX_OPS - set(PERF_SWEEP_OPS)
+)
+assert not _UNSWEPT_FULL_MATRIX_OPS, (
+    "these ops are declared as carrying the full format matrix but are not in "
+    f"PERF_SWEEP_OPS: {_UNSWEPT_FULL_MATRIX_OPS}"
+)
+
+
+# Local opt-in: LLK_PERF_FULL_FORMAT_OPS="Softplus,..." gives the named ops the full matrix too.
+_EXTRA_FULL_FORMAT_OPS = frozenset(
+    MathOperation[name.strip()]
+    for name in os.environ.get("LLK_PERF_FULL_FORMAT_OPS", "").split(",")
+    if name.strip()
+)
+
+
+def _get_formats(mathop):
+    if mathop in _FULL_FORMAT_MATRIX_OPS or mathop in _EXTRA_FULL_FORMAT_OPS:
+        return _FULL_FORMAT_PAIRS
+    return _REPRESENTATIVE_FORMAT_PAIRS
+
+
+@pytest.mark.perf
+@parametrize(
+    formats=lambda mathop: _get_formats(mathop),
+    approx_mode=[
+        ApproximationMode.Yes,
+        ApproximationMode.No,
+    ],
+    mathop=PERF_SWEEP_OPS,
+    dest_acc=lambda mathop, formats: _get_dest_acc_modes(mathop, formats),
+    loop_factor=[
+        16,
+    ],  # Number of iterations to run the test in order to minimize profiler overhead in measurement
+    iterations=[
+        32,
+    ],  # Number of SFPU iterations
+    fast_mode=lambda mathop: _get_fast_modes(mathop),
+    stable_sort=lambda mathop: _get_stable_sort_modes(mathop),
+    fused_sort=lambda mathop: _get_fused_sort_modes(mathop),
+    dest_sync=[DestSync.Half],
+    input_dimensions=[
+        [128, 64],  # tile_cnt: 8
+    ],  # Specifying different input sizes to cover different tile counts
+)
+def test_perf_eltwise_unary_sfpu(
+    perf_report,
+    formats,
+    mathop,
+    approx_mode,
+    dest_acc,
+    loop_factor,
+    iterations,
+    fast_mode,
+    stable_sort,
+    fused_sort,
+    dest_sync,
+    input_dimensions,
+):
+    if fused_sort == FusedSort.Yes and (
+        stable_sort == StableSort.Yes
+        or dest_acc == DestAccumulation.No
+        or formats.input_format != DataFormat.Float16_b
+        or formats.output_format != DataFormat.Float16_b
+    ):
+        # Fused keys: bf16-only, 32-bit DEST, and mutually exclusive with the comparator-stable
+        # mode -- only the (Float16_b -> Float16_b, dest_acc=Yes) rows are meaningful.
+        pytest.skip(
+            "fused sort requires bf16 formats, dest_acc=Yes, and stable_sort=No"
+        )
+
+    # A 32-bit (fp32) input with dest_acc ON unpacks straight into the 32-bit Dest
+    # register. With dest_acc OFF it goes through the source registers (converted to 16-bit)
+    # and is copied into Dest for the SFPU op.
+    unpack_to_dest = unpacks_to_dest(formats.input_format, dest_acc)
+
+    eltwise_unary_sfpu(
+        formats=formats,
+        dest_acc=dest_acc,
+        approx_mode=approx_mode,
+        mathop=mathop,
+        fast_mode=fast_mode,
+        input_dimensions=input_dimensions,
+        dest_sync=dest_sync,
+        clamp_negative=False,
+        iterations=iterations,
+        stable_sort=stable_sort,
+        fused_sort=fused_sort,
+        loop_factor=loop_factor,
+        unpack_to_dest=unpack_to_dest,
+        is_perf=True,
+        perf_report=perf_report,
+        run_types=ALL_PERF_RUN_TYPES,
+        check_golden=False,
+    )
+
+
+# Extra slices for formats the main sweep does not cover. They must use
+# ALL_PERF_RUN_TYPES so this module's single CSV has one column schema.
+_EXTRA_SLICE_DIMS = [[128, 64]]  # tile_cnt: 8
+
+# AddInt32/SubInt32 are perf-only until the int32-unary functional sweep is
+# unblocked (tt-llk #495); integer add/sub is covered via the binary path.
+_INT32_UNARY_OPS = [
+    MathOperation.AddInt32,
+    MathOperation.SubInt32,
+    MathOperation.AbsInt32,
+    MathOperation.ReluMin,
+    MathOperation.BitwiseNot,
+    MathOperation.LogicalNot,
+    MathOperation.Fill,
+]
+
+# uint16 (calculate_comp_uint16) and uint32 (calculate_eqz/nez_uint32) only support
+# equality against zero.
+_UINT_COMP_OPS = [
+    MathOperation.EqualZero,
+    MathOperation.NotEqualZero,
+]
+
+
+def _extra_slice_run(
+    perf_report, formats, mathop, dest_acc, unpack_to_dest, input_dimensions
+):
+    eltwise_unary_sfpu(
+        formats=formats,
+        dest_acc=dest_acc,
+        approx_mode=ApproximationMode.No,
+        mathop=mathop,
+        fast_mode=FastMode.No,
+        input_dimensions=input_dimensions,
+        dest_sync=DestSync.Half,
+        clamp_negative=False,
+        unpack_to_dest=unpack_to_dest,
+        is_perf=True,
+        perf_report=perf_report,
+        run_types=ALL_PERF_RUN_TYPES,
+        check_golden=False,
+        loop_factor=16,
+    )
+
+
+@pytest.mark.perf
+@parametrize(
+    formats=input_output_formats([DataFormat.Int32], same=True),
+    mathop=_INT32_UNARY_OPS,
+    input_dimensions=_EXTRA_SLICE_DIMS,
+)
+def test_perf_eltwise_unary_sfpu_int32(perf_report, formats, mathop, input_dimensions):
+    _extra_slice_run(
+        perf_report,
+        formats,
+        mathop,
+        DestAccumulation.No,
+        formats.input_format.is_32_bit(),
+        input_dimensions,
+    )
+
+
+# The Int32 unary shifts in their production configuration (32-bit Dest, unpacked to Dest); the
+# instruction stream does not depend on the shift amount.
+_INT32_SHIFT_OPS = [
+    MathOperation.LeftShift,
+    MathOperation.RightShift,
+]
+
+
+@pytest.mark.perf
+@parametrize(
+    formats=input_output_formats([DataFormat.Int32], same=True),
+    mathop=_INT32_SHIFT_OPS,
+    input_dimensions=_EXTRA_SLICE_DIMS,
+)
+def test_perf_eltwise_unary_sfpu_int_shift(
+    perf_report, formats, mathop, input_dimensions
+):
+    _extra_slice_run(
+        perf_report,
+        formats,
+        mathop,
+        dest_acc=DestAccumulation.Yes,
+        unpack_to_dest=True,
+        input_dimensions=input_dimensions,
+    )
+
+
+def _comp_dest_acc(formats):
+    # 32-bit inputs (UInt32) are unpacked straight into DEST and the uint32 kernels do
+    # full-word DataLayout::U32 accesses, so they require a 32-bit DEST. Mirror the
+    # correctness test (test_eltwise_unary_sfpu_int) and constraints.py, which force
+    # dest_acc=Yes for 32-bit formats; hardcoding No here would measure an unsupported config.
+    if formats.input_format.is_32_bit():
+        return DestAccumulation.Yes
+    return DestAccumulation.No
+
+
+@skip_for_blackhole
+@pytest.mark.perf
+@parametrize(
+    formats=input_output_formats([DataFormat.UInt16], same=True),
+    mathop=_UINT_COMP_OPS,
+    input_dimensions=_EXTRA_SLICE_DIMS,
+)
+def test_perf_eltwise_unary_sfpu_comp_uint16(
+    perf_report, formats, mathop, input_dimensions
+):
+    dest_acc = _comp_dest_acc(formats)
+    _extra_slice_run(
+        perf_report,
+        formats,
+        mathop,
+        dest_acc,
+        formats.input_format.is_32_bit(),
+        input_dimensions,
+    )
+
+
+@skip_for_blackhole
+@pytest.mark.perf
+@parametrize(
+    formats=input_output_formats([DataFormat.UInt32], same=True),
+    mathop=_UINT_COMP_OPS,
+    input_dimensions=_EXTRA_SLICE_DIMS,
+)
+def test_perf_eltwise_unary_sfpu_comp_uint32(
+    perf_report, formats, mathop, input_dimensions
+):
+    dest_acc = _comp_dest_acc(formats)
+    _extra_slice_run(
+        perf_report,
+        formats,
+        mathop,
+        dest_acc,
+        formats.input_format.is_32_bit(),
+        input_dimensions,
+    )
+
+
+@pytest.mark.perf
+@skip_for_quasar
+@skip_for_wormhole
+@parametrize(
+    formats=input_output_formats([DataFormat.Float16_b]),
+    mathop=[MathOperation.QuickGelu],
+    dest_acc=[DestAccumulation.No, DestAccumulation.Yes],
+    input_dimensions=_EXTRA_SLICE_DIMS,
+)
+def test_perf_eltwise_unary_sfpu_quick_gelu(
+    perf_report, formats, mathop, dest_acc, input_dimensions
+):
+    _extra_slice_run(perf_report, formats, mathop, dest_acc, False, input_dimensions)
+
+
+@pytest.mark.perf
+@parametrize(
+    formats=input_output_formats([DataFormat.Float32]),
+    mathop=[MathOperation.Erfinv],
+    input_dimensions=_EXTRA_SLICE_DIMS,
+)
+def test_perf_eltwise_unary_sfpu_erfinv_fp32(
+    perf_report, formats, mathop, input_dimensions
+):
+    dest_acc = DestAccumulation.Yes
+    unpack_to_dest = unpacks_to_dest(formats.input_format, dest_acc)
+    _extra_slice_run(
+        perf_report, formats, mathop, dest_acc, unpack_to_dest, input_dimensions
+    )

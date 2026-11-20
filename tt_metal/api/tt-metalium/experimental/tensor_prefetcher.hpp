@@ -1,0 +1,265 @@
+// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+// Experimental Start / Queue / Stop lifecycle API for the queueable Tensor
+// prefetcher. Long-running device kernels serve requests that each name a set of
+// DRAM-sender PrefetcherPipes and a per-tensor work list. The host can keep
+// queueing new requests after Start returns; each pipe's ring state (write
+// cursors, credit counters) is preserved on the device between requests, so
+// successive requests can target different pipe sets and switch back and forth.
+//
+// State (device kernels, request transport, host worker thread, held tensor refs)
+// lives on MeshDeviceImpl. Only one prefetcher may be active per mesh device at a time.
+
+#pragma once
+
+#include <cstdint>
+#include <functional>
+#include <optional>
+#include <vector>
+
+#include <tt-metalium/experimental/prefetcher_pipe.hpp>
+#include <tt_stl/optional_reference.hpp>
+
+namespace tt::tt_metal {
+
+class MeshTensor;
+
+namespace distributed {
+class MeshDevice;
+class MeshCommandQueue;
+class MeshCoordinateRangeSet;
+}  // namespace distributed
+
+namespace experimental {
+
+struct BlackholeTensorPrefetcherConfig {
+    // GDDR Memory Controller Multi-Port Front End (MPFE) weighted round-robin service levels.
+    // Higher relative values receive more arbitration service; valid weights are 0 through 7.
+    //
+    // The controller register names use slots P1/P2/P3, which correspond to the Blackhole
+    // DRAM tile names D0/D1/D2, respectively. These config fields name traffic roles rather
+    // than fixed D tiles because each DRAM bank's SoC descriptor assigns those roles:
+    //   - free_sender_mpfe_weight: the unreserved D tile selected for the first prefetch sender.
+    //   - noc1_sender_mpfe_weight: the D tile named by worker_endpoint[1].
+    //   - ordinary_mpfe_weight: the D tile named by worker_endpoint[0].
+    uint32_t free_sender_mpfe_weight = 0;
+    uint32_t noc1_sender_mpfe_weight = 1;
+    uint32_t ordinary_mpfe_weight = 5;
+
+    // Static mode holds the active L/M/H tuple for the prefetcher's lifetime.
+    // Dynamic mode idles both prefetch senders at H and independently lowers each
+    // sender to its active weight only while that sender processes a request.
+    bool dynamic_mpfe_weighting = false;
+
+    // The benchmark tuner runs unchanged model commands by setting
+    // TT_METAL_BENCHMARK_TENSOR_PREFETCHER_ENABLE=1 plus per-field environment
+    // overrides. While enabled, those benchmark-only values take precedence over
+    // this config and the resolved policy is logged.
+};
+
+// Architectures apply their default config when arch specific configs are unset.
+struct TensorPrefetcherConfig {
+    std::optional<BlackholeTensorPrefetcherConfig> blackhole = std::nullopt;
+};
+
+// Returns true if the Tensor prefetcher is supported on `mesh_device`. Both must hold:
+//   - the device can run DRAM-sender endpoints: Blackhole with firmware >= 19.12.0.0, or
+//     Quasar running fast dispatch with one command queue, and
+//   - the streaming profiler is off. TT_METAL_STREAMING_PROFILER=1 parks a resident relay
+//     on the same free DRAM subchannel a bank's first prefetch sender uses, with both of
+//     that DRISC's NIUs in stream mode, so the two cannot coexist.
+// When this returns false, StartTensorPrefetcher TT_FATALs, so callers (e.g. tests) can
+// use this to skip rather than fail.
+bool IsTensorPrefetcherSupported(const distributed::MeshDevice& mesh_device);
+
+// Picks which groups of a grouped weight a request streams. A grouped weight is a receiver-
+// contiguous weight whose NdShardSpec shard is (G, K, N / ring_size) with G the tensor's dim -3, so
+// every receiver slab stacks all G groups (e.g. MoE experts). With a selector the prefetcher reads
+// `mask` on device when it reaches the request and streams, in ascending group order, only the groups
+// whose mask entry is non-zero -- the order a sparse matmul scans the same mask in. Reading it on
+// device is what lets a traced request follow a mask the device rewrites between replays.
+//
+// `mask` must be a ROW_MAJOR, BFLOAT16 or UINT16 tensor of exactly G elements in one page (every dim
+// but the last is 1), G <= 256, on the same mesh as the weight, in DRAM (interleaved) or in L1 on a
+// single core. It must be written before the prefetcher reaches the request and must not change until
+// the consumer that reads it has run; otherwise the prefetcher and the consumer disagree on which
+// groups arrive and the delivery target deadlocks. Order the prefetcher after the write with
+// WaitForCqOnTensorPrefetcher when the host enqueues it, or with QueueTensorPrefetcherWaitForSignal
+// and a signaling op after the write when the write is device work captured into a trace. Neither
+// wait can be recorded into a CommandList, so a mask written by an op inside the same list is not
+// ordered on replay: write it, and fence it, before EnqueueCommandList.
+struct TensorPrefetcherGroupSelector {
+    std::reference_wrapper<const MeshTensor> mask;
+};
+
+// One prefetch work item: a weight tensor plus the number of K-blocks to split
+// its K dimension into (k_block_w_tiles = ceil(K_tiles / block_count) for a
+// K-row-major weight; a receiver-contiguous one needs block_count to divide K),
+// so different tensors — within one request or across pipe sets — can use
+// different K-block counts. The consuming matmul must wait_front(block_count)
+// per layer.
+//
+// Required `tensor` layout (validated at Queue time, when the request is
+// serialized):
+//   - DRAM-resident, TILE layout,
+//   - width-sharded across all DRAM banks (one shard per bank; each shard holds
+//     the full K dimension and `N / num_dram_banks` columns),
+//   - tile-aligned in both K and N (shard_shape divisible by TILE_HEIGHT/WIDTH).
+// The per-bank N columns are further split evenly across that bank's receivers,
+// so `N_per_bank` (= N / num_dram_banks) must divide that bank's receiver count:
+// receiver r in bank b owns columns
+// `[b*N_per_bank + r*N_per_recv, b*N_per_bank + (r+1)*N_per_recv)`, where
+// N_per_recv = N_per_bank / num_receivers_per_sender.
+struct TensorPrefetcherInput {
+    std::reference_wrapper<const MeshTensor> tensor;
+    uint32_t block_count = 0;
+    // Per-receiver streaming rotation (receiver-contiguous layout only). Empty = batched
+    // (whole-tensor) delivery. When non-empty, the kernel delivers this tensor's K-blocks in
+    // the host-specified rotated order: at push step p, the receiver at global receiver
+    // position r sources physical block (rotation[r] + p) mod block_count. This lets the
+    // consuming matmul stream blocks in FIFO order and start before the whole tensor arrives
+    // (allowing a shallow ring), and gives the host full control over which block leads each
+    // receiver rather than fixing it to the topology position.
+    //
+    // When non-empty, `rotation` must have exactly `total_receivers` (== ring size ==
+    // block_count) entries, each in [0, block_count), indexed by global receiver position. That
+    // position is derived from the weight's shard distribution: ROUND_ROBIN_1D (strided) and
+    // CONTIGUOUS_1D (contiguous) receiver-contiguous weights are both supported; the host maps
+    // each receiver's (bank, slab index) to its global position accordingly. For the standard
+    // ring matmul, rotation[r] = r reproduces the natural topology order. The matmul must be
+    // built to consume in the matching order, else it deadlocks. The host is responsible for
+    // supplying a rotation consistent with the consumer's ring topology.
+    std::vector<uint32_t> rotation;
+    // Grouped weights only. Unset streams every group in ascending order.
+    std::optional<TensorPrefetcherGroupSelector> group_selector = std::nullopt;
+};
+
+// Start the prefetcher's device kernels where they are not already running (on
+// Blackhole, two per DRAM bank), open the per-device request transport, and spawn
+// the host worker thread that drains the request queue. Returns immediately. No
+// prefetch work is scheduled yet; the kernels wait for requests.
+//
+// Each queued pipe set selects which of the provisioned senders receive its PREFETCH
+// requests. Single-sender pipe sets leave the second sender for each bank idle;
+// dual-sender ones use both.
+//
+// Receiver count is owned by each pipe (read from its sender config page on every
+// request), so a single prefetcher can serve pipe sets with different receiver
+// counts.
+//
+// Preconditions (TT_FATAL):
+//   - No other prefetcher is currently active on this mesh device.
+//   - IsTensorPrefetcherSupported(mesh_device).
+void StartTensorPrefetcher(distributed::MeshDevice& mesh_device, const TensorPrefetcherConfig& config);
+
+// Queue one prefetch request. Non-blocking.
+//
+//   - `prefetcher_pipes` must be every pipe of one CreatePrefetcherPipesForTensorPrefetcher result
+//     for the same mesh device, in any order. Each pipe carries its bank-local slab base. Consumers
+//     bind each pipe on its own receivers through ProgramRunArgs and read through the device-side
+//     experimental::PrefetcherPipe.
+//   - `device_subset` defaults to the full mesh when std::nullopt. Devices
+//     outside the subset do not process this request.
+//   - `input_tensors` is the full, flattened list of weight tensors to prefetch
+//     (at least one), each paired with the block_count to divide its K dimension
+//     into. They are streamed to the receivers in list order; pass distinct
+//     tensors for distinct model layers, or repeat a tensor to replay it. Tensors
+//     that share a layout are deduplicated on the wire, and a list that overflows
+//     one request page is transparently split across pages.
+//   - Each pipe's write cursors are preserved across requests, so successive Queue
+//     calls against the same pipes resume where the previous call left off.
+//   - Per-tensor `rotation` (on each TensorPrefetcherInput) is documented on that struct; a
+//     non-empty rotation enables streaming and sets the per-receiver delivery order, the only
+//     knob that varies delivery order within a request.
+//   - `trace_capture_cq` is the command queue on which a trace may be recording, and
+//     must belong to `mesh_device`. When it is non-null and mid trace-capture, the
+//     request is captured into the trace instead of being sent, and is (re)sent on
+//     every replay of that trace (ReplayTrace / ttnn.execute_trace). Otherwise — a
+//     non-capturing queue, or null (the default) — the request is sent immediately,
+//     whatever any command queue is doing. Pass `&mesh_device.mesh_command_queue()`
+//     to opt into capture on the calling thread's current queue. To record a request
+//     into a CommandList, use CommandListBuilder::add_tensor_prefetcher_request.
+//
+// Further preconditions, all TT_FATAL with the offending values:
+//   - every pipe has a DRAM sender, comes from the same factory call, and shares one ring size;
+//     every pipe of that call is listed, each once;
+//   - receiver sets are disjoint across every pipe;
+//   - a K-row-major tensor (legacy WIDTH_SHARDED, one shard per bank sliced across that bank's
+//     receivers) needs one sender per bank, i.e. pipes created with support_multi_receiver_shards.
+//     One receiver per bank is the exception: a bank's whole shard is then that receiver's slab, so
+//     such a weight is read as receiver-contiguous (the two layouts name the same bytes).
+//
+// A tensor's per-receiver block size need not equal the pipes' `entry_size` nor divide the ring --
+// the sender re-grids its write cursor per tensor, and any trailing remainder of the ring is a gap
+// both endpoints credit at the wrap. The ring itself is fixed at creation and never resizes, so
+// size it for the consumer: one block is enough for the transport, while a consumer that keeps a
+// block of lookahead (a streaming matmul) needs two.
+//
+// The caller is responsible for keeping the tensors in `input_tensors` and the
+// pipes alive until Stop returns.
+void QueueTensorPrefetcherRequest(
+    distributed::MeshDevice& mesh_device,
+    const std::vector<std::reference_wrapper<const PrefetcherPipe>>& prefetcher_pipes,
+    ttsl::optional_reference<const distributed::MeshCoordinateRangeSet> device_subset,
+    const std::vector<TensorPrefetcherInput>& input_tensors,
+    distributed::MeshCommandQueue* trace_capture_cq = nullptr);
+
+// Fence the prefetcher against command queue `cq`: every prefetch request queued
+// after this call waits until all work previously enqueued on `cq` has completed
+// on device before it reads DRAM. Use this to guarantee that data written over
+// `cq` (e.g. the EnqueueWriteBuffer that populates the weights) has landed before
+// the prefetcher streams it.
+//
+// Call this synchronously on the host thread that issued the data writes — after
+// those writes, and before the QueueTensorPrefetcherRequest that consumes them.
+//
+//   - The prefetcher fenced is the one active on `cq.device()`.
+//   - `device_subset` defaults to the full mesh when std::nullopt.
+//
+// Preconditions (TT_FATAL): a prefetcher is active on `cq`'s mesh device.
+void WaitForCqOnTensorPrefetcher(
+    distributed::MeshCommandQueue& cq,
+    ttsl::optional_reference<const distributed::MeshCoordinateRangeSet> device_subset);
+
+// Number of op signals a running Tensor prefetcher offers. Signal ids are [0, kTensorPrefetcherNumSignals).
+inline constexpr uint32_t kTensorPrefetcherNumSignals = 8;
+
+// Returns the L1 address of op signal `signal_id`. A device kernel raises the signal by passing it to
+// experimental::tensor_prefetcher_signal (api/dataflow/tensor_prefetcher_signal.h);
+// ttnn.experimental.signal_tensor_prefetcher is an op that does only that. The address is the same on
+// every device of the mesh, so one program signals them all. It stays valid until StopTensorPrefetcher.
+//
+// Preconditions (TT_FATAL): a prefetcher is active on `mesh_device`, and signal_id is in range.
+uint32_t GetTensorPrefetcherSignalAddress(distributed::MeshDevice& mesh_device, uint32_t signal_id);
+
+// Queue a wait on op signal `signal_id`. On each device of the mesh, the prefetcher processes no request
+// queued after this one until that device has received the signal that pairs with this wait. Use it to
+// order the prefetcher after device work that has no host-side fence, such as a mask an op inside a
+// trace writes: run that op, then an op that signals, and queue the wait ahead of the request that
+// reads the mask.
+//
+// Waits and signals on one id pair up in order, counted per device from StartTensorPrefetcher: the n-th
+// wait proceeds once the n-th signal has arrived. A signal that arrives before its wait is kept, so the
+// signaling op may run before or after this call. Every device waits, so every device must signal, and
+// a signal with no matching wait releases a later wait early.
+//
+// `trace_capture_cq` works as it does for QueueTensorPrefetcherRequest. A captured wait is re-sent on
+// every replay, and each replay waits for one further signal rather than the count seen at capture, so
+// a trace that also captures the signaling op releases its own wait on every run.
+//
+// Preconditions (TT_FATAL): a prefetcher is active on `mesh_device`, signal_id is in range, and
+// `trace_capture_cq`, if given, belongs to `mesh_device`.
+void QueueTensorPrefetcherWaitForSignal(
+    distributed::MeshDevice& mesh_device,
+    uint32_t signal_id,
+    distributed::MeshCommandQueue* trace_capture_cq = nullptr);
+
+// Block until all previously queued requests have been delivered and the
+// kernels have exited, then release the prefetcher's resources. No-op if no
+// prefetcher is active.
+void StopTensorPrefetcher(distributed::MeshDevice& mesh_device);
+
+}  // namespace experimental
+}  // namespace tt::tt_metal

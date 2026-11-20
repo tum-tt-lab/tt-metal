@@ -1,0 +1,298 @@
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
+
+# SPDX-License-Identifier: Apache-2.0
+
+import os
+import shlex
+import signal
+import subprocess
+from pathlib import Path
+import pandas as pd
+from loguru import logger
+
+from tracy.common import PROFILER_ARTIFACTS_DIR, generate_reports_folder, PROFILER_DEFAULT_OP_SUPPORT_COUNT
+
+
+def get_profiler_folder(output_logs_subdir):
+    return PROFILER_ARTIFACTS_DIR / output_logs_subdir
+
+
+def get_latest_ops_log_filename(output_logs_subdir=""):
+    output_report_dir = generate_reports_folder(get_profiler_folder(output_logs_subdir))
+    runDate = sorted(os.listdir(output_report_dir))[-1]
+    filename = output_report_dir / runDate / f"ops_perf_results_{runDate}.csv"
+    return filename
+
+
+def post_process_ops_log(output_logs_subdir, columns=None, sum_vals=True, op_name="", has_signposts=False):
+    filename = get_latest_ops_log_filename(output_logs_subdir)
+    df = pd.read_csv(filename)
+
+    if has_signposts:
+        # there are explicit start and stop points in the model we want to measure between
+        markers = df[df["OP TYPE"] == "signpost"]["OP CODE"]
+        start = markers[markers == "start"].index[0]
+        stop = markers[markers == "stop"].index[0]
+        df = df.iloc[start + 1 : stop]
+    if op_name != "":
+        df = df[df["OP CODE"] == op_name]
+
+    results = {}
+    if columns:
+        assert (
+            type(columns) == list
+        ), f"Bad columns name type, requested columns should be of type list but {type(columns)} was provided"
+        for col in columns:
+            df_filtered = df[df[col] != "-"]
+            if sum_vals:
+                results[col] = df_filtered[col].astype(float).sum()
+            else:
+                results[col] = df_filtered[col].astype(float).to_numpy()
+    else:
+        results = df
+    return results
+
+
+def _build_profiler_cmd(
+    command,
+    output_profiler_dir,
+    check_test_return_code,
+    device_analysis_types,
+    python_post_process,
+    capture_perf_counters_groups,
+    sum_profiling,
+    op_support_count,
+    is_command_binary_exe,
+):
+    """Build the `python3 -m tracy ...` invocation as an argv list, to be run without a shell."""
+    cmd = ["python3", "-m", "tracy", "-p"]
+    if python_post_process:
+        cmd.append("-r")
+    cmd += ["-o", str(output_profiler_dir)]
+    if check_test_return_code:
+        cmd.append("--check-exit-code")
+    if device_analysis_types:
+        assert type(device_analysis_types) == list
+        for analysis in device_analysis_types:
+            cmd += ["-a", analysis]
+    if sum_profiling:
+        cmd.append("--enable-sum-profiling")
+    if op_support_count != PROFILER_DEFAULT_OP_SUPPORT_COUNT:
+        cmd += ["--op-support-count", str(op_support_count)]
+    if capture_perf_counters_groups:
+        assert type(capture_perf_counters_groups) == list
+        cmd.append("--profiler-capture-perf-counters=" + ",".join(capture_perf_counters_groups))
+        cmd.append("--perf-counter-multipass")
+    cmd += ["-t", "5000"]
+
+    if is_command_binary_exe:
+        # The caller hands over a shell-style command line (e.g. `-m 'pytest x.py -k "a and b"'`); split it the way
+        # the shell used to, so quoted arguments stay whole.
+        cmd += shlex.split(command)
+    else:
+        # A module command goes to tracy's -m as one argument, like the shlex.quote()d form did through the shell.
+        cmd += ["-m", command]
+    return cmd
+
+
+def merge_pass_csv(pass1_csv_path, pass2_csv_path):
+    """Merge L1 bank 1 columns from pass 2 CSV into the pass 1 CSV."""
+    df1 = pd.read_csv(pass1_csv_path)
+    df2 = pd.read_csv(pass2_csv_path)
+
+    # Identify L1_1-specific columns (present in pass2 but not in pass1)
+    l1_1_cols = [c for c in df2.columns if c not in df1.columns]
+    if not l1_1_cols:
+        logger.warning("No L1 bank 1 columns found in pass 2 CSV to merge")
+        return
+
+    merge_keys = ["GLOBAL CALL COUNT", "METAL TRACE ID", "METAL TRACE REPLAY SESSION ID"]
+    merged = df1.merge(df2[merge_keys + l1_1_cols], on=merge_keys, how="left")
+    merged.to_csv(pass1_csv_path, index=False)
+    logger.info(f"Merged {len(l1_1_cols)} L1 bank 1 columns from pass 2 into {pass1_csv_path}")
+
+
+def requires_multi_pass_profile(capture_perf_counters_groups):
+    """True if both L1_0 and L1_1 are requested (they share a mux and need two passes)."""
+    if not capture_perf_counters_groups:
+        return False
+    groups_lower = [g.lower() for g in capture_perf_counters_groups]
+    has_l1_0 = "l1_0" in groups_lower or "all" in groups_lower
+    has_l1_1 = "l1_1" in groups_lower
+    return has_l1_0 and has_l1_1
+
+
+def get_multi_pass_configs(capture_perf_counters_groups):
+    """Split counter groups into pass 1 (L1 bank 0) and pass 2 (L1 bank 1) groups."""
+    groups_lower = [g.lower() for g in capture_perf_counters_groups]
+    groups_pass1 = [g for g in capture_perf_counters_groups if g.lower() != "l1_1"]
+
+    if "all" in groups_lower:
+        groups_pass2 = ["fpu", "pack", "unpack", "l1_1", "instrn"]
+    else:
+        groups_pass2 = [g for g in capture_perf_counters_groups if g.lower() not in ("l1_0", "all")]
+        if "l1_1" not in [g.lower() for g in groups_pass2]:
+            groups_pass2.append("l1_1")
+
+    return groups_pass1, groups_pass2
+
+
+def _descendant_process_groups(root_pid):
+    """Process-group ids of root_pid and every descendant, from one `ps` snapshot.
+
+    `python -m tracy` starts its workload with os.setsid, so the captured test lives in a session of
+    its own: killing the profiler's group alone leaves that test (the process that actually hangs on
+    a dead device) holding the step's stdout. The snapshot has to be taken before anything is killed,
+    since orphans get re-parented to init and drop out of the tree.
+    """
+    groups = set()
+    try:
+        groups.add(os.getpgid(root_pid))
+    except ProcessLookupError:
+        pass
+    try:
+        table = subprocess.run(["ps", "-eo", "pid=,ppid=,pgid="], capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return groups
+    children, pgid_of = {}, {}
+    for line in table.splitlines():
+        parts = line.split()
+        if len(parts) != 3:
+            continue
+        pid, ppid, pgid = (int(x) for x in parts)
+        children.setdefault(ppid, []).append(pid)
+        pgid_of[pid] = pgid
+    stack = [root_pid]
+    while stack:
+        pid = stack.pop()
+        if pid in pgid_of:
+            groups.add(pgid_of[pid])
+        stack.extend(children.get(pid, []))
+    return groups
+
+
+def _run_profiler_cmd(profiler_cmd):
+    """Run the `python -m tracy ...` argv (no shell) in its own session; take the whole tree down with the caller.
+
+    A plain subprocess.run() does not kill its child on interruption: when the caller is interrupted
+    (pytest-timeout raising inside the wait, SIGINT) the orphaned `python -m tracy` and the test it
+    captured keep the CI step's stdout open until the step budget kills it (10 min on the Blackhole
+    device-perf legs after a 600 s pytest-timeout, e.g. 2026-09-16 jobs 104841076912 and
+    104881661500; 45 s of post-processing on wh_n150 on 09-10).
+    """
+    proc = subprocess.Popen(profiler_cmd, start_new_session=True)
+    try:
+        returncode = proc.wait()
+    except BaseException:
+        for pgid in _descendant_process_groups(proc.pid):
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        raise
+    if returncode != 0:
+        raise subprocess.CalledProcessError(returncode, profiler_cmd)
+
+
+def run_multi_pass(
+    command,
+    output_logs_subdir,
+    check_test_return_code,
+    device_analysis_types,
+    python_post_process,
+    capture_perf_counters_groups,
+    sum_profiling,
+    op_support_count,
+    is_command_binary_exe,
+):
+    """Run profiler twice to capture both L1 banks, then merge results."""
+    groups_pass1, groups_pass2 = get_multi_pass_configs(capture_perf_counters_groups)
+
+    # Pass 1: all groups except L1_1
+    output_profiler_dir = get_profiler_folder(output_logs_subdir)
+    profiler_cmd = _build_profiler_cmd(
+        command,
+        output_profiler_dir,
+        check_test_return_code,
+        device_analysis_types,
+        python_post_process,
+        groups_pass1,
+        sum_profiling,
+        op_support_count,
+        is_command_binary_exe,
+    )
+    logger.info(f"L1 two-pass: running pass 1 (L1 bank 0) — {shlex.join(profiler_cmd)}")
+    _run_profiler_cmd(profiler_cmd)
+
+    # Pass 2: L1_1 instead of L1_0
+    pass2_subdir = f"{output_logs_subdir}_l1_pass2"
+    output_profiler_dir_pass2 = get_profiler_folder(pass2_subdir)
+    profiler_cmd_pass2 = _build_profiler_cmd(
+        command,
+        output_profiler_dir_pass2,
+        check_test_return_code,
+        device_analysis_types,
+        python_post_process,
+        groups_pass2,
+        sum_profiling,
+        op_support_count,
+        is_command_binary_exe,
+    )
+    logger.info(f"L1 two-pass: running pass 2 (L1 bank 1) — {shlex.join(profiler_cmd_pass2)}")
+    _run_profiler_cmd(profiler_cmd_pass2)
+
+    # Merge L1_1 columns from pass 2 into pass 1 CSV
+    if python_post_process:
+        pass1_csv = get_latest_ops_log_filename(output_logs_subdir)
+        pass2_csv = get_latest_ops_log_filename(pass2_subdir)
+        merge_pass_csv(pass1_csv, pass2_csv)
+
+
+def run_device_profiler(
+    command,
+    output_logs_subdir,
+    check_test_return_code=True,
+    device_analysis_types=[],
+    python_post_process=True,
+    capture_perf_counters_groups=[],
+    sum_profiling=False,
+    # 1.333x matches the reserve some model tests depend on.
+    op_support_count=int(PROFILER_DEFAULT_OP_SUPPORT_COUNT * 1.333),
+    is_command_binary_exe=False,
+):
+    if requires_multi_pass_profile(capture_perf_counters_groups):
+        run_multi_pass(
+            command,
+            output_logs_subdir,
+            check_test_return_code,
+            device_analysis_types,
+            python_post_process,
+            capture_perf_counters_groups,
+            sum_profiling,
+            op_support_count,
+            is_command_binary_exe,
+        )
+    else:
+        output_profiler_dir = get_profiler_folder(output_logs_subdir)
+        profiler_cmd = _build_profiler_cmd(
+            command,
+            output_profiler_dir,
+            check_test_return_code,
+            device_analysis_types,
+            python_post_process,
+            capture_perf_counters_groups,
+            sum_profiling,
+            op_support_count,
+            is_command_binary_exe,
+        )
+        logger.info(shlex.join(profiler_cmd))
+        _run_profiler_cmd(profiler_cmd)
+
+
+def get_samples_per_s(time_ns, num_samples):
+    ns_to_s = 1e-9
+    return 1 / (time_ns * ns_to_s) * num_samples

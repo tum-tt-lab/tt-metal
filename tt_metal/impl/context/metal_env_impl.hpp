@@ -1,0 +1,234 @@
+// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <map>
+#include <mutex>
+#include <set>
+#include <atomic>
+#include <cstdint>
+#include <filesystem>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include <tt-metalium/core_coord.hpp>
+#include <tt-metalium/dispatch_core_common.hpp>
+#include <tt-metalium/experimental/context/metal_env.hpp>
+#include <tt-metalium/experimental/fabric/fabric_types.hpp>
+#include "llrt/core_descriptor_types.hpp"
+#include "tt_metal/llrt/hal.hpp"
+#include "tt_metal/llrt/tt_cluster.hpp"
+#include "tt_metal/llrt/rtoptions.hpp"
+
+namespace tt::tt_fabric {
+class ControlPlane;
+struct FabricTensixSessionInputs;
+}  // namespace tt::tt_fabric
+
+namespace tt::tt_metal::distributed {
+class SystemMesh;
+}  // namespace tt::tt_metal::distributed
+
+namespace tt::tt_metal::distributed::multihost {
+class DistributedContext;
+}
+
+namespace tt::tt_metal {
+
+class MetalEnvImpl {
+public:
+    explicit MetalEnvImpl(MetalEnvDescriptor descriptor);
+    ~MetalEnvImpl();
+
+    llrt::RunTimeOptions& get_rtoptions();
+    const Hal& get_hal();
+    const Hal& get_hal() const;
+    Cluster& get_cluster();
+    const Cluster& get_cluster() const;
+    distributed::SystemMesh& get_system_mesh();
+    const MetalEnvDescriptor& get_descriptor() const;
+
+    // Requested fabric configuration (configure_fabric). Distinct from get_fabric_config(), which is the runtime
+    // value and may differ after the dispatch fallback enables fabric.
+    const FabricSettings& get_fabric_settings() const { return fabric_desc_; }
+    void configure_fabric(const FabricSettings& fabric);
+
+    bool check_use_count_zero() const;
+
+    void acquire();
+    void release();
+
+    // --- Fabric config ---
+    tt_fabric::FabricConfig get_fabric_config() const;
+    tt_fabric::FabricReliabilityMode get_fabric_reliability_mode() const;
+    const tt_fabric::FabricRouterConfig& get_fabric_router_config() const;
+    tt_fabric::FabricTensixConfig get_fabric_tensix_config() const;
+    tt_fabric::FabricUDMMode get_fabric_udm_mode() const;
+    tt_fabric::FabricManagerMode get_fabric_manager() const;
+    uint8_t get_num_fabric_active_routing_planes() const;
+
+    // Internal reconfigure used by the legacy SetFabricConfig path. Ignores the configure_fabric freeze and may
+    // rebuild the control plane, which invalidates the system mesh. Prefer enable_fabric_for_dispatch when fabric
+    // must be turned on for dispatch without changing an already-published system mesh.
+    // Returns true if updated
+    bool set_fabric_config(
+        tt_fabric::FabricConfig fabric_config,
+        tt_fabric::FabricReliabilityMode reliability_mode =
+            tt_fabric::FabricReliabilityMode::STRICT_SYSTEM_HEALTH_SETUP_MODE,
+        std::optional<uint8_t> num_routing_planes = std::nullopt,
+        tt_fabric::FabricTensixConfig fabric_tensix_config = tt_fabric::FabricTensixConfig::DISABLED,
+        tt_fabric::FabricUDMMode fabric_udm_mode = tt_fabric::FabricUDMMode::DISABLED,
+        tt_fabric::FabricManagerMode fabric_manager = tt_fabric::FabricManagerMode::DEFAULT,
+        tt_fabric::FabricRouterConfig router_config = tt_fabric::FabricRouterConfig{});
+
+    // Enables FABRIC_1D for dispatch when the user left fabric disabled. Rebuilds the control plane when one
+    // already exists, but keeps a published system mesh: DISABLED and FABRIC_1D describe the same mesh. Fatals if
+    // the rebuilt mesh would differ.
+    void enable_fabric_for_dispatch();
+    void initialize_fabric_config();
+    void initialize_fabric_tensix_datamover_config(const tt_fabric::FabricTensixSessionInputs& inputs);
+    void teardown_fabric_config();
+
+    // --- Control plane ---
+    tt::tt_fabric::ControlPlane& get_control_plane();
+    void initialize_control_plane();
+
+    // --- Custom topology ---
+    // Need to call set_fabric_config to reinit the control plane after calling this
+    // TODO: Remove these two functions in favor of a unified set fabric config where you can
+    // pass in a custom topology.
+    void set_custom_fabric_topology(
+        const std::string& mesh_graph_desc_file,
+        const std::map<tt_fabric::FabricNodeId, ChipId>& logical_mesh_chip_id_to_physical_chip_id_mapping);
+    void set_default_fabric_topology();
+
+    // --- Distributed context ---
+    const distributed::multihost::DistributedContext& full_world_distributed_context() const;
+    const distributed::multihost::DistributedContext& global_distributed_context();
+    std::shared_ptr<distributed::multihost::DistributedContext> get_distributed_context_ptr();
+
+    // Teardown fabric-layer objects (control plane, system mesh, distributed context).
+    void teardown_fabric_objects();
+
+    // Register this env as a MetalContext (silicon: default slot; mock: non-default slot) so that legacy
+    // fabric code reached during control-plane / system-mesh / mesh-device construction (which still calls
+    // the bare MetalContext::instance()) resolves to this env instead of implicitly creating a default
+    // silicon context that opens a second real PCIe device and self-deadlocks on its CHIP_IN_USE lock
+    // (GitHub #50041, #50043). Idempotent; returns the env-owned context id (created on first call). The
+    // context lifetime is tied to the env (uplift of mesh-device-level cleanup, GitHub #21500).
+    int ensure_context_registered(MetalEnv& env);
+
+    // True once ensure_context_registered has created the env-owned context.
+    bool has_registered_context() const { return registered_context_id_.has_value(); }
+
+    // Destroy the env-owned context created by ensure_context_registered, if any. Must be called from
+    // MetalEnv::~MetalEnv() while MetalEnv::impl_ is still valid (MetalContext::teardown() reaches back
+    // through *env_ -> impl_), not from ~MetalEnvImpl where impl_ has already been nulled by reset().
+    void teardown_registered_context();
+
+    // Returns true if set_fabric_config changed state requiring a reinit.
+    bool consume_force_reinit();
+
+    const std::vector<CoreCoord>& get_quasar_dispatch_cores(
+        ChipId device_id, uint8_t num_hw_cqs, const DispatchCoreConfig& dispatch_core_config);
+
+    const tt::core_descriptor_t& get_core_descriptor_config(
+        ChipId device_id, uint8_t num_hw_cqs, const DispatchCoreConfig& dispatch_core_config);
+
+private:
+    // During init we need to bypass set_fabric_config to avoid reinitialization of the control plane
+    // by directly setting the fabric config state.
+    friend class DeviceManager;
+
+    MetalEnvDescriptor descriptor_;
+
+    std::unique_ptr<llrt::RunTimeOptions> rtoptions_;
+    std::unique_ptr<Cluster> cluster_;
+    std::unique_ptr<Hal> hal_;
+
+    std::atomic<int> use_count_{0};
+
+    // MetalContext id registered lazily for this env (see ensure_context_registered). Stored as a raw int
+    // to avoid pulling metal_context.hpp into this header; wrapped back into a ContextId at the
+    // metal_context.cpp boundary. Torn down by teardown_registered_context() from MetalEnv::~MetalEnv().
+    std::optional<int> registered_context_id_ = std::nullopt;
+
+    // --- Fabric config state ---
+    // What configure_fabric was asked for. fabric_config_ below is the runtime value.
+    FabricSettings fabric_desc_ = {};
+
+    tt_fabric::FabricConfig fabric_config_ = tt_fabric::FabricConfig::DISABLED;
+    tt_fabric::FabricReliabilityMode fabric_reliability_mode_ =
+        tt_fabric::FabricReliabilityMode::STRICT_SYSTEM_HEALTH_SETUP_MODE;
+    tt_fabric::FabricTensixConfig fabric_tensix_config_ = tt_fabric::FabricTensixConfig::DISABLED;
+    tt_fabric::FabricUDMMode fabric_udm_mode_ = tt_fabric::FabricUDMMode::DISABLED;
+    tt_fabric::FabricManagerMode fabric_manager_ = tt_fabric::FabricManagerMode::DEFAULT;
+    tt_fabric::FabricRouterConfig fabric_router_config_ = tt_fabric::FabricRouterConfig{};
+    uint8_t num_fabric_active_routing_planes_ = 0;
+    tt_fabric::MeshId fabric_mesh_id_ = tt_fabric::MeshId{0};
+    tt_fabric::MeshHostRankId fabric_host_rank_ = tt_fabric::MeshHostRankId{0};
+    std::map<tt_fabric::FabricNodeId, ChipId> logical_mesh_chip_id_to_physical_chip_id_mapping_;
+    std::optional<std::string> custom_mesh_graph_desc_path_ = std::nullopt;
+
+    bool force_reinit_ = false;
+
+    // --- Control plane / system mesh ---
+    std::mutex control_plane_mutex_;
+    std::unique_ptr<tt::tt_fabric::ControlPlane> control_plane_;
+    std::unique_ptr<distributed::SystemMesh> system_mesh_;
+
+    // --- Distributed context ---
+    std::shared_ptr<distributed::multihost::DistributedContext> distributed_context_;
+    std::shared_ptr<distributed::multihost::DistributedContext> compute_only_distributed_context_;
+
+    void initialize_base_objects();
+    void verify_fw_capabilities();
+
+    void construct_control_plane(const std::filesystem::path& mesh_graph_desc_path);
+    void construct_control_plane();
+    // The current fabric settings, bundled for the ControlPlane constructor.
+    FabricSettings control_plane_config() const;
+    void initialize_control_plane_impl();
+
+    struct QuasarDispatchCoresCacheKey {
+        ChipId device_id;
+        uint8_t num_hw_cqs;
+        DispatchCoreConfig dispatch_core_config;
+        bool use_tensix_fallback;
+
+        bool operator==(const QuasarDispatchCoresCacheKey& other) const;
+    };
+
+    struct QuasarDispatchCoresCacheKeyHash {
+        std::size_t operator()(const QuasarDispatchCoresCacheKey& key) const;
+    };
+
+    std::unordered_map<QuasarDispatchCoresCacheKey, std::vector<CoreCoord>, QuasarDispatchCoresCacheKeyHash>
+        quasar_dispatch_cores_cache_;
+
+    struct CoreDescriptorCacheKey {
+        std::string product_name;
+        DispatchCoreConfig dispatch_core_config;
+        tt_fabric::FabricTensixConfig fabric_tensix_config;
+        uint8_t num_hw_cqs;
+        bool fast_dispatch;
+
+        bool operator==(const CoreDescriptorCacheKey& other) const;
+    };
+
+    struct CoreDescriptorCacheKeyHash {
+        std::size_t operator()(const CoreDescriptorCacheKey& key) const;
+    };
+
+    std::unordered_map<CoreDescriptorCacheKey, tt::core_descriptor_t, CoreDescriptorCacheKeyHash>
+        core_descriptor_cache_;
+
+    static std::mutex s_registry_mutex_;
+    static std::set<MetalEnvImpl*> s_registry_;
+    static std::once_flag s_atfork_registered_;
+    static void prefork_check_all();
+};
+
+}  // namespace tt::tt_metal

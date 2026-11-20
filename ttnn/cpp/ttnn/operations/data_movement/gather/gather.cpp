@@ -1,0 +1,574 @@
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include "gather.hpp"
+#include "gather_force.hpp"
+#include <cstdint>
+
+#include "codegen/gather_codegen_device_operation.hpp"
+#include "codegen/gather_codegen_supported.hpp"
+#include "device/gather_device_operation.hpp"
+
+#include "ttnn/operations/core/core.hpp"
+#include "ttnn/operations/data_movement/common/common.hpp"
+#include "ttnn/operations/data_movement/fill_pad/fill_pad.hpp"
+#include "ttnn/operations/reduction/reduction_common/reduction_common.hpp"
+#include "ttnn/tensor/shape/shape.hpp"
+#include "ttnn/operations/data_movement/slice/slice.hpp"
+#include "ttnn/operations/data_movement/transpose/transpose.hpp"
+#include "ttnn/operations/data_movement/transpose/device/transpose_utils.hpp"
+
+#include <tt-metalium/constants.hpp>
+
+namespace ttnn::detail {
+
+// Fires if either input or index is RM B/W-sharded with non-tile-aligned W; the composite arm then
+// round-trips BOTH tensors through TILE to dodge the noc_async_*_sharded misread. Retires with #47299.
+inline bool needs_rm_irregular_composite(const ttnn::Tensor& input_tensor, const ttnn::Tensor& index_tensor) {
+    if (input_tensor.layout() != tt::tt_metal::Layout::ROW_MAJOR) {
+        return false;
+    }
+    auto is_bw_sharded = [](const ttnn::Tensor& t) {
+        const auto& mc = t.memory_config();
+        return mc.is_sharded() && (mc.memory_layout() == tt::tt_metal::TensorMemoryLayout::BLOCK_SHARDED ||
+                                   mc.memory_layout() == tt::tt_metal::TensorMemoryLayout::WIDTH_SHARDED);
+    };
+    auto last_dim_not_tile = [](const ttnn::Tensor& t) {
+        const auto& s = t.logical_shape();
+        return s.rank() >= 1 && s[-1] % tt::constants::TILE_WIDTH != 0;
+    };
+    return (is_bw_sharded(input_tensor) && last_dim_not_tile(input_tensor)) ||
+           (is_bw_sharded(index_tensor) && last_dim_not_tile(index_tensor));
+}
+
+}  // namespace ttnn::detail
+
+namespace ttnn::operations::data_movement {
+namespace {
+namespace CMAKE_UNIQUE_NAMESPACE {
+
+/**
+ * @brief For rank > 4, slices the dims the 4D fold merges (all but the last three) to the index tensor's extents,
+ * so input and index fold identically.
+ *
+ * @throws TT_FATAL if the index is larger than the input on one of those dims
+ */
+Tensor slice_merged_dims_to_index(
+    const Tensor& transposed_input,
+    const int8_t dim,
+    const bool is_dim_last_idx,
+    const ttnn::Shape& index_tensor_lshape) {
+    const auto& input_lshape = transposed_input.logical_shape();
+    const auto rank = input_lshape.rank();
+
+    // The index tensor's extents in the input's transposed layout
+    ttsl::SmallVector<uint32_t> index_extents(index_tensor_lshape.cbegin(), index_tensor_lshape.cend());
+    if (!is_dim_last_idx) {
+        std::swap(index_extents[dim], index_extents[rank - 1]);
+    }
+
+    ttsl::SmallVector<uint32_t> end_index(input_lshape.cbegin(), input_lshape.cend());
+    for (size_t i = 0; i < rank - 3; ++i) {
+        // Position dim holds the caller's last dimension after the transpose
+        const size_t caller_dim = (!is_dim_last_idx && i == static_cast<size_t>(dim)) ? rank - 1 : i;
+        TT_FATAL(
+            index_extents[i] <= input_lshape[i],
+            "gather: index tensor size {} on dimension {} exceeds the input tensor size {}; only dimension {} may be "
+            "larger",
+            index_extents[i],
+            caller_dim,
+            input_lshape[i],
+            dim);
+        end_index[i] = index_extents[i];
+    }
+    if (ttnn::Shape{end_index} == input_lshape) {
+        return transposed_input;
+    }
+
+    const ttsl::SmallVector<uint32_t> start_index(rank, 0);
+    const ttsl::SmallVector<uint32_t> step(rank, 1);
+    return ttnn::slice(transposed_input, start_index, end_index, step);
+}
+
+/**
+ * @brief Transforms an input tensor for gather operation by applying necessary preprocessing steps.
+ *
+ * This function prepares the input tensor for gather operations by performing several transformations:
+ * 1. Transposes the tensor if the gather dimension is not the last dimension
+ * 2. Transforms the tensor to 4D if it has rank <= 4
+ * 3. For index tensors: applies implicit tile padding with zeros
+ * 4. For input tensors: slices to match index tensor shape and applies padding with minimum float values
+ *
+ * @param input_tensor The tensor to be transformed
+ * @param dim The dimension along which the gather operation will be performed
+ * @param is_dim_last_idx Flag indicating if the gather dimension is the last dimension
+ * @param is_rank_le_4d Flag indicating if the tensor rank is less than or equal to 4
+ * @param padding_index_tensor Optional flag to indicate if this is an index tensor requiring padding (default: false)
+ * @param index_tensor_padded_shape Optional shape of the padded index tensor used for slicing (default: empty)
+ * @param index_tensor_lshape Optional untransformed index tensor shape, used for rank > 4 inputs (default: empty)
+ *
+ * @return Tensor The transformed tensor ready for gather operation
+ *
+ * @note For scalar tensors (logical shape {1}), the function returns the input tensor unchanged
+ * @note Index tensors are padded with zeros, while input tensors are padded with minimum float values
+ * @note Input tensors are sliced to match the index tensor dimensions for proper cell mapping
+ */
+Tensor pre_gather_transform_tensor(
+    const Tensor& input_tensor,
+    const int8_t dim,
+    const bool is_dim_last_idx,
+    const bool is_rank_le_4d,
+    const bool padding_index_tensor = false,
+    const ttnn::Shape& index_tensor_padded_shape = {},
+    const ttnn::Shape& index_tensor_lshape = {}) {
+    if (input_tensor.logical_shape() == ttnn::Shape{1}) {
+        // Early exit for scalar tensors, return the same tensor
+        return input_tensor;
+    }
+
+    // If dim is not last dimension transpose it
+    Tensor transposed_tensor = reduction_common::perform_transpose(input_tensor, is_dim_last_idx, dim, -1);
+    if (!padding_index_tensor && !is_rank_le_4d) {
+        transposed_tensor = slice_merged_dims_to_index(transposed_tensor, dim, is_dim_last_idx, index_tensor_lshape);
+    }
+    // If input is not rank 4 transform it to 4D
+    const Tensor transformed_tensor = reduction_common::transform_to_4d_tensor(transposed_tensor, is_rank_le_4d);
+
+    // fill_implicit_tile_padding is TILE-only; RM has no tile-face padding so skip it.
+    const bool is_tile = transformed_tensor.layout() == tt::tt_metal::Layout::TILE;
+
+    if (padding_index_tensor) {
+        // Index tensor padding
+        return is_tile ? ttnn::fill_implicit_tile_padding(transformed_tensor, 0.0f) : transformed_tensor;
+    }
+
+    // Input tensor processing
+    // Since index_tensor.size(d) <= input_tensor.size(d) for all dimensions d != dim we slice input tensor to be the
+    // same shape ignoring the dimension of the operation as the index tensor - this allows easy mapping of cells
+    // between tensors
+    const ttsl::SmallVector<uint32_t> step = {1, 1, 1, 1};
+    const ttsl::SmallVector<uint32_t> start_index = {0, 0, 0, 0};
+    const ttsl::SmallVector<uint32_t> end_index = {
+        index_tensor_padded_shape[0],
+        index_tensor_padded_shape[1],
+        index_tensor_padded_shape[2],
+        transformed_tensor.logical_shape()[-1]};
+
+    const Tensor sliced_tensor =
+        ttnn::slice(transformed_tensor, start_index, end_index, step, input_tensor.memory_config());
+
+    return is_tile ? ttnn::fill_implicit_tile_padding(sliced_tensor, std::numeric_limits<float>::min()) : sliced_tensor;
+}
+
+/**
+ * @brief Transforms the output tensor from gather operation to match the expected shape and dimension ordering.
+ *
+ * This function performs post-processing on the output tensor from a gather operation to ensure it has the
+ * correct shape and dimension ordering based on the original input tensor characteristics and gather parameters.
+ *
+ * The transformation process handles two main scenarios:
+ * 1. For tensors with rank <= 4: Squeezes the tensor from 4D representation back to original rank,
+ *    and optionally transposes if the gather dimension wasn't the last index.
+ * 2. For tensors with rank > 4: Reshapes back to the transposed original-rank shape, then transposes if needed.
+ *
+ * @param index_tensor The original index tensor used in the gather operation (used for shape reference and memory
+ * config)
+ * @param output_tensor The tensor resulting from the gather operation that needs transformation
+ * @param dim The dimension along which the gather operation was performed
+ * @param is_dim_last_idx Flag indicating whether the gather dimension was the last index in the tensor
+ * @param original_lshape The expected logical shape that the output tensor should have after transformation
+ *
+ * @return Tensor The transformed output tensor with correct shape and dimension ordering
+ *
+ * @throws TT_FATAL if the final output tensor shape doesn't match the expected original_lshape
+ *
+ * @note This function modifies the output_tensor parameter in-place during transformations
+ * @note The function ensures the final tensor shape matches original_lshape through assertion checking
+ * @note Rank-1 results are reshaped straight to the logical shape; squeeze_from_4D cannot drop a tile-padded height.
+ */
+Tensor post_gather_transform_tensor(
+    const Tensor& index_tensor,
+    Tensor& output_tensor,
+    const int8_t dim,
+    const bool is_dim_last_idx,
+    const Shape& original_lshape) {
+    const auto& input_shape = index_tensor.logical_shape();
+    const auto orig_rank = input_shape.rank();
+
+    if (orig_rank == 1) {
+        output_tensor = ttnn::reshape(output_tensor, input_shape);
+    } else if (orig_rank <= 4) {
+        // For tensors of rank 4 and below: first transform back to original representation,
+        // then transpose since we have the same shapes as dim referred to at the beginning
+        output_tensor = ttnn::squeeze_from_4D(output_tensor, orig_rank);
+        if (!is_dim_last_idx) {
+            output_tensor = ttnn::transpose(output_tensor, dim, -1, index_tensor.memory_config());
+        }
+    } else if (orig_rank > 4) {
+        // For tensors above rank 4: reverse the order of pre_gather_transform_tensor
+        // First reshape back to the transposed higher-dimensional form, then transpose at that rank
+        ttsl::SmallVector<uint32_t> transposed_shape(input_shape.cbegin(), input_shape.cend());
+        if (!is_dim_last_idx) {
+            const auto index_dim = (dim < 0) ? (orig_rank + dim) : dim;
+            std::swap(transposed_shape[index_dim], transposed_shape[orig_rank - 1]);
+        }
+        output_tensor = ttnn::reshape(output_tensor, ttnn::Shape{transposed_shape});
+        if (!is_dim_last_idx) {
+            output_tensor = ttnn::transpose(output_tensor, dim, -1, index_tensor.memory_config());
+        }
+    }
+
+    TT_FATAL(
+        output_tensor.logical_shape() == original_lshape,
+        "Output tensor transformation did not create correct output shape! Got: {}, expected: {}",
+        output_tensor.logical_shape(),
+        original_lshape);
+
+    return output_tensor;
+}
+
+}  // namespace CMAKE_UNIQUE_NAMESPACE
+}  // namespace
+
+}  // namespace ttnn::operations::data_movement
+
+namespace ttnn::operations::data_movement::detail {
+
+// Internal to this file. `detail` is shared across the whole data_movement library and this is a
+// unity-build target, so unprefixed helper names must not have external linkage.
+namespace {
+
+namespace gather_ns = ttnn::operations::data_movement::gather;
+
+// Whether the codegen path can serve this call. Evaluated on the ORIGINAL (pre
+// pre_gather_transform_tensor) tensors and the caller's raw dim -- the same attributes the
+// supported scope is expressed in (dim, layout, dtype as the caller supplied them), before any
+// transpose/4D-fold. Correctness and caller-controlled placement only; perf demotion is a separate,
+// routing-only question.
+bool codegen_can_serve(
+    const Tensor& input_tensor,
+    int8_t dim,
+    const Tensor& input_index_tensor,
+    const std::optional<tt::tt_metal::MemoryConfig>& memory_config,
+    const std::optional<Tensor>& optional_output_tensor) {
+    return gather_ns::supported_execution_controls(input_tensor, memory_config, optional_output_tensor) &&
+           gather_ns::supported_by_codegen(input_tensor, dim, input_index_tensor);
+}
+
+Tensor gather_native(
+    const Tensor& input_tensor,
+    int8_t dim,
+    const Tensor& input_index_tensor,
+    bool sparse_grad,
+    const std::optional<tt::tt_metal::MemoryConfig>& memory_config,
+    std::optional<Tensor> optional_output_tensor,
+    const std::optional<CoreRangeSet>& sub_core_grids);
+
+// Shared body: normalize, transform, dispatch to the chosen prim, transform back. `use_codegen` is
+// decided by the caller on the original tensors and is not revisited here.
+Tensor gather_dispatch(
+    const Tensor& input_tensor,
+    int8_t dim,
+    const Tensor& input_index_tensor,
+    const bool sparse_grad,
+    const std::optional<tt::tt_metal::MemoryConfig>& memory_config,
+    std::optional<Tensor> optional_output_tensor,
+    const std::optional<CoreRangeSet>& sub_core_grids,
+    const bool use_codegen) {
+    // Every route's writers re-read input and index pages while output pages are being written:
+    // native's SingleRowMultiCore and both of codegen's row-splitting factories spread a single row
+    // across cores, so one core's reads race another's writes as soon as an operand and the
+    // destination are the same buffer. Held here rather than at the routing gate so both routes
+    // answer for it -- rejecting an aliased call only where codegen serves it would route the same
+    // call to native, whose own wide-Wt factory (device/gather_device_operation.cpp) splits rows the
+    // same way, making the corruption depend on which route the call happened to take.
+    if (optional_output_tensor.has_value()) {
+        auto* out_buffer = optional_output_tensor.value().buffer();
+        TT_FATAL(
+            out_buffer != input_tensor.buffer(),
+            "gather: optional_output_tensor must not alias the input tensor's buffer");
+        TT_FATAL(
+            out_buffer != input_index_tensor.buffer(),
+            "gather: optional_output_tensor must not alias the index tensor's buffer");
+    }
+
+    // Input tensor
+    const ttnn::Shape& original_input_tensor_lshape = input_tensor.logical_shape();
+    const auto input_tensor_rank = input_tensor.logical_shape().rank();
+
+    // Index tensor
+    const auto& original_index_tensor_lshape = input_index_tensor.logical_shape();
+    const auto index_tensor_rank = input_index_tensor.logical_shape().rank();
+
+    // Checked before the early exits and transforms: the device op only ever sees 4D operands.
+    TT_FATAL(
+        input_tensor_rank == index_tensor_rank,
+        "Input and index tensor must have the same number of dimensions. Got input dim: {} and index dim: {}",
+        input_tensor_rank,
+        index_tensor_rank);
+
+    // Checked on the caller's tensors: the transforms below would otherwise fail on the tile first, or carry it
+    // into the native factory, whose buffers are sized for 32x32 tiles and whose output always gets one.
+    ttnn::prim::validate_gather_tile_shape(input_tensor, "the input tensor");
+    ttnn::prim::validate_gather_tile_shape(input_index_tensor, "the index tensor");
+    if (optional_output_tensor.has_value()) {
+        ttnn::prim::validate_gather_tile_shape(*optional_output_tensor, "the output tensor");
+    }
+
+    // Check for early exit for empty tensors tensors
+    if (original_input_tensor_lshape == ttnn::Shape{}) {
+        return input_tensor;
+    }
+    if (original_index_tensor_lshape == ttnn::Shape{}) {
+        return input_index_tensor;
+    }
+
+    // Narrow composite hop for RM B/W-sharded inputs with non-tile-aligned W. Retire when #47299 lands.
+    if (ttnn::detail::needs_rm_irregular_composite(input_tensor, input_index_tensor)) {
+        // Snapshot orientation before the staging hop drops shard_spec (mirrors #48025); prefer index.
+        std::optional<tt::tt_metal::ShardOrientation> orientation_hint;
+        const auto& idx_mc = input_index_tensor.memory_config();
+        if (idx_mc.is_sharded() && idx_mc.shard_spec().has_value()) {
+            orientation_hint = idx_mc.shard_spec()->orientation;
+        } else if (input_tensor.memory_config().is_sharded() && input_tensor.memory_config().shard_spec().has_value()) {
+            orientation_hint = input_tensor.memory_config().shard_spec()->orientation;
+        }
+        const auto l1_interleaved =
+            tt::tt_metal::MemoryConfig(tt::tt_metal::TensorMemoryLayout::INTERLEAVED, tt::tt_metal::BufferType::L1);
+        const auto tile_input =
+            ttnn::to_layout(ttnn::to_memory_config(input_tensor, l1_interleaved), tt::tt_metal::Layout::TILE);
+        const auto tile_index =
+            ttnn::to_layout(ttnn::to_memory_config(input_index_tensor, l1_interleaved), tt::tt_metal::Layout::TILE);
+        auto requested_mc = memory_config.has_value() ? memory_config.value() : input_tensor.memory_config();
+        // Staying on the native helper rather than re-entering the router: the routing decision was
+        // taken on the tensors the caller passed, and staging them to TILE/interleaved to make this
+        // arm work must not turn a rejected call into an accepted one behind the caller's back.
+        const auto tile_out =
+            gather_native(tile_input, dim, tile_index, sparse_grad, l1_interleaved, std::nullopt, sub_core_grids);
+        auto rm_out = ttnn::to_layout(tile_out, tt::tt_metal::Layout::ROW_MAJOR);
+        // Like the native op, `out` takes precedence over memory_config: write straight into it.
+        if (optional_output_tensor.has_value()) {
+            return ttnn::to_memory_config(
+                rm_out, optional_output_tensor->memory_config(), std::nullopt, optional_output_tensor);
+        }
+        // Sharded-no-spec requested_mc: synthesize a shard_spec via the same helper compute_output_specs
+        // uses, since to_memory_config does not derive a spec for the actual allocation call.
+        if (requested_mc.is_sharded() && !requested_mc.shard_spec().has_value()) {
+            const auto derived = ttnn::operations::data_movement::transpose::generate_transpose_shard_spec(
+                rm_out, rm_out.padded_shape(), requested_mc.memory_layout(), orientation_hint);
+            requested_mc =
+                tt::tt_metal::MemoryConfig(requested_mc.memory_layout(), requested_mc.buffer_type(), derived);
+        }
+        return ttnn::to_memory_config(rm_out, requested_mc);
+    }
+
+    // Normalize negative dimension to positive index with bounds check
+    const int8_t normalized_dim = dim < 0 ? dim + input_tensor_rank : dim;
+    TT_FATAL(
+        normalized_dim >= 0 && normalized_dim < static_cast<int8_t>(input_tensor_rank),
+        "gather: dim {} is out of range for tensor rank {}",
+        dim,
+        input_tensor_rank);
+
+    const bool input_tensor_is_dim_last_idx = (normalized_dim == input_tensor_rank - 1);
+    const bool input_tensor_is_rank_le_4d = input_tensor_rank <= 4;
+    const bool input_index_tensor_is_dim_last_idx = (normalized_dim == index_tensor_rank - 1);
+    const bool index_tensor_is_rank_le_4d = index_tensor_rank <= 4;
+
+    const auto memory_config_value = memory_config.has_value() ? memory_config.value() : input_tensor.memory_config();
+
+    Tensor padded_index_tensor = operations::data_movement::CMAKE_UNIQUE_NAMESPACE::pre_gather_transform_tensor(
+        input_index_tensor, normalized_dim, input_index_tensor_is_dim_last_idx, index_tensor_is_rank_le_4d, true);
+
+    Tensor padded_input_tensor = operations::data_movement::CMAKE_UNIQUE_NAMESPACE::pre_gather_transform_tensor(
+        input_tensor,
+        normalized_dim,
+        input_tensor_is_dim_last_idx,
+        input_tensor_is_rank_le_4d,
+        false,
+        padded_index_tensor.padded_shape(),
+        original_index_tensor_lshape);
+
+    std::optional<Tensor> optional_output_tensor_value = std::nullopt;
+    if (optional_output_tensor.has_value()) {
+        auto& output_tensor = optional_output_tensor.value();
+        output_tensor = operations::data_movement::CMAKE_UNIQUE_NAMESPACE::pre_gather_transform_tensor(
+            output_tensor, normalized_dim, input_tensor_is_dim_last_idx, input_tensor_is_rank_le_4d, true);
+        optional_output_tensor_value = output_tensor;
+    }
+
+    // The native RM factories need every BLOCK/WIDTH-sharded shard row to be a multiple of the buffer
+    // alignment (see has_subaligned_shard_row). An input or index tensor whose shard row fails this
+    // check is moved to interleaved memory of the same buffer type. An output whose shard row fails
+    // this check is computed in interleaved memory and then moved to the memory config the device op
+    // would have given it.
+    auto native_memory_config = memory_config_value;
+    auto native_output_tensor = optional_output_tensor_value;
+    std::optional<tt::tt_metal::MemoryConfig> rerouted_output_memory_config;
+    if (!use_codegen && padded_input_tensor.layout() == tt::tt_metal::Layout::ROW_MAJOR) {
+        auto interleaved_same_buffer_type = [](const tt::tt_metal::MemoryConfig& mc) {
+            return tt::tt_metal::MemoryConfig(tt::tt_metal::TensorMemoryLayout::INTERLEAVED, mc.buffer_type());
+        };
+        const bool output_is_sharded = optional_output_tensor_value.has_value()
+                                           ? optional_output_tensor_value->is_sharded()
+                                           : memory_config_value.is_sharded();
+        if (output_is_sharded) {
+            // Taken before the operands move, because a sharded output with no shard spec derives
+            // its spec from the index and input tensors. The device op gets this spec rather than
+            // re-deriving it from operands that may have moved.
+            const auto output_spec = ttnn::prim::GatherDeviceOperation::compute_output_specs(
+                ttnn::prim::GatherParams{normalized_dim, sparse_grad, memory_config_value, sub_core_grids},
+                ttnn::prim::GatherInputs{padded_input_tensor, padded_index_tensor, optional_output_tensor_value});
+            uint32_t output_elem_size = padded_input_tensor.element_size();
+            if (optional_output_tensor_value.has_value()) {
+                output_elem_size = optional_output_tensor_value->element_size();
+            } else {
+                native_memory_config = output_spec.memory_config();
+            }
+            if (has_subaligned_shard_row(output_spec.memory_config(), output_elem_size)) {
+                rerouted_output_memory_config = output_spec.memory_config();
+                native_memory_config = interleaved_same_buffer_type(output_spec.memory_config());
+                native_output_tensor = std::nullopt;
+            }
+        }
+        if (has_subaligned_shard_row(padded_input_tensor.memory_config(), padded_input_tensor.element_size())) {
+            padded_input_tensor = ttnn::to_memory_config(
+                padded_input_tensor, interleaved_same_buffer_type(padded_input_tensor.memory_config()));
+        }
+        if (has_subaligned_shard_row(padded_index_tensor.memory_config(), padded_index_tensor.element_size())) {
+            padded_index_tensor = ttnn::to_memory_config(
+                padded_index_tensor, interleaved_same_buffer_type(padded_index_tensor.memory_config()));
+        }
+    }
+
+    Tensor gather_tensor = use_codegen ? ttnn::prim::gather_codegen(
+                                             padded_input_tensor,
+                                             normalized_dim,
+                                             padded_index_tensor,
+                                             sparse_grad,
+                                             memory_config_value,
+                                             optional_output_tensor_value,
+                                             sub_core_grids)
+                                       : ttnn::prim::gather(
+                                             padded_input_tensor,
+                                             normalized_dim,
+                                             padded_index_tensor,
+                                             sparse_grad,
+                                             native_memory_config,
+                                             native_output_tensor,
+                                             sub_core_grids);
+    if (rerouted_output_memory_config.has_value()) {
+        gather_tensor = ttnn::to_memory_config(
+            gather_tensor, rerouted_output_memory_config.value(), std::nullopt, optional_output_tensor_value);
+    }
+
+    return operations::data_movement::CMAKE_UNIQUE_NAMESPACE::post_gather_transform_tensor(
+        input_index_tensor,
+        gather_tensor,
+        normalized_dim,
+        input_index_tensor_is_dim_last_idx,
+        original_index_tensor_lshape);
+}
+
+// The existing native implementation, unconditionally. Callers that have already been routed here
+// enter this rather than re-entering ttnn::gather, so a call routed to native cannot be routed a
+// second time and land on codegen partway through.
+Tensor gather_native(
+    const Tensor& input_tensor,
+    int8_t dim,
+    const Tensor& input_index_tensor,
+    const bool sparse_grad,
+    const std::optional<tt::tt_metal::MemoryConfig>& memory_config,
+    std::optional<Tensor> optional_output_tensor,
+    const std::optional<CoreRangeSet>& sub_core_grids) {
+    return gather_dispatch(
+        input_tensor,
+        dim,
+        input_index_tensor,
+        sparse_grad,
+        memory_config,
+        std::move(optional_output_tensor),
+        sub_core_grids,
+        /*use_codegen=*/false);
+}
+
+}  // namespace
+
+Tensor gather_force_native(
+    const Tensor& input_tensor,
+    const int8_t dim,
+    const Tensor& input_index_tensor,
+    const bool sparse_grad,
+    const std::optional<tt::tt_metal::MemoryConfig>& memory_config,
+    std::optional<Tensor> optional_output_tensor,
+    const std::optional<CoreRangeSet>& sub_core_grids) {
+    return gather_native(
+        input_tensor,
+        dim,
+        input_index_tensor,
+        sparse_grad,
+        memory_config,
+        std::move(optional_output_tensor),
+        sub_core_grids);
+}
+
+Tensor gather_force_codegen(
+    const Tensor& input_tensor,
+    const int8_t dim,
+    const Tensor& input_index_tensor,
+    const bool sparse_grad,
+    const std::optional<tt::tt_metal::MemoryConfig>& memory_config,
+    std::optional<Tensor> optional_output_tensor,
+    const std::optional<CoreRangeSet>& sub_core_grids) {
+    TT_FATAL(
+        codegen_can_serve(input_tensor, dim, input_index_tensor, memory_config, optional_output_tensor),
+        "gather_force_codegen invoked for a case the codegen path does not support (requires a TILE, bfloat16, "
+        "non-sharded input with a TILE non-sharded index, a non-empty shape, an index dtype wide enough to name "
+        "every position on the gathered axis, an interleaved output placement, and enough per-core L1 for the "
+        "shallowest plan any of its factories can be built with). This entry never falls back to native, because "
+        "a forced leg that quietly served native would make any comparison against native vacuous. Use "
+        "ttnn::gather if you want the case routed.");
+    return gather_dispatch(
+        input_tensor,
+        dim,
+        input_index_tensor,
+        sparse_grad,
+        memory_config,
+        std::move(optional_output_tensor),
+        sub_core_grids,
+        /*use_codegen=*/true);
+}
+
+}  // namespace ttnn::operations::data_movement::detail
+
+namespace ttnn {
+
+Tensor gather(
+    const Tensor& input_tensor,
+    const int8_t dim,
+    const Tensor& input_index_tensor,
+    const bool sparse_grad,
+    const std::optional<tt::tt_metal::MemoryConfig>& memory_config,
+    std::optional<Tensor> optional_output_tensor,
+    const std::optional<CoreRangeSet>& sub_core_grids) {
+    namespace detail = operations::data_movement::detail;
+    namespace gather_ns = operations::data_movement::gather;
+
+    const bool use_codegen =
+        operations::data_movement::codegen_supported_on_arch(input_tensor) &&
+        detail::codegen_can_serve(input_tensor, dim, input_index_tensor, memory_config, optional_output_tensor) &&
+        !gather_ns::is_demoted(input_tensor, dim, input_index_tensor);
+
+    return detail::gather_dispatch(
+        input_tensor,
+        dim,
+        input_index_tensor,
+        sparse_grad,
+        memory_config,
+        std::move(optional_output_tensor),
+        sub_core_grids,
+        use_codegen);
+}
+
+}  // namespace ttnn

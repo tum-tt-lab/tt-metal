@@ -1,0 +1,77 @@
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
+
+# SPDX-License-Identifier: Apache-2.0
+
+import os
+import copy
+import json
+import dataclasses
+import pprint
+import shutil
+
+from loguru import logger
+import pytest
+
+import ttnn
+from tt_py_test_utils_common.utils_for_testing import format_parametrize_id
+
+
+def pytest_addoption(parser):
+    parser.addoption("--runslow", action="store_true", default=False, help="run tests marked as slow")
+
+
+def pytest_make_parametrize_id(config, val, argname):
+    return format_parametrize_id(argname, val)
+
+
+def pytest_collection_modifyitems(config, items):
+    if not ttnn.CONFIG.enable_fast_runtime_mode:
+        return
+
+    runslow = config.getoption("--runslow")
+    skip_slow = pytest.mark.skip(reason="need --runslow option to run")
+
+    logger.warning("Fast Runtime Mode is ON. Skipping tests tagged with @pytest.mark.requires_fast_runtime_mode_off")
+    skip_unmarked = pytest.mark.skip(reason="Skipping test with requires_fast_runtime_mode_off")
+    for item in items:
+        if "requires_fast_runtime_mode_off" in item.keywords:
+            logger.warning(f"Skipping {item}")
+            item.add_marker(skip_unmarked)
+        if "slow" in item.keywords:
+            if not runslow:
+                logger.warning(f"Skipping slow test {item}")
+                item.add_marker(skip_slow)
+
+
+@pytest.fixture(autouse=True)
+def pre_and_post(request):
+    original_config = ttnn.Config(ttnn.CONFIG)
+    if ttnn.CONFIG_PATH is not None:
+        ttnn.load_config_from_json_file(ttnn.CONFIG_PATH)
+    if ttnn.CONFIG_OVERRIDES is not None:
+        ttnn.load_config_from_dictionary(json.loads(ttnn.CONFIG_OVERRIDES))
+
+    ttnn.graph.reset_comparison_records_data()
+
+    # Every test gets a report_name so that report_path is defined: comparison mode records its global golden
+    # comparison only then (ttnn/ttnn/decorators.py). A report requested without a name already carries this exact
+    # name from the root ttnn_graph_report fixture, since derive_report_name is a pure function of the test id, so a
+    # config reload above that spelled report_name as null resolves to the same directory.
+    report_name = ttnn.CONFIG.report_name or ttnn.graph_report.derive_report_name(request.node.nodeid)
+    with ttnn.manage_config("report_name", report_name):
+        if ttnn.CONFIG.enable_logging:
+            logger.debug(f"ttnn.CONFIG:\n{ttnn.CONFIG}")
+            report_path = ttnn.CONFIG.report_path
+            if report_path.exists():
+                logger.warning(f"Removing existing log directory: {report_path}")
+                shutil.rmtree(report_path)
+        yield
+
+    ttnn.tracer.disable_tracing()
+    # Restore the live config IN PLACE. `ttnn.CONFIG` is a reference to the C++ `ttnn::CONFIG` global that device
+    # operations and the tensor serializer read; rebinding the module attribute to the snapshot would leave every
+    # later test (and `ttnn.manage_config`) mutating a detached Python-owned copy that the C++ side never sees.
+    for key in ttnn.Config.keys():
+        value = getattr(original_config, key)
+        if getattr(ttnn.CONFIG, key) != value:
+            setattr(ttnn.CONFIG, key, value)

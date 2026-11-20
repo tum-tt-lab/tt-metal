@@ -1,0 +1,153 @@
+#!/bin/bash
+# Build OpenMPI from source with ULFM (User Level Fault Mitigation) support.
+# Used by Dockerfile.tools to produce a pre-built OpenMPI layer for manylinux.
+# Output is installed under ${OMPI_PREFIX} (default /opt/openmpi-<tag>-ulfm).
+set -euo pipefail
+
+OMPI_VERSION="${OMPI_VERSION:-v5.0.7}"
+INSTALL_DIR="${INSTALL_DIR:-/opt}"
+OMPI_PREFIX="${INSTALL_DIR}/openmpi-${OMPI_VERSION}-ulfm"
+
+echo "Building OpenMPI ${OMPI_VERSION} (from git) with ULFM to ${OMPI_PREFIX}..."
+
+# Passed in by Dockerfile.tools, which builds UCX into this prefix before calling us.
+# Required, not defaulted: guessing it is how you end up with an MPI that configured
+# without UCX and silently runs over TCP.
+UCX_PREFIX="${UCX_PREFIX:?UCX_PREFIX must be set (path UCX was installed to)}"
+
+if [ ! -e "${UCX_PREFIX}/include/ucp/api/ucp.h" ]; then
+    echo "[ERROR] no UCX at ${UCX_PREFIX} (missing include/ucp/api/ucp.h)." >&2
+    echo "[ERROR] Check UCX_PREFIX matches where install-ucx.sh installed." >&2
+    exit 1
+fi
+
+WORKDIR="/tmp/ompi-src"
+rm -rf "${WORKDIR}"
+mkdir -p "${WORKDIR}"
+
+if [ -n "${OMPI_COMMIT_SHA:-}" ]; then
+    echo "Fetching OpenMPI commit ${OMPI_COMMIT_SHA} from GitHub..."
+    git init "${WORKDIR}"
+    git -C "${WORKDIR}" remote add origin https://github.com/open-mpi/ompi.git
+    git -C "${WORKDIR}" fetch --depth 1 origin "${OMPI_COMMIT_SHA}"
+    git -C "${WORKDIR}" checkout FETCH_HEAD
+    git -C "${WORKDIR}" submodule update --init --recursive
+else
+    echo "WARNING: OMPI_COMMIT_SHA not set, cloning by tag ${OMPI_VERSION} (less secure)"
+    git clone --branch "${OMPI_VERSION}" --depth 1 --recursive https://github.com/open-mpi/ompi.git "${WORKDIR}"
+fi
+
+cd "${WORKDIR}"
+
+# Run autogen.pl to generate configure script (required when building from git)
+echo "Running autogen.pl..."
+./autogen.pl
+
+# NOTE: OpenMPI configure options for ULFM fault tolerance and HPC environment compatibility.
+# The --with-slurm=/opt/slurm option enables SLURM process management support for multi-host jobs.
+# --disable-mca-dso and --disable-dlopen create a static build for portability.
+# These settings were validated for the current manylinux-based environment.
+# If issues arise with different MPI runtimes or cluster configurations, review with the scaleout team.
+# See: https://github.com/open-mpi/ompi/blob/main/docs/features/ulfm.rst
+#
+# CFLAGS: force C17 (-std=gnu17). GCC 14 auto-selects C23 (gnu23) which promotes
+# certain OpenMPI _Bool->volatile void* assignments to hard errors. GCC uses the
+# last -std flag on the command line, so this overrides the gnu23 embedded in CC.
+# --disable-oshmem: OpenSHMEM is auto-enabled once UCX is found, but tt-metal does
+# not use it and oshmem/mca/sshmem fails under GCC 14 (-Wint-conversion is an error:
+# "initialization of 'void *' from 'long unsigned int'"). Without UCX it was never built.
+CFLAGS="-std=gnu17" ./configure \
+    --prefix="${OMPI_PREFIX}" \
+    --with-ft=ulfm \
+    --enable-wrapper-rpath \
+    --enable-mpirun-prefix-by-default \
+    --disable-mca-dso \
+    --disable-dlopen \
+    --with-ucx="${UCX_PREFIX}" \
+    --disable-oshmem \
+    --enable-static \
+    --with-slurm=/opt/slurm \
+    --without-munge \
+    --with-pic
+
+make -j"$(nproc)"
+make install -j"$(nproc)"
+cd /
+rm -rf "${WORKDIR}"
+
+# Provide mpirun-ulfm for scripts expecting this name, as a plain symlink to mpirun. This matches the
+# tenstorrent/ompi .deb used by install_dependencies.sh (its postinst symlinks /usr/local/bin/mpirun-ulfm
+# to <prefix>/bin/mpirun).
+#
+# It must NOT be a wrapper that adds "--with-ft ulfm". That flag marks the job recoverable: a rank killed by
+# a signal no longer aborts the job, surviving ranks keep waiting, and mpirun exits 0 even when every rank
+# crashed, so CI steps report success after fatal rank failures and the next command starts on a wedged
+# device. Nothing after "--with-ft ulfm" on the
+# command line can turn it back off. Programs that handle rank failures themselves (the fault-tolerance
+# tests) pass "--with-ft ulfm" explicitly.
+if [ -e "${OMPI_PREFIX}/bin/mpirun-ulfm" ]; then
+    echo "[WARNING] mpirun-ulfm already exists at ${OMPI_PREFIX}/bin/mpirun-ulfm, skipping symlink creation"
+elif [ ! -x "${OMPI_PREFIX}/bin/mpirun" ]; then
+    echo "[ERROR] mpirun not found or not executable at ${OMPI_PREFIX}/bin/mpirun, cannot create mpirun-ulfm symlink" >&2
+    exit 1
+else
+    ln -s mpirun "${OMPI_PREFIX}/bin/mpirun-ulfm"
+fi
+
+# Guard: ensure no munge runtime dependency leaked into libmpi.so.
+# munge-devel must not be present in the builder image; this catches it if it ever is.
+if ldd "${OMPI_PREFIX}/lib/libmpi.so" 2>/dev/null | grep -q munge; then
+    echo "[ERROR] libmpi.so links against libmunge — runtime containers will fail to load." >&2
+    exit 1
+fi
+echo "==> Verified: libmpi.so has no munge runtime dependency"
+
+# Guard: UCX must be built in for both one-sided (osc/ucx) and point-to-point (pml/ucx).
+# Which PML is used is a runtime choice: pml/ucx only outranks ob1 when
+# opal_common_ucx_devices matches the RDMA driver (default "mlx*"; "bnxt*" on Broadcom),
+# and ULFM users pin OMPI_MCA_pml=ob1 since fault tolerance is not supported over UCX.
+# Components are static here (--disable-mca-dso --disable-dlopen), so what ompi_info
+# reports is what got compiled in.
+if ! OMPI_INFO_OUT="$(LD_LIBRARY_PATH="${OMPI_PREFIX}/lib:${LD_LIBRARY_PATH:-}" \
+        "${OMPI_PREFIX}/bin/ompi_info" --parsable 2>&1)"; then
+    echo "[ERROR] ompi_info failed to run; cannot verify UCX components:" >&2
+    echo "${OMPI_INFO_OUT}" >&2
+    exit 1
+fi
+
+if ! grep -q '^mca:osc:ucx:' <<<"${OMPI_INFO_OUT}"; then
+    echo "[ERROR] osc/ucx was NOT built -- MPI RMA would fall back off UCX." >&2
+    grep -E '^mca:(osc|pml):' <<<"${OMPI_INFO_OUT}" >&2 || true
+    exit 1
+fi
+echo "==> Verified: osc/ucx present"
+
+if ! grep -q '^mca:pml:ucx:' <<<"${OMPI_INFO_OUT}"; then
+    echo "[ERROR] pml/ucx was NOT built -- two-sided MPI would fall back off UCX." >&2
+    grep -E '^mca:(osc|pml):' <<<"${OMPI_INFO_OUT}" >&2 || true
+    exit 1
+fi
+echo "==> Verified: pml/ucx present"
+
+# Default the PML to ob1 (TCP / shared memory) in the installed MCA params file.
+# pml/ucx stays compiled in but is opt-in (OMPI_MCA_pml=ucx or --mca pml ucx):
+# ULFM fault tolerance is only supported on ob1 and forcing pml/ucx under
+# "mpirun --with-ft ulfm" segfaults, so existing ULFM launch paths keep the
+# behaviour they had before UCX was added. One-sided (osc/ucx) is unaffected.
+MCA_PARAMS_CONF="${OMPI_PREFIX}/etc/openmpi-mca-params.conf"
+cat >> "${MCA_PARAMS_CONF}" <<'MCA_EOF'
+
+# tt-metal defaults (dockerfile/scripts/install-openmpi.sh):
+# UCX is opt-in for point-to-point; override with OMPI_MCA_pml=ucx / --mca pml ucx.
+pml = ob1
+MCA_EOF
+if ! grep -qx 'pml = ob1' "${MCA_PARAMS_CONF}"; then
+    echo "[ERROR] failed to set default pml = ob1 in ${MCA_PARAMS_CONF}" >&2
+    exit 1
+fi
+echo "==> Verified: default pml = ob1 set in ${MCA_PARAMS_CONF} (pml/ucx is opt-in)"
+
+echo "OpenMPI ${OMPI_VERSION} installed to ${OMPI_PREFIX}"
+if [ -x "${OMPI_PREFIX}/bin/mpicc" ]; then
+    "${OMPI_PREFIX}/bin/mpicc" --version || true
+fi

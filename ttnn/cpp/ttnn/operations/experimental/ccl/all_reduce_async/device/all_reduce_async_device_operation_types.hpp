@@ -1,0 +1,135 @@
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+#include <tt_stl/reflection.hpp>
+
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <tuple>
+#include <vector>
+
+#include <tt-metalium/sub_device_types.hpp>
+#include "ttnn/tensor/tensor.hpp"
+#include "ttnn/operations/ccl/ccl_common.hpp"
+#include "ttnn/operations/ccl/ccl_op_fusion.hpp"
+#include "ttnn/global_semaphore.hpp"
+
+namespace ttnn::experimental::prim {
+
+struct AllReduceAsyncParams {
+    uint32_t num_links = 0;
+    uint32_t ring_size = 0;
+    DataType dtype = DataType::BFLOAT16;
+    MemoryConfig output_mem_config;
+    ttnn::ccl::Topology topology;
+    GlobalSemaphore semaphore;
+    std::optional<tt::tt_metal::SubDeviceId> sub_device_id;
+    bool use_noc1_only = false;
+    bool use_optimal_ccl_for_llama = false;
+    uint32_t cluster_axis = 0;
+    distributed::MeshDevice* mesh_device = nullptr;
+    // Accumulate the cross-device reduction in the fp32 dest register (order-independent). Default false
+    // preserves existing bf16 behavior; opted into per-call (e.g. the Llama LM-head all_reduce, whose
+    // ring-order-dependent bf16 sum caused per-row logit non-determinism).
+    bool fp32_dest_acc = false;
+    // One-shot (reduce-scatter + all-gather) mode, 1D fabric only: the output cores are split into ring_size equal
+    // slices and device d owns slice d. Every device unicasts each peer's slice of its partial straight into that
+    // owner's reduction buffer (its own slot, as today), only the owners reduce (same kernel, same chip-ordered slots,
+    // so the sum is bit-identical to the default mode), and each owner line-multicasts its reduced slice into every
+    // peer's output shards. Each directed link carries about 2.5x fewer packets than the broadcast default.
+    bool one_shot = false;
+
+    AllReduceAsyncParams(
+        uint32_t num_links,
+        uint32_t ring_size,
+        DataType dtype,
+        MemoryConfig output_mem_config,
+        ttnn::ccl::Topology topology,
+        GlobalSemaphore semaphore,
+        std::optional<tt::tt_metal::SubDeviceId>& sub_device_id,
+        bool use_noc1_only,
+        bool use_optimal_ccl_for_llama,
+        uint32_t cluster_axis,
+        distributed::MeshDevice* mesh_device,
+        bool fp32_dest_acc = false,
+        bool one_shot = false) :
+        num_links(num_links),
+        ring_size(ring_size),
+        dtype(dtype),
+        output_mem_config(std::move(output_mem_config)),
+        topology(topology),
+        semaphore(std::move(semaphore)),
+        sub_device_id(sub_device_id),
+        use_noc1_only(use_noc1_only),
+        use_optimal_ccl_for_llama(use_optimal_ccl_for_llama),
+        cluster_axis(cluster_axis),
+        mesh_device(mesh_device),
+        fp32_dest_acc(fp32_dest_acc),
+        one_shot(one_shot) {}
+
+    // Add attributes method for reflection
+    auto attributes() const {
+        using ttsl::reflection::Attribute;
+        constexpr std::size_t kNumAttributes = 11;
+        std::vector<std::tuple<std::string, Attribute>> attrs;
+        attrs.reserve(kNumAttributes);
+
+        attrs.emplace_back("num_links", num_links);
+        attrs.emplace_back("ring_size", ring_size);
+        attrs.emplace_back("dtype", dtype);
+        attrs.emplace_back("output_mem_config", output_mem_config);
+        attrs.emplace_back("topology", topology);
+        attrs.emplace_back("semaphore", semaphore);
+        attrs.emplace_back("use_noc1_only", use_noc1_only);
+        attrs.emplace_back("use_optimal_ccl_for_llama", use_optimal_ccl_for_llama);
+        attrs.emplace_back("cluster_axis", cluster_axis);
+        attrs.emplace_back("fp32_dest_acc", fp32_dest_acc);
+        attrs.emplace_back("one_shot", one_shot);
+        return attrs;
+    }
+
+    // Compile-time attributes drive the default program-cache reflection hash and the canonical key
+    // (ttsl::hash::hash_objects_with_default_seed + ttsl::hash::canonical_key)
+    // semaphore is excluded because GlobalSemaphore is not part of the structural key;
+    // AllReduceAsyncMeshWorkloadFactory::override_runtime_arguments re-applies semaphore.address().
+    static constexpr auto attribute_names = std::forward_as_tuple(
+        "num_links",
+        "ring_size",
+        "dtype",
+        "output_mem_config",
+        "topology",
+        "use_noc1_only",
+        "use_optimal_ccl_for_llama",
+        "cluster_axis",
+        "sub_device_id",
+        "fp32_dest_acc",
+        "one_shot");
+    auto attribute_values() const {
+        return std::make_tuple(
+            num_links,
+            ring_size,
+            dtype,
+            output_mem_config,
+            topology,
+            use_noc1_only,
+            use_optimal_ccl_for_llama,
+            cluster_axis,
+            sub_device_id,
+            fp32_dest_acc,
+            one_shot);
+    }
+};
+
+struct AllReduceAsyncInputs {
+    Tensor input_tensor;
+    Tensor buffer_tensor;
+    // Optional fused residual: when set, the reduction kernel adds this tensor to the cross-device sum before
+    // packing (output = residual + sum(partials)), replacing a separate eltwise add after the all-reduce.
+    // Same shard spec as the output and same dtype as the input (the reduction CB format); read in place from L1.
+    std::optional<Tensor> residual_tensor;
+};
+
+}  // namespace ttnn::experimental::prim

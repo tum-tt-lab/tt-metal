@@ -1,0 +1,199 @@
+name: Verify/create new release tag
+
+on:
+  workflow_call:
+    inputs:
+      fetch_depth:
+        description: "Commit depth to checkout to scan for previous release tags"
+        default: 0
+        type: number
+      bump_each_commit:
+        description: "Bump each commit as a patch version"
+        default: true
+        type: boolean
+      tag-type:
+        description: "Type of tag to create: 'rc' for release candidate, 'dev' for dev development, or '' for normal release"
+        default: ""
+        type: string
+      force-bump-type:
+        description: "Force a specific bump type instead of auto-detecting from commits. Options: 'major', 'minor', 'patch', 'none'."
+        default: ""
+        type: string
+      ignore-commits:
+        description: "Comma-separated list of commit SHAs to ignore when analyzing version bumps"
+        default: ""
+        type: string
+      dry-run:
+        description: "If true, do not upload tag."
+        default: false
+        type: boolean
+    outputs:
+      version:
+        description: "New version"
+        value: ${{ jobs.verify-create-new-tag.outputs.version }}
+
+jobs:
+  verify-create-new-tag:
+    # ubuntu-latest, not ubuntu-slim: off main the job joins the tailnet to get
+    # the release token, and ubuntu-slim cannot join.
+    runs-on: ubuntu-latest
+    # The release token can only be fetched by a job in environment `release`.
+    # Same form as the `mainline` binding in clang-tidy-reusable.yaml.
+    environment: ${{ github.ref != 'refs/heads/main' && !inputs.dry-run && 'release' || '' }}
+    permissions:
+      contents: write # checkout; read and create the tag with the built-in token on main
+      actions: write # "Dispatch upstream-tests" runs `gh workflow run`
+      id-token: write # off main: tailnet join and login for the release token
+    outputs:
+      version: ${{ steps.calculate-version.outputs.final_version }}
+    # On main the built-in token creates the tag. Off main (stable, v* tags) the
+    # tagged commit can carry workflow files that differ from main, so GitHub
+    # also asks for the `workflows` permission, which the built-in token cannot
+    # have. There the job gets a short-lived token (contents and workflows write
+    # on this repository only) at run time. No stored personal token is used.
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      VAULT_URL: https://vault-ospo.eng-svc.aws.tenstorrent.com
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2 cachew: keep
+        timeout-minutes: 20
+        with:
+          fetch-depth: ${{ inputs.fetch_depth }}
+          fetch-tags: true
+          ref: stable
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: true
+
+      - name: Calculate version
+        id: calculate-version
+        uses: tenstorrent/tt-metal/.github/actions/calculate-version@main
+        with:
+          tag-type: ${{ inputs.tag-type }}
+          force-bump-type: ${{ inputs.force-bump-type }}
+          ignore-commits: ${{ inputs.ignore-commits }}
+
+      # Off main and not a dry run: get the short-lived release token. Any
+      # failure here fails the job before "Create tag". There is no fallback
+      # to the built-in token off main.
+      - name: Join tailnet
+        if: ${{ github.ref != 'refs/heads/main' && !inputs.dry-run }}
+        timeout-minutes: 3
+        uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4.4.0
+        with:
+          oauth-client-id: ${{ vars.TS_VAULT_OSPO_CLIENT_ID }}
+          audience: ${{ vars.TS_VAULT_OSPO_AUDIENCE }}
+          tags: tag:tt-gha-vault-ospo
+
+      - name: Wait for Vault
+        if: ${{ github.ref != 'refs/heads/main' && !inputs.dry-run }}
+        timeout-minutes: 2
+        run: |
+          for attempt in 1 2 3 4 5 6; do
+            curl -fsS --max-time 5 "${VAULT_URL}/v1/sys/health?standbyok=true&uninitcode=204&sealedcode=204" >/dev/null && exit 0
+            sleep 2
+          done
+          echo "Vault ${VAULT_URL} did not become reachable over Tailscale" >&2
+          exit 1
+
+      - name: Get release tag token from Vault
+        if: ${{ github.ref != 'refs/heads/main' && !inputs.dry-run }}
+        timeout-minutes: 2
+        id: vault
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc # v4.0.0
+        with:
+          url: ${{ env.VAULT_URL }}
+          method: jwt
+          path: jwt-github
+          role: tenstorrent--tt-metal--release
+          jwtGithubAudience: ${{ env.VAULT_URL }}
+          exportEnv: false
+          secrets: |
+            github/token/tenstorrent--tt-metal--release-tag token | GH_TOKEN
+
+      - name: Check release tag token
+        if: ${{ github.ref != 'refs/heads/main' && !inputs.dry-run && steps.vault.outputs.GH_TOKEN == '' }}
+        run: |
+          echo "::error::No release tag token for ${GITHUB_REF}. The tag needs the workflows permission off main, which the built-in token does not have. Ask OSPO."
+          exit 1
+
+      - name: Create tag
+        if: ${{ !inputs.dry-run }}
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          # Built-in token on main; the release token everywhere else (no fallback).
+          github-token: ${{ github.ref == 'refs/heads/main' && github.token || steps.vault.outputs.GH_TOKEN }}
+          script: |
+            const owner = "${{ github.repository_owner }}";
+            const repo = "${{ github.repository }}".split('/')[1];
+            const version = "${{ steps.calculate-version.outputs.final_version }}";
+            const sha = "${{ github.sha }}";
+
+            console.log(`Checking for existing tag ${version} in ${owner}/${repo} at sha ${sha}...`);
+
+            async function getRefOrNull() {
+              try {
+                const { data } = await github.rest.git.getRef({
+                  owner, repo, ref: `tags/${version}`,
+                });
+                return data; // { ref, node_id, url, object: { sha, type, url } }
+              } catch (e) {
+                if (e.response.status === 404) return null;
+                core.error(`getRef failed: ${e.response.status} ${e.response.data.message}`);
+                throw e;
+              }
+            }
+
+            const existingRef = await getRefOrNull();
+
+            if(!existingRef) {
+              console.log(`Tag ${version} does not exist, creating it...`);
+              const tag = await github.rest.git.createTag({
+                  owner: owner,
+                  repo: repo,
+                  tag: version,
+                  message: `Release for ${version}`,
+                  object: sha,
+                  type: "commit",
+                  tagger: {
+                    name: "Tenstorrent Inc.",
+                    email: "info@tenstorrent.com",
+                  }
+                });
+                console.log("Created tag:", tag.data);
+                const ref = await github.rest.git.createRef({
+                  owner: owner,
+                  repo: repo,
+                  ref: `refs/tags/${version}`,
+                  sha: tag.data.sha,
+                });
+                console.log("Created ref:", ref.data);
+            } else {
+              console.log(`Tag ${version} already exists at sha ${existingRef.object.sha}, not creating it again.`);
+              const currentSha = existingRef.object?.sha;
+              if(currentSha === sha) {
+                console.log(`Tag ${version} already exists at the current commit sha ${sha}, all good.`);
+              } else {
+                console.warn(`Tag ${version} already exists at a different commit sha ${currentSha} than the current commit sha ${sha}.`);
+                await github.rest.git.updateRef({
+                  owner: owner,
+                  repo: repo,
+                  ref: `tags/${version}`,
+                  sha: sha,
+                  force: true,
+                });
+              }
+            }
+
+      # Kick off upstream-tests on the freshly created tag so it builds,
+      # tests, and publishes the :release-<version> image. For normal releases this also
+      # moves :release-latest; rc/dev tags get only the version-specific tag (see upstream-tests.yaml).
+      # Non-blocking: failures here must not fail the release.
+      - name: Dispatch upstream-tests on the release tag
+        if: ${{ !inputs.dry-run }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.calculate-version.outputs.final_version }}
+        run: |
+          echo "Dispatching upstream-tests.yaml on tag ${VERSION}"
+          gh workflow run upstream-tests.yaml --repo "${{ github.repository }}" --ref "${VERSION}" || true

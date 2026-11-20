@@ -1,0 +1,263 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
+# SPDX-License-Identifier: Apache-2.0
+
+from typing import List
+
+import pytest
+from helpers.constraints import is_valid_quasar_dest_mode_conversion
+from helpers.data_format_inference import unpacks_to_dest
+from helpers.format_config import DataFormat, FormatConfig
+from helpers.golden_generators import (
+    PackGolden,
+    get_golden_generator,
+    quantize_mx_tensor_chunked,
+)
+from helpers.llk_params import (
+    DestAccumulation,
+    PerfRunType,
+    ReluConfig,
+)
+from helpers.param_config import (
+    BlocksCalculationAlgorithm,
+    flat_axes,
+    get_num_blocks_and_num_tiles_in_block,
+    input_output_formats,
+    parametrize,
+    quasar_dest_sync_modes,
+    quasar_mx_smoke,
+    runtime,
+)
+from helpers.perf.core import create_test_or_perf_config
+from helpers.stimuli_config import StimuliConfig
+from helpers.stimuli_generator import generate_stimuli
+from helpers.test_config import BootMode
+from helpers.test_variant_parameters import (
+    DEST_SYNC,
+    LOOP_FACTOR,
+    NUM_BLOCKS,
+    NUM_FACES,
+    NUM_TILES_IN_BLOCK,
+    RELU_CONFIG,
+    TEST_FACE_DIMS,
+    TILE_COUNT,
+    generate_input_dim,
+)
+from helpers.tile_constants import FACE_C_DIM, get_tile_params
+from helpers.utils import passed_test, result_tensor
+
+INPUT_DIMENSIONS = [[512, 64], [192, 512]]
+TILE_DIMENSIONS = [32, 32]
+# Complete list of formats that are supported with L1 accumulation as the
+# OUTPUT format. MX formats (MxInt8) are allowed only as INPUT — accumulation
+# happens on the packed output in L1, and MX formats do not support L1 acc.
+PACK_L1_ACC_FORMATS = input_output_formats(
+    [
+        DataFormat.Float16_b,
+        DataFormat.Float32,
+        DataFormat.Int32,
+        DataFormat.Int8,
+        DataFormat.UInt8,
+    ]
+) + quasar_mx_smoke(DataFormat.MxInt8, DataFormat.Float16_b)
+
+
+def generate_qsr_pack_l1_acc_combinations(
+    formats_list: List[FormatConfig],
+):
+    """
+    Generate pack combinations for Quasar pack with L1 accumulation tests.
+
+    Args:
+        formats_list: List of input/output format pairs
+
+    Returns:
+        List of (format, dest_acc) tuples
+    """
+
+    def is_supported_format_conversion(in_fmt, out_fmt):
+        """Check if the format conversion is supported by packer. These format conversions are NOT dependent on the dest register mode."""
+        # Skip if mixing integer and non-integer formats
+        if in_fmt.is_integer() ^ out_fmt.is_integer():
+            return False
+        # MX formats are not L1-accumulation-capable as the output; allow them
+        # only on the input side.
+        if out_fmt.is_mx_format():
+            return False
+        return True
+
+    def get_dest_acc_modes(in_fmt):
+        """Determine valid dest register modes depending on the input format."""
+        # Int32, Float32 (unpack_to_dest) requires 32bit mode dest register
+        if in_fmt.is_32_bit():
+            return (DestAccumulation.Yes,)
+        return (DestAccumulation.No, DestAccumulation.Yes)
+
+    combinations = []
+    for fmt in formats_list:
+        in_fmt, out_fmt = fmt.input_format, fmt.output_format
+
+        if not is_supported_format_conversion(in_fmt, out_fmt):
+            continue
+
+        for dest_acc in get_dest_acc_modes(in_fmt):
+            if is_valid_quasar_dest_mode_conversion(in_fmt, out_fmt, dest_acc):
+                combinations.append((fmt, dest_acc))
+
+    return combinations
+
+
+# Column names of the tuples ``generate_qsr_pack_l1_acc_combinations`` returns.
+PACK_L1_ACC_FLAT_NAMES = (
+    "formats",
+    "dest_acc",
+)
+ALL_PACK_L1_ACC_COMBINATIONS = generate_qsr_pack_l1_acc_combinations(
+    PACK_L1_ACC_FORMATS
+)
+
+
+@pytest.mark.quasar
+@parametrize(
+    **flat_axes(PACK_L1_ACC_FLAT_NAMES, ALL_PACK_L1_ACC_COMBINATIONS),
+    dest_sync=lambda: quasar_dest_sync_modes(is_perf=False),
+    input_dimensions=runtime(INPUT_DIMENSIONS),
+    run_types=[[PerfRunType.L1_TO_L1]],
+    loop_factor=[1],
+)
+def test_pack_l1_acc_quasar(
+    formats,
+    dest_acc,
+    dest_sync,
+    input_dimensions,
+    run_types,
+    loop_factor,
+    boot_mode=BootMode.DEFAULT,
+    *,
+    is_perf=False,
+    perf_report=None,
+):
+    tile_rows, tile_cols = TILE_DIMENSIONS
+    face_r_dim, num_faces_r_dim, num_faces_c_dim = get_tile_params(
+        [tile_rows, tile_cols]
+    )
+    num_faces = num_faces_r_dim * num_faces_c_dim
+
+    rows, cols = input_dimensions
+    tile_cnt = (rows // tile_rows) * (cols // tile_cols)
+
+    output_num_blocks, output_tiles_in_block = get_num_blocks_and_num_tiles_in_block(
+        dest_sync,
+        dest_acc,
+        formats,
+        input_dimensions,
+        TILE_DIMENSIONS,
+        BlocksCalculationAlgorithm.Standard,
+    )
+
+    src_A, _, src_B, _ = generate_stimuli(
+        stimuli_format_A=formats.input_format,
+        input_dimensions_A=input_dimensions,
+        stimuli_format_B=formats.input_format,
+        input_dimensions_B=input_dimensions,
+        tile_dimensions=TILE_DIMENSIONS,
+    )
+
+    if not is_perf:
+        # Quantize MX input through the source lattice so the golden sees what HW
+        # sees after unpacking from L1. Without this, raw bfloat16 stimuli flow
+        # into PackGolden while HW reads MxInt4-quantized values; per-block
+        # accumulation then amplifies the per-element drift.
+        src_A_golden = (
+            quantize_mx_tensor_chunked(src_A, formats.input_format)
+            if formats.input_format.is_mx_format()
+            else src_A
+        )
+
+        generate_golden = get_golden_generator(PackGolden)
+        full_golden = generate_golden(
+            src_A_golden,
+            formats.output_format,
+            num_faces=num_faces,
+            input_dimensions=input_dimensions,
+            face_r_dim=face_r_dim,
+        )
+
+        # This test accumulates the results of each block on top of each other
+        # Slice the full golden into per-block partials and accumulate
+        elements_per_block = output_tiles_in_block * num_faces * face_r_dim * FACE_C_DIM
+        partials = [
+            full_golden[block * elements_per_block : (block + 1) * elements_per_block]
+            for block in range(output_num_blocks)
+        ]
+        golden_tensor = generate_golden.accumulate_l1(
+            partials, data_format=formats.output_format
+        )
+
+    unpack_to_dest = unpacks_to_dest(formats.input_format, dest_acc)
+
+    if is_perf and perf_report is None:
+        raise ValueError("perf_report must be provided when is_perf=True")
+
+    test_config_kwargs = {
+        "test_name": "sources/quasar/pack_l1_acc_quasar_test.cpp",
+        "formats": formats,
+        "templates": [
+            DEST_SYNC(dest_sync),
+        ],
+        "runtimes": [
+            generate_input_dim(input_dimensions, input_dimensions),
+            TILE_COUNT(tile_cnt),
+            NUM_FACES(num_faces),
+            NUM_TILES_IN_BLOCK(
+                output_tiles_in_block,
+                input_num_tiles_in_block=output_tiles_in_block,
+                output_num_tiles_in_block=output_tiles_in_block,
+            ),
+            NUM_BLOCKS(
+                output_num_blocks,
+                input_num_blocks=output_num_blocks,
+                output_num_blocks=output_num_blocks,
+            ),
+            TEST_FACE_DIMS(face_r_dim=face_r_dim, face_c_dim=FACE_C_DIM),
+            RELU_CONFIG(ReluConfig.NoRelu.value),
+            LOOP_FACTOR(loop_factor),
+        ],
+        "variant_stimuli": StimuliConfig(
+            src_A,
+            formats.input_format,
+            src_B,
+            formats.input_format,
+            formats.output_format,
+            tile_count_A=tile_cnt,
+            tile_count_B=tile_cnt,
+            tile_count_res=output_tiles_in_block,
+            num_faces=num_faces,
+            face_r_dim=face_r_dim,
+            tile_dimensions=TILE_DIMENSIONS,
+            use_dense_tile_dimensions=True,
+        ),
+        "unpack_to_dest": unpack_to_dest,
+        "dest_acc": dest_acc,
+    }
+
+    configuration = create_test_or_perf_config(
+        is_perf=is_perf,
+        run_types=run_types,
+        test_config_kwargs=test_config_kwargs,
+        boot_mode=boot_mode,
+    )
+    if is_perf:
+        configuration.run(perf_report)
+        return
+
+    res_from_L1 = configuration.run().result
+
+    res_tensor = result_tensor(res_from_L1, formats.output_format, golden_tensor)
+
+    test_passed = passed_test(
+        golden_tensor,
+        res_tensor,
+        formats.output_format,
+    )
+
+    assert test_passed, "Assert against golden failed"

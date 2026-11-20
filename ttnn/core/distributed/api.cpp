@@ -1,0 +1,212 @@
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include <tt_stl/reflection.hpp>
+#include "ttnn/distributed/api.hpp"
+
+#include <memory>
+
+#include <tt_stl/overloaded.hpp>
+#include <tt_stl/assert.hpp>
+#include <tt-metalium/distributed_host_buffer.hpp>
+#include <tt-metalium/mesh_coord.hpp>
+#include <ttnn/tensor/storage.hpp>
+#include <ttnn/tensor/tensor.hpp>
+#include <ttnn/tensor/host_buffer/functions.hpp>
+#include <ttnn/tensor/tensor_utils.hpp>
+#include <ttnn/tensor/topology_check.hpp>
+#include <ttnn/distributed/host_ccl.hpp>
+#include <tt-metalium/mesh_device.hpp>
+#include <tt-metalium/system_mesh.hpp>
+#include <ttnn/distributed/types.hpp>
+#include <tt-metalium/experimental/distributed_tensor/distributed_tensor_apis.hpp>
+
+using namespace tt::tt_metal;
+
+namespace ttnn::distributed {
+
+std::shared_ptr<MeshDevice> open_mesh_device(
+    const MeshShape& mesh_shape,
+    size_t l1_small_size,
+    size_t trace_region_size,
+    size_t num_command_queues,
+    const DispatchCoreConfig& dispatch_core_config,
+    const std::optional<MeshCoordinate>& offset,
+    const std::vector<int>& physical_device_ids,
+    size_t worker_l1_size) {
+    return MeshDevice::create(
+        MeshDeviceConfig(mesh_shape, offset, physical_device_ids),
+        l1_small_size,
+        trace_region_size,
+        num_command_queues,
+        dispatch_core_config,
+        {},
+        worker_l1_size);
+}
+
+std::shared_ptr<MeshDevice> open_mesh_device(
+    size_t l1_small_size,
+    size_t trace_region_size,
+    size_t num_command_queues,
+    const tt::tt_metal::DispatchCoreConfig& dispatch_core_config,
+    const std::optional<MeshShape>& mesh_shape,
+    const std::optional<MeshCoordinate>& offset,
+    const std::vector<int>& physical_device_ids,
+    size_t worker_l1_size) {
+    return MeshDevice::create(
+        MeshDeviceConfig(mesh_shape, offset, physical_device_ids),
+        l1_small_size,
+        trace_region_size,
+        num_command_queues,
+        dispatch_core_config,
+        {},
+        worker_l1_size);
+}
+
+void close_mesh_device(const std::shared_ptr<MeshDevice>& mesh_device) { mesh_device->close(); }
+
+std::vector<Tensor> get_device_tensors(const Tensor& tensor) {
+    if (is_cpu_tensor(tensor)) {
+        std::vector<ttnn::Tensor> tensors;
+        auto gathered_tensor = host_ccl::all_gather(tensor);
+        const auto& distributed_buffer = gathered_tensor.host_storage().buffer();
+        distributed_buffer.apply(
+            [&](const HostBuffer& buffer) { tensors.push_back(Tensor{buffer, tensor.tensor_spec()}); });
+        return tensors;
+    }
+    if (is_device_tensor(tensor) && tensor.is_allocated()) {
+        const auto& device_storage = tensor.device_storage();
+        std::vector<ttnn::Tensor> tensors;
+        tensors.reserve(device_storage.get_coords().size());
+        for (const auto& coord : device_storage.get_coords()) {
+            // Each shard is a tensor of its own held at one mesh coordinate and is labelled as such; the label of
+            // the tensor it was taken from describes shards this tensor does not hold.
+            tensors.push_back(Tensor(DeviceStorage::single_shard(device_storage, coord)));
+        }
+        return tensors;
+    }
+    return {tensor};
+}
+
+Tensor from_host_shards(const std::vector<Tensor>& tensor_shards, const MeshShape& mesh_shape, int shard_dim) {
+    TT_FATAL(tensor_shards.size() == mesh_shape.mesh_size(), "Number of tensor shards must match mesh size");
+    const auto& reference_shard = tensor_shards.at(0);
+    for (const auto& shard : tensor_shards) {
+        TT_FATAL(shard.storage_type() == StorageType::HOST, "All tensor shards must be on host");
+        TT_FATAL(
+            shard.tensor_spec() == reference_shard.tensor_spec(), "All tensor shards must have the same tensor spec");
+    }
+
+    auto distributed_host_buffer = DistributedHostBuffer::create(mesh_shape);
+    auto shard_it = tensor_shards.begin();
+    for (const auto& coord : distributed::MeshCoordinateRange(mesh_shape)) {
+        HostBuffer buffer = host_buffer::get_host_buffer(*(shard_it++));
+        distributed_host_buffer.emplace_shard(coord, [&]() { return std::move(buffer); });
+    }
+
+    tt::tt_metal::TensorTopology topology =
+        tt::tt_metal::TensorTopology::create_sharded_tensor_topology(mesh_shape, shard_dim);
+    return Tensor(host_tensor_from_buffer_with_topology(
+        std::move(distributed_host_buffer), reference_shard.tensor_spec(), std::move(topology)));
+}
+
+Tensor combine_device_tensors(const std::vector<Tensor>& tensor_shards, int shard_dim) {
+    // Validations
+    TT_FATAL(!tensor_shards.empty(), "At least one tensor shard must be provided");
+    const auto& reference_shard = tensor_shards.front();
+    TT_FATAL(
+        std::all_of(
+            tensor_shards.begin(),
+            tensor_shards.end(),
+            [](const auto& shard) { return shard.storage_type() == StorageType::DEVICE; }),
+        "All tensor shards must be on device");
+    TT_FATAL(
+        std::all_of(
+            tensor_shards.begin(),
+            tensor_shards.end(),
+            [&](const auto& shard) { return shard.tensor_spec() == reference_shard.tensor_spec(); }),
+        "All tensor shards must have the same spec");
+
+    // Combine the storages
+    std::vector<std::reference_wrapper<const DeviceStorage>> device_storages;
+    device_storages.reserve(tensor_shards.size());
+    for (const auto& shard : tensor_shards) {
+        device_storages.push_back(std::cref(shard.device_storage()));
+    }
+
+    return Tensor(DeviceStorage::combine_device_storages(device_storages, shard_dim));
+}
+
+Tensor from_local_host_shards(
+    const std::map<MeshCoordinate, Tensor>& shards,
+    const MeshDevice& mesh_device,
+    const tt::tt_metal::TensorTopology& topology) {
+    TT_FATAL(!shards.empty(), "from_local_host_shards needs at least one shard");
+    const auto& [reference_coord, reference_shard] = *shards.begin();
+    const auto& mesh_device_view = mesh_device.get_view();
+    const auto& mesh_shape = mesh_device_view.shape();
+    const distributed::MeshCoordinateRange mesh_range(mesh_shape);
+    for (const auto& [coord, shard] : shards) {
+        TT_FATAL(
+            shard.storage_type() == StorageType::HOST, "from_local_host_shards: the shard at {} is not on host", coord);
+        // A mesh host tensor (the output of cpu(), say) is on host too, but holds several shards; get_host_buffer
+        // below would refuse it with a message that names no coordinate.
+        const size_t shard_count = shard.host_storage().buffer().shard_coords().size();
+        TT_FATAL(
+            shard_count == 1,
+            "from_local_host_shards: the shard at {} is a multi-device host tensor with {} shards; pass one "
+            "single-device host tensor per coordinate",
+            coord,
+            shard_count);
+        TT_FATAL(
+            shard.tensor_spec() == reference_shard.tensor_spec(),
+            "from_local_host_shards: the shard at {} has a different tensor spec from the one at {}",
+            coord,
+            reference_coord);
+        // The dims compare comes first: MeshCoordinateRange::contains throws its own, less specific, message on a
+        // coordinate with the wrong number of dimensions.
+        TT_FATAL(
+            coord.dims() == mesh_shape.dims() && mesh_range.contains(coord),
+            "from_local_host_shards: coordinate {} is not inside the mesh of shape {}",
+            coord,
+            mesh_shape);
+    }
+
+    // The buffer spans the whole mesh. The label decides where the tensor lives, which can be part of the mesh (a
+    // mapper's mesh_shape_override, say): every coordinate it lists on this host needs a shard, and a shard goes only
+    // to a coordinate of this host. A shard at a coordinate the label does not list is refused by
+    // verify_shards_match_topology below.
+    auto distributed_host_buffer = DistributedHostBuffer::create(mesh_device_view);
+    for (const auto& coord : topology.mesh_coords()) {
+        TT_FATAL(
+            coord.dims() == mesh_shape.dims() && mesh_range.contains(coord),
+            "from_local_host_shards: the topology lists coordinate {}, which is not inside the mesh of shape {}",
+            coord,
+            mesh_shape);
+        TT_FATAL(
+            shards.contains(coord) || !distributed_host_buffer.is_local(coord),
+            "from_local_host_shards: no shard was given for local coordinate {}",
+            coord);
+    }
+    for (const auto& [coord, shard] : shards) {
+        TT_FATAL(
+            distributed_host_buffer.is_local(coord),
+            "from_local_host_shards: coordinate {} is not local to this host",
+            coord);
+    }
+    for (const auto& [coord, shard] : shards) {
+        HostBuffer buffer = host_buffer::get_host_buffer(shard);
+        distributed_host_buffer.emplace_shard(coord, [&]() { return std::move(buffer); });
+    }
+    Tensor result(host_tensor_from_buffer_with_topology(
+        std::move(distributed_host_buffer), reference_shard.tensor_spec(), topology));
+    // The label is the caller's: check that it describes the shards just placed, with the check serialization runs,
+    // so a label that omits a populated coordinate or lists one that holds no shard is refused here rather than
+    // when the tensor is composed or dumped. Replica contents are not compared: the shards are what the caller
+    // loaded, and comparing them would read every byte.
+    verify_shards_match_topology(result, /*compare_replica_contents=*/false);
+    return result;
+}
+
+}  // namespace ttnn::distributed

@@ -1,0 +1,397 @@
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+#include "transpose.hpp"
+
+#include "clone/clone.hpp"
+#include "device/transpose_device_operation.hpp"
+#include "device/transpose_utils.hpp"
+#include "ttnn/operations/copy/typecast/typecast.hpp"
+#include "ttnn/operations/core/core.hpp"
+#include "ttnn/operations/data_movement/common/common.hpp"
+#include "ttnn/operations/data_movement/permute/device/permute_device_operation.hpp"
+#include "ttnn/operations/data_movement/permute/permute.hpp"
+
+#include <tt-metalium/hal.hpp>
+
+#include <variant>
+
+namespace ttnn::operations::data_movement::transpose {
+
+namespace detail {
+
+using namespace tt;
+using tt::tt_metal::BufferType;
+
+// True for a sharded MemoryConfig whose shard geometry still has to be synthesized. An ND-only
+// config carries no legacy shard_spec but is already fully specified by its nd_shard_spec, so
+// testing shard_spec() alone misreads it as geometry-less and invites callers to overwrite it.
+inline bool needs_shard_spec_synthesis(const tt::tt_metal::MemoryConfig& mc) {
+    return mc.is_sharded() && !mc.shard_spec().has_value() &&
+           !(mc.created_with_nd_shard_spec() && mc.nd_shard_spec().has_value());
+}
+
+// True when the RM WH device op's per-core L1 need (its non-tensor-backed CBs plus an L1 output
+// buffer, which is allocated after lowest_occupied_compute_l1_address() is sampled) exceeds what
+// is free, so the caller should route to permute instead. CB counts mirror the selected factory.
+inline bool rm_wh_exceeds_l1_budget(
+    const Tensor& a, const MemoryConfig& output_mem_config, bool output_mem_config_is_explicit, float pad_value) {
+    const ttnn::prim::TransposeParams attributes{
+        .dim = ttnn::prim::TransposeOpDim::WH,
+        .output_mem_config = output_mem_config,
+        .pad_value = pad_value,
+        .output_mem_config_is_explicit = output_mem_config_is_explicit};
+    const ttnn::prim::TransposeInputs tensor_args{.input = a};
+
+    const uint64_t Wt = tt::div_up(a.logical_shape()[3], tt::constants::TILE_WIDTH);
+    const uint64_t Ht = tt::div_up(a.logical_shape()[2], tt::constants::TILE_HEIGHT);
+    const uint64_t tile_size = tt::tile_size(tt::tt_metal::datatype_to_dataformat_converter(a.dtype()));
+    const auto factory = ttnn::prim::TransposeDeviceOperation::select_program_factory(attributes, tensor_args);
+    uint64_t num_cb_tiles = 0;
+    if (std::holds_alternative<ttnn::prim::TransposeWHShardedRMProgramFactory>(factory)) {
+        // Input/output CBs alias the shard buffers; the ht > 8 path adds untilize + staging CBs.
+        num_cb_tiles = 2 * Wt + Ht * Wt + (Ht > 8 ? 3 * Ht : 0);
+    } else {
+        num_cb_tiles = 2 * Wt + 2 * Ht + Ht * Wt;
+    }
+    uint64_t required = num_cb_tiles * tile_size;
+
+    auto* device = a.device();
+    const auto& allocator = device->allocator();
+    if (output_mem_config.buffer_type() == BufferType::L1) {
+        const auto output_spec = ttnn::prim::TransposeDeviceOperation::compute_output_specs(attributes, tensor_args);
+        // HYBRID mode aligns every L1 page to the DRAM alignment, so round each page, not just the
+        // total, using the larger of the two alignments.
+        const uint64_t page_alignment =
+            std::max<uint64_t>(allocator->get_alignment(BufferType::L1), allocator->get_alignment(BufferType::DRAM));
+        required += output_spec.compute_consumed_memory_bytes_per_bank(
+            page_alignment, allocator->get_num_banks(BufferType::L1));
+    }
+
+    const auto lowest_address = device->lowest_occupied_compute_l1_address();
+    const uint64_t l1_top = lowest_address.has_value() ? lowest_address.value() : device->l1_size_per_core();
+    const uint64_t l1_base = allocator->get_base_allocator_addr(tt::tt_metal::HalMemType::L1);
+    const uint64_t max_l1_space = l1_top > l1_base ? l1_top - l1_base : 0;
+    return required > max_l1_space;
+}
+
+inline Tensor transpose_(
+    const Tensor& a,
+    ttnn::prim::TransposeOpDim transpose_dim,
+    const std::optional<MemoryConfig>& output_mem_config,
+    float pad_value = 0.0f) {
+    MemoryConfig output_mem_constructed;
+    // Tracks whether output_mem_constructed ends up as the caller's output_mem_config verbatim
+    // (already expressed in the output coordinate frame) vs. defaulted/mirrored from the input
+    // (still needs reindexing to the output frame downstream). Forwarded to the device op so
+    // derive_effective_output_memory_config() doesn't have to guess from ND provenance alone.
+    bool output_mem_config_is_explicit = false;
+    // A fully-specified caller config (including an ND-only one) is routed to the verbatim branch;
+    // only a geometry-less sharded request gets derived from the input here.
+    const bool caller_requested_shard_derivation =
+        output_mem_config.has_value() && needs_shard_spec_synthesis(output_mem_config.value());
+    if (!output_mem_config.has_value() || caller_requested_shard_derivation) {
+        // Native sharded subset: derive output shard_spec from input's. Otherwise fall back to L1
+        // interleaved (the interleaved factories handle non-native via TensorAccessor).
+        const bool native = is_native_transpose_sharding(a.tensor_spec());
+        if (a.is_sharded() && native) {
+            // Seed: honor user's requested sharded layout (spec gets synthesized below); else
+            // inherit input config so downstream can promote (e.g. N=C=1 → WIDTH_SHARDED).
+            const bool user_requested_layout = output_mem_config.has_value() && output_mem_config.value().is_sharded();
+            const MemoryConfig allocation_flag_source =
+                user_requested_layout ? output_mem_config.value() : a.memory_config();
+            output_mem_constructed = allocation_flag_source;
+            output_mem_config_is_explicit = user_requested_layout;
+            // ND-created inputs keep their legacy expression here on purpose: select_program_factory
+            // picks the native factories off output_memory_config.shard_spec(), which an ND-only
+            // config doesn't carry, so re-expressing the output as ND-only just to hold the
+            // created_with_nd_shard_spec bit would demote every native sharded transpose. No
+            // placement is lost — only ROUND_ROBIN_1D specs can be native, and re-deriving the ND
+            // spec from the output's legacy spec reproduces that same strategy and grid.
+            // If shard geometry can't scale to a valid output shard, hand back a shard-spec-less
+            // sharded MemoryConfig (device op synthesizes via generate_transpose_shard_spec) when
+            // the user requested sharded; otherwise fall back to L1 interleaved.
+            const auto shard_derivation_fallback = [&]() {
+                if (user_requested_layout) {
+                    output_mem_constructed = MemoryConfig(
+                        output_mem_config.value().memory_layout(), output_mem_config.value().buffer_type());
+                } else {
+                    output_mem_constructed = MemoryConfig(TensorMemoryLayout::INTERLEAVED, BufferType::L1);
+                }
+            };
+            const auto& input_padded_shape = a.padded_shape();
+            if (transpose_dim == ttnn::prim::TransposeOpDim::WH) {
+                const uint32_t W = input_padded_shape[3], C = input_padded_shape[1], N = input_padded_shape[0];
+                auto shard_spec = a.shard_spec().value();
+                // N=C=1 height-sharded-with-full-width → WIDTH_SHARDED (skip if user requested layout).
+                const bool can_promote_to_width_sharded =
+                    !user_requested_layout && N == 1 && C == 1 && shard_spec.shape[1] == W;
+                if (can_promote_to_width_sharded) {
+                    std::swap(shard_spec.shape[0], shard_spec.shape[1]);
+                    if (a.layout() == Layout::TILE && (shard_spec.shape[0] % tt::constants::TILE_HEIGHT != 0 ||
+                                                       shard_spec.shape[1] % tt::constants::TILE_WIDTH != 0)) {
+                        shard_derivation_fallback();
+                    } else {
+                        output_mem_constructed = MemoryConfig(
+                            TensorMemoryLayout::WIDTH_SHARDED, output_mem_constructed.buffer_type(), shard_spec);
+                    }
+                } else {
+                    auto output_padded_shape = input_padded_shape;
+                    std::swap(output_padded_shape[2], output_padded_shape[3]);
+                    auto adjusted = adjust_shard_spec_to_shape(shard_spec, input_padded_shape, output_padded_shape);
+                    // Layout mismatch: synthesize a fresh spec instead of reusing the input's.
+                    const bool layouts_match = !user_requested_layout || output_mem_config.value().memory_layout() ==
+                                                                             a.memory_config().memory_layout();
+                    if (!adjusted.has_value() || !layouts_match ||
+                        (a.layout() == Layout::TILE && (adjusted->shape[0] % tt::constants::TILE_HEIGHT != 0 ||
+                                                        adjusted->shape[1] % tt::constants::TILE_WIDTH != 0))) {
+                        shard_derivation_fallback();
+                    } else {
+                        output_mem_constructed = MemoryConfig(
+                            output_mem_constructed.memory_layout(),
+                            output_mem_constructed.buffer_type(),
+                            std::move(adjusted));
+                    }
+                }
+            } else if (transpose_dim == ttnn::prim::TransposeOpDim::HC && a.layout() == Layout::TILE) {
+                auto shard_spec = a.shard_spec().value();
+                // HC TILE padded-shape contract: dim[1] = logical H, dim[2] = round_up(logical C, TILE_HEIGHT).
+                auto output_padded_shape = input_padded_shape;
+                output_padded_shape[1] = a.logical_shape()[2];
+                output_padded_shape[2] = tt::round_up(a.logical_shape()[1], tt::constants::TILE_HEIGHT);
+                auto adjusted = adjust_shard_spec_to_shape(shard_spec, input_padded_shape, output_padded_shape);
+                // Layout mismatch: synthesize a fresh spec instead of reusing the input's.
+                const bool layouts_match = !user_requested_layout || output_mem_config.value().memory_layout() ==
+                                                                         a.memory_config().memory_layout();
+                if (!adjusted.has_value() || !layouts_match || adjusted->shape[0] % tt::constants::TILE_HEIGHT != 0 ||
+                    adjusted->shape[1] % tt::constants::TILE_WIDTH != 0) {
+                    shard_derivation_fallback();
+                } else {
+                    output_mem_constructed = MemoryConfig(
+                        output_mem_constructed.memory_layout(),
+                        output_mem_constructed.buffer_type(),
+                        std::move(adjusted));
+                }
+            }
+            // Every rebuild above goes through a public MemoryConfig constructor, and
+            // derive_effective_output_memory_config() can't recover the flags either: it
+            // early-returns once shard_spec() is set. Reapply from the seed config. Skipped for the
+            // interleaved fallback, where neither flag applies.
+            if (output_mem_constructed.is_sharded()) {
+                copy_experimental_allocation_flags(allocation_flag_source, output_mem_constructed);
+            }
+        } else if (output_mem_config.has_value()) {
+            // User-requested sharded output (no spec): honor the layout; device op will synthesize
+            // the spec. Must precede the non-native fallback below so it isn't overridden.
+            output_mem_constructed = output_mem_config.value();
+            output_mem_config_is_explicit = true;
+        } else if (a.is_sharded()) {
+            // Non-native sharded input → mirror input's memory_layout (no shard_spec, device op
+            // synthesizes via adjust_shard_spec_to_shape / generate_transpose_shard_spec). Preserve
+            // ND-sharding provenance (nd_shard_spec / created_with_nd_shard_spec) for ND-created
+            // inputs instead of dropping it via the legacy (memory_layout, buffer_type) constructor.
+            const auto& input_memory_config = a.memory_config();
+            output_mem_constructed =
+                input_memory_config.created_with_nd_shard_spec()
+                    ? MemoryConfig(input_memory_config.buffer_type(), input_memory_config.nd_shard_spec())
+                    : MemoryConfig(input_memory_config.memory_layout(), input_memory_config.buffer_type());
+            // Reapply from the input so a caller's allocation mode survives the fallback.
+            copy_experimental_allocation_flags(input_memory_config, output_mem_constructed);
+        } else {
+            output_mem_constructed = a.memory_config();
+        }
+    } else {
+        output_mem_constructed = output_mem_config.value();
+        output_mem_config_is_explicit = true;
+    }
+
+    auto prim_permute = [&](const ttnn::Tensor& input, const ttsl::SmallVector<uint32_t>& dims) -> ttnn::Tensor {
+        return ttnn::prim::permute(input, dims, output_mem_constructed, std::nullopt, pad_value);
+    };
+
+    bool interleaved_rm = !a.is_sharded() && a.layout() == Layout::ROW_MAJOR;
+    switch (transpose_dim) {
+        case ttnn::prim::TransposeOpDim::HC:
+            if (interleaved_rm) {
+                return prim_permute(a, ttsl::SmallVector<uint32_t>{0, 2, 1, 3});
+            }
+            break;
+        case ttnn::prim::TransposeOpDim::NH:
+            return ttnn::permute(
+                (const ttnn::Tensor)a, ttsl::SmallVector<int64_t>({2, 1, 0, 3}), output_mem_config, pad_value);
+        case ttnn::prim::TransposeOpDim::NW:
+            return ttnn::permute(
+                (const ttnn::Tensor)a, ttsl::SmallVector<int64_t>({3, 1, 2, 0}), output_mem_config, pad_value);
+        case ttnn::prim::TransposeOpDim::CW:
+            return ttnn::permute(
+                (const ttnn::Tensor)a, ttsl::SmallVector<int64_t>({0, 3, 2, 1}), output_mem_config, pad_value);
+        case ttnn::prim::TransposeOpDim::CN:
+            if (interleaved_rm) {
+                return prim_permute(a, ttsl::SmallVector<uint32_t>({1, 0, 2, 3}));
+            }
+            break;
+        case ttnn::prim::TransposeOpDim::WH:
+            if (interleaved_rm) {
+                return prim_permute(a, ttsl::SmallVector<uint32_t>({0, 1, 3, 2}));
+            }
+            if (a.layout() == Layout::ROW_MAJOR &&
+                rm_wh_exceeds_l1_budget(a, output_mem_constructed, output_mem_config_is_explicit, pad_value)) {
+                return prim_permute(a, ttsl::SmallVector<uint32_t>({0, 1, 3, 2}));
+            }
+            break;
+        default: break;
+    }
+    return ttnn::prim::transpose(a, transpose_dim, output_mem_constructed, pad_value, output_mem_config_is_explicit);
+}
+
+ttnn::Tensor transpose_nd(
+    const ttnn::Tensor& input_tensor,
+    uint32_t dim1,
+    uint32_t dim2,
+    const std::optional<MemoryConfig>& memory_config_arg,
+    float pad_value = 0.0f) {
+    const auto rank = input_tensor.logical_shape().rank();
+    ttsl::SmallVector<int64_t> permutation;
+    permutation.reserve(rank);
+    for (uint32_t i = 0; i < rank; ++i) {
+        permutation.push_back(i);
+    }
+    std::swap(permutation[dim1], permutation[dim2]);
+    return ttnn::permute(input_tensor, permutation, memory_config_arg, pad_value);
+}
+
+inline bool is_block_or_width_sharded_mc(const tt::tt_metal::MemoryConfig& mc) {
+    return mc.is_sharded() && (mc.memory_layout() == tt::tt_metal::TensorMemoryLayout::BLOCK_SHARDED ||
+                               mc.memory_layout() == tt::tt_metal::TensorMemoryLayout::WIDTH_SHARDED);
+}
+
+}  // namespace detail
+
+ttnn::Tensor transpose_impl(
+    const ttnn::Tensor& input_tensor,
+    int64_t dim1,
+    int64_t dim2,
+    const std::optional<MemoryConfig>& memory_config_arg,
+    float pad_value = 0.0f) {
+    // Irregular RM block/width sharded hits a pages_per_shard misread in noc_async_*_sharded.
+    // Unshard until the kernel-side helpers handle irregular RM geometries.
+    const bool rm = input_tensor.layout() == Layout::ROW_MAJOR;
+    const bool in_sharded = detail::is_block_or_width_sharded_mc(input_tensor.memory_config());
+    const auto& input_logical = input_tensor.logical_shape();
+    const bool irregular_hw = input_logical.rank() >= 2 && (input_logical[-1] % tt::constants::TILE_WIDTH != 0 ||
+                                                            input_logical[-2] % tt::constants::TILE_HEIGHT != 0);
+    // BH 8-bit int sharded RM hits pack_untilize_dest truncation in transpose_wh_sharded_rm; stage interleaved.
+    const bool bh_8bit_rm_sharded =
+        rm && input_tensor.is_sharded() &&
+        (input_tensor.dtype() == DataType::UINT8 || input_tensor.dtype() == DataType::INT8) &&
+        input_tensor.device() != nullptr && input_tensor.device()->arch() == tt::ARCH::BLACKHOLE;
+    if (rm && ((in_sharded && irregular_hw) || bh_8bit_rm_sharded)) {
+        // Snapshot orientation before the L1-interleaved staging hop strips it.
+        std::optional<tt::tt_metal::ShardOrientation> input_orientation_hint;
+        if (input_tensor.shard_spec().has_value()) {
+            input_orientation_hint = input_tensor.shard_spec()->orientation;
+        }
+        auto resolved_mc = memory_config_arg;
+        // BH 8-bit RM sharded: default output back to the input's sharded layout so caller gets sharded result.
+        if (!resolved_mc.has_value() && bh_8bit_rm_sharded) {
+            resolved_mc = tt::tt_metal::MemoryConfig(
+                input_tensor.memory_config().memory_layout(), input_tensor.memory_config().buffer_type());
+        }
+        if (resolved_mc.has_value() && detail::needs_shard_spec_synthesis(*resolved_mc)) {
+            const auto& input_padded = input_tensor.padded_shape();
+            const uint32_t n1 = input_logical.get_normalized_index(dim1);
+            const uint32_t n2 = input_logical.get_normalized_index(dim2);
+            ttsl::SmallVector<uint32_t> out_padded_vec(input_padded.cbegin(), input_padded.cend());
+            std::swap(out_padded_vec[n1], out_padded_vec[n2]);
+            auto output_padded_shape = ttnn::Shape(std::move(out_padded_vec));
+            // Composite path opts into RM-safe synth; TILE inputs still tile-inflate.
+            auto spec = generate_transpose_shard_spec(
+                input_tensor,
+                output_padded_shape,
+                resolved_mc->memory_layout(),
+                input_orientation_hint,
+                input_tensor.layout() == Layout::TILE ? OutputTiling::Tile : OutputTiling::RowMajor);
+            auto new_mc =
+                tt::tt_metal::MemoryConfig(resolved_mc->memory_layout(), resolved_mc->buffer_type(), std::move(spec));
+            copy_experimental_allocation_flags(*resolved_mc, new_mc);
+            resolved_mc = std::move(new_mc);
+        }
+        const auto interleaved_l1 =
+            tt::tt_metal::MemoryConfig(tt::tt_metal::TensorMemoryLayout::INTERLEAVED, tt::tt_metal::BufferType::L1);
+        Tensor x = ttnn::to_memory_config(input_tensor, interleaved_l1, std::nullopt);
+        return transpose_impl(x, dim1, dim2, resolved_mc, pad_value);
+    }
+    const auto& input_shape = input_tensor.logical_shape();
+    uint32_t normalized_dim1 = input_shape.get_normalized_index(dim1);
+    uint32_t normalized_dim2 = input_shape.get_normalized_index(dim2);
+
+    Tensor input_unsqueezed = input_tensor;
+    const uint32_t initial_rank = input_shape.rank();
+    if (initial_rank < 4) {
+        input_unsqueezed = ttnn::unsqueeze_to_4D(input_tensor);
+        const uint32_t rank_diff = 4 - initial_rank;
+        normalized_dim1 += rank_diff;
+        normalized_dim2 += rank_diff;
+    } else if (initial_rank > 4) {
+        return detail::transpose_nd(input_tensor, normalized_dim1, normalized_dim2, memory_config_arg, pad_value);
+    }
+
+    TT_FATAL(normalized_dim1 <= 3, "dimension has to be 0-3 only corresponding to N,C,H,W");
+    TT_FATAL(normalized_dim2 <= 3, "dimension has to be 0-3 only corresponding to N,C,H,W");
+    const bool wh = 5 == (normalized_dim1 + normalized_dim2);  // 2+3=5
+    const bool cn = 1 == (normalized_dim1 + normalized_dim2);  // 0+1
+    const bool bfloat8_supported = wh || cn;
+    const bool typecast = input_unsqueezed.dtype() == DataType::BFLOAT8_B and !bfloat8_supported;
+    Tensor input_typecasted = typecast ? ttnn::typecast(input_unsqueezed, DataType::BFLOAT16) : input_unsqueezed;
+
+    Tensor output;
+    if ((normalized_dim1 == normalized_dim2) || (input_typecasted.padded_shape()[normalized_dim1] == 1 &&
+                                                 input_typecasted.padded_shape()[normalized_dim2] == 1)) {
+        if (memory_config_arg.has_value() && input_typecasted.memory_config() != memory_config_arg.value()) {
+            output = ttnn::clone(
+                input_typecasted,
+                std::nullopt,
+                memory_config_arg.value_or(input_typecasted.memory_config()),
+                std::nullopt);
+        } else {
+            output = input_typecasted;
+        }
+    } else {
+        // covered in main if branch => not a TT_FATAL
+        TT_ASSERT(normalized_dim1 != normalized_dim2, "Unsupported transpose dims");
+
+        using ttnn::prim::TransposeOpDim;
+        constexpr auto tod_default_value = TransposeOpDim::NW;
+        constexpr TransposeOpDim transpose_dims[4][4] = {
+            //     dim2=0              dim2=1              dim2=2              dim2=3
+            {tod_default_value, TransposeOpDim::CN, TransposeOpDim::NH, TransposeOpDim::NW},  // dim1=0
+            {TransposeOpDim::CN, tod_default_value, TransposeOpDim::HC, TransposeOpDim::CW},  // dim1=1
+            {TransposeOpDim::NH, TransposeOpDim::HC, tod_default_value, TransposeOpDim::WH},  // dim1=2
+            {TransposeOpDim::NW, TransposeOpDim::CW, TransposeOpDim::WH, tod_default_value},  // dim1=3
+        };
+
+        output = detail::transpose_(
+            input_typecasted, transpose_dims[normalized_dim1][normalized_dim2], memory_config_arg, pad_value);
+    }
+    output = initial_rank < 4u ? ttnn::squeeze_from_4D(output, initial_rank) : output;
+    return typecast ? ttnn::typecast(output, DataType::BFLOAT8_B) : output;
+}
+
+}  // namespace ttnn::operations::data_movement::transpose
+
+namespace ttnn {
+
+ttnn::Tensor transpose(
+    const ttnn::Tensor& input_tensor,
+    int64_t dim1,
+    int64_t dim2,
+    const std::optional<MemoryConfig>& memory_config,
+    float pad_value) {
+    return operations::data_movement::transpose::transpose_impl(input_tensor, dim1, dim2, memory_config, pad_value);
+}
+
+ttnn::Tensor transpose(const ttnn::Tensor& input_tensor, int64_t dim1, int64_t dim2, float pad_value) {
+    return transpose(input_tensor, dim1, dim2, std::nullopt, pad_value);
+}
+
+}  // namespace ttnn

@@ -1,0 +1,601 @@
+// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include "d2d_stream_service.hpp"
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <nanobind/nanobind.h>
+#include <nanobind/operators.h>
+#include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
+#include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
+#include <nanobind/stl/unique_ptr.h>
+
+#include <tt-metalium/buffer_types.hpp>
+#include <tt-metalium/core_coord.hpp>
+#include <tt-metalium/distributed_context.hpp>
+#include <tt-metalium/experimental/sockets/mesh_socket.hpp>
+#include <tt-metalium/mesh_coord.hpp>
+#include <tt-metalium/mesh_device.hpp>
+
+#include "ttnn/distributed/distributed_tensor.hpp"
+#include "ttnn/tensor/d2d_pipeline_descriptor.hpp"
+#include "ttnn/tensor/d2d_stream_service.hpp"
+#include "ttnn/tensor/tensor.hpp"
+
+namespace ttnn::d2d_stream_service {
+
+namespace {
+
+using tt::tt_metal::distributed::SocketMemoryConfig;
+using tt::tt_metal::distributed::multihost::Rank;
+using ttnn::D2DBoundaryDescriptor;
+using ttnn::D2DEndpointConfig;
+using ttnn::D2DPipelineDescriptor;
+using ttnn::D2DRankDescriptor;
+using ttnn::D2DReceiverCoordDescriptor;
+using ttnn::D2DReceiverDescriptor;
+using ttnn::D2DStageGateConfig;
+using ttnn::D2DStageGateDescriptor;
+using ttnn::D2DStreamConfig;
+using ttnn::D2DStreamService;
+using ttnn::D2DStreamServiceReceiver;
+using ttnn::D2DStreamServiceSender;
+using ttnn::PCIeCoreLocation;
+using MeshDevicePtr = std::shared_ptr<tt::tt_metal::distributed::MeshDevice>;
+
+// Assemble a D2DStreamConfig from individual kwargs. Like the H2DStreamService ctor, the
+// config struct is never exposed to Python directly — it holds a move-only `mapper`
+// (std::unique_ptr<TensorToMesh>) and a SocketMemoryConfig, so the factory entry points
+// take the constituent fields and build it inline. `mapper` is REQUIRED (the service
+// TT_FATALs on a null mapper); nanobind surrenders ownership into the unique_ptr and
+// invalidates the Python-side wrapper.
+D2DStreamConfig make_config(
+    const tt::tt_metal::TensorSpec& global_spec,
+    std::unique_ptr<ttnn::distributed::TensorToMesh> mapper,
+    tt::tt_metal::BufferType socket_buffer_type,
+    uint32_t fifo_size_bytes,
+    const tt::tt_metal::CoreRange& sender_worker_cores,
+    const tt::tt_metal::CoreRange& receiver_worker_cores,
+    uint32_t metadata_size_bytes,
+    bool share_fabric_links,
+    std::string fabric_link_group,
+    std::optional<D2DStageGateConfig> stage_gate = std::nullopt,
+    std::vector<ttnn::D2DStreamTensorConfig> extra_tensors = {},
+    bool relay = false) {
+    return D2DStreamConfig{
+        .global_spec = global_spec,
+        .mapper = std::move(mapper),
+        .extra_tensors = std::move(extra_tensors),
+        .socket_mem_config = SocketMemoryConfig{socket_buffer_type, fifo_size_bytes},
+        .sender_worker_cores = sender_worker_cores,
+        .receiver_worker_cores = receiver_worker_cores,
+        .metadata_size_bytes = metadata_size_bytes,
+        .share_fabric_links = share_fabric_links,
+        .fabric_link_group = std::move(fabric_link_group),
+        .stage_gate = stage_gate,
+        .relay = relay,
+    };
+}
+
+// `extra_tensors` arrives as a list of (TensorSpec, CppTensorToMesh). Each mapper is
+// rebuilt from its config so the Python-side mappers stay valid and reusable.
+std::vector<ttnn::D2DStreamTensorConfig> make_extra_tensors(
+    const tt::tt_metal::distributed::MeshDevice& mesh, const nb::list& extra_tensors) {
+    std::vector<ttnn::D2DStreamTensorConfig> out;
+    out.reserve(extra_tensors.size());
+    for (nb::handle item : extra_tensors) {
+        auto entry = nb::cast<nb::tuple>(item);
+        TT_FATAL(entry.size() == 2, "extra_tensors entries must be (global_spec, mapper) pairs");
+        const auto& mapper = nb::cast<const ttnn::distributed::TensorToMesh&>(entry[1]);
+        out.push_back(ttnn::D2DStreamTensorConfig{
+            .global_spec = nb::cast<tt::tt_metal::TensorSpec>(entry[0]),
+            .mapper = std::make_unique<ttnn::distributed::TensorToMesh>(
+                ttnn::distributed::TensorToMesh::create(mesh, mapper.config())),
+        });
+    }
+    return out;
+}
+
+}  // namespace
+
+void py_module_types(nb::module_& mod) {
+    nb::enum_<ttnn::d2d_stream::GateMode>(mod, "D2DStageGateMode", R"doc(
+        What a transfer does at its stage gate. Written into the transfer's metadata.
+    )doc")
+        .value("KeepOpen", ttnn::d2d_stream::GateMode::KeepOpen)
+        .value("CloseOnTransit", ttnn::d2d_stream::GateMode::CloseOnTransit);
+    mod.attr("D2D_STAGE_GATE_UNGATED_SLOT") = ttnn::d2d_stream::kUngatedSlot;
+
+    nb::class_<D2DStageGateConfig>(mod, "D2DStageGateConfig", R"doc(
+        Receiver stage gate: num_gates (enabled when > 0) and the metadata byte offsets of
+        the slot id and gate mode.
+    )doc")
+        .def(
+            nb::init<uint32_t, uint32_t, uint32_t>(),
+            nb::arg("num_gates"),
+            nb::arg("slot_id_offset_bytes"),
+            nb::arg("gate_mode_offset_bytes"))
+        .def_rw("num_gates", &D2DStageGateConfig::num_gates)
+        .def_rw("slot_id_offset_bytes", &D2DStageGateConfig::slot_id_offset_bytes)
+        .def_rw("gate_mode_offset_bytes", &D2DStageGateConfig::gate_mode_offset_bytes);
+
+    nb::class_<D2DStageGateDescriptor>(mod, "D2DStageGateDescriptor", R"doc(
+        Location of one coord's stage gates. gate_addr(i) is the L1 address of gate i.
+    )doc")
+        .def_ro("fabric_node_id", &D2DStageGateDescriptor::fabric_node_id)
+        .def_ro("service_core_noc", &D2DStageGateDescriptor::service_core_noc)
+        .def_ro("gate_base_addr", &D2DStageGateDescriptor::gate_base_addr)
+        .def("gate_addr", &D2DStageGateDescriptor::gate_addr, nb::arg("gate"));
+
+    nb::class_<PCIeCoreLocation>(mod, "PCIeCoreLocation", R"doc(
+        A core, described so that another process on the same host can reach it over PCIe.
+    )doc")
+        .def_ro(
+            "pcie_device_id", &PCIeCoreLocation::pcie_device_id, "Physical PCIe device number (/dev/tenstorrent/N).")
+        .def_ro("core", &PCIeCoreLocation::core, "Mesh coord + logical core.")
+        .def_ro("virtual_core", &PCIeCoreLocation::virtual_core, "Virtual (translated) NoC coords.")
+        .def(nb::self == nb::self);
+
+    nb::class_<D2DReceiverCoordDescriptor>(mod, "D2DReceiverCoordDescriptor")
+        .def_ro("service_core", &D2DReceiverCoordDescriptor::service_core)
+        .def_ro("fabric_node_id", &D2DReceiverCoordDescriptor::fabric_node_id)
+        .def_ro("sender_fabric_node_id", &D2DReceiverCoordDescriptor::sender_fabric_node_id)
+        .def_ro("backing_tensor_addr", &D2DReceiverCoordDescriptor::backing_tensor_addr)
+        .def_ro("stage_gate_base_addr", &D2DReceiverCoordDescriptor::stage_gate_base_addr)
+        .def_ro("metadata_core", &D2DReceiverCoordDescriptor::metadata_core)
+        .def(nb::self == nb::self);
+
+    nb::class_<D2DReceiverDescriptor>(mod, "D2DReceiverDescriptor")
+        .def_ro("sender_rank", &D2DReceiverDescriptor::sender_rank)
+        .def_ro("metadata_size_bytes", &D2DReceiverDescriptor::metadata_size_bytes)
+        .def_ro("metadata_addr", &D2DReceiverDescriptor::metadata_addr)
+        .def_ro("stage_gate", &D2DReceiverDescriptor::stage_gate)
+        .def_ro("stage_gate_stride_bytes", &D2DReceiverDescriptor::stage_gate_stride_bytes)
+        .def_ro("coords", &D2DReceiverDescriptor::coords)
+        .def(nb::self == nb::self);
+
+    nb::class_<D2DBoundaryDescriptor>(mod, "D2DBoundaryDescriptor", R"doc(
+        Every receiver across one pipeline-stage boundary. They carry the same chunk, so a reader
+        ungates all of them together.
+    )doc")
+        .def_ro("receivers", &D2DBoundaryDescriptor::receivers)
+        .def(nb::self == nb::self);
+
+    nb::class_<D2DRankDescriptor>(mod, "D2DRankDescriptor")
+        .def_ro("rank", &D2DRankDescriptor::rank)
+        .def_ro("host_name", &D2DRankDescriptor::host_name)
+        .def_ro("boundaries", &D2DRankDescriptor::boundaries)
+        .def(nb::self == nb::self);
+
+    nb::class_<D2DPipelineDescriptor>(mod, "D2DPipelineDescriptor", R"doc(
+        Every D2DStreamService receiver of a pipeline, as written by
+        D2DStreamService.export_pipeline_descriptor.
+    )doc")
+        .def_ro("ranks", &D2DPipelineDescriptor::ranks)
+        .def(nb::self == nb::self)
+        .def_static(
+            "wait_and_read",
+            [](const std::string& path, uint32_t timeout_ms) {
+                nb::gil_scoped_release release;
+                return D2DPipelineDescriptor::wait_and_read(path, timeout_ms);
+            },
+            nb::arg("path"),
+            nb::arg("timeout_ms") = 10000u,
+            "Wait for a descriptor file to appear, then read it.");
+
+    mod.def(
+        "d2d_pipeline_descriptor_path",
+        &ttnn::d2d_pipeline_descriptor_path,
+        nb::arg("service_id"),
+        "Path export_pipeline_descriptor writes for `service_id`.");
+
+    nb::class_<ttnn::D2DPipelineDescriptorFile>(mod, "D2DPipelineDescriptorFile", R"doc(
+        An exported descriptor file. Removes the file when garbage-collected.
+    )doc")
+        .def_prop_ro("path", &ttnn::D2DPipelineDescriptorFile::path);
+
+    // ----- Sender handle (created only via D2DStreamService factories) -----
+    nb::class_<D2DStreamServiceSender>(mod, "D2DStreamServiceSender")
+        .def(
+            "get_backing_tensors",
+            &D2DStreamServiceSender::get_backing_tensors,
+            nb::rv_policy::reference_internal,
+            "Every backing tensor in segment order: the primary first, then each extra tensor.")
+        .def(
+            "get_backing_tensor",
+            &D2DStreamServiceSender::get_backing_tensor,
+            nb::rv_policy::reference_internal,
+            R"doc(
+                The outbound device tensor a producing op writes into; the sender service
+                forwards its contents over fabric once the op signals data_ready and the
+                fabric-link lease is granted. Same instance across calls.
+            )doc")
+        .def(
+            "get_per_shard_spec",
+            &D2DStreamServiceSender::get_per_shard_spec,
+            nb::rv_policy::reference_internal,
+            "The per-coord tt::tt_metal::TensorSpec of the backing tensor (mapper output).")
+        .def(
+            "get_worker_cores",
+            &D2DStreamServiceSender::get_worker_cores,
+            "Worker CoreRange the producing op runs on; sizes the data_ready ack count.")
+        .def(
+            "get_service_core",
+            &D2DStreamServiceSender::get_service_core,
+            nb::arg("coord"),
+            "Logical CoreCoord of the sender service core on this coord's device.")
+        .def(
+            "get_data_ready_counter_addr",
+            &D2DStreamServiceSender::get_data_ready_counter_addr,
+            nb::arg("coord"),
+            R"doc(
+                L1 address (on this coord's service core) of the data_ready counter the
+                producing op atomic-incs once per worker after writing the backing tensor;
+                the sender forwards when it reaches num_workers and the lease is granted.
+            )doc")
+        .def(
+            "get_consumed_sem_addr",
+            &D2DStreamServiceSender::get_consumed_sem_addr,
+            R"doc(
+                L1 address (on every worker core) of the consumed semaphore the sender
+                multicasts after a forward drains. A separate gate op waits on it before
+                the next iteration overwrites the backing tensor.
+            )doc")
+        .def(
+            "get_metadata_addr",
+            &D2DStreamServiceSender::get_metadata_addr,
+            nb::arg("coord"),
+            "L1 address of the metadata buffer on this coord's service core (metadata mode).")
+        .def(
+            "get_output_counters",
+            &D2DStreamServiceSender::get_output_counters,
+            nb::arg("coord"),
+            R"doc(
+                This coord's output counters: produced is the data_ready counter (an inc from every worker per
+                transfer), pushed is consumed_sem on the first worker core (1 per drained transfer), forwarded is
+                the bytes_acked word in the socket config (1 per transfer the receiver consumed). In relay mode
+                the exit relay credits bytes_acked, and an exit chip's forwarded is its slot's cable_acked word.
+            )doc")
+        .def(
+            "wait_for_fabric_links",
+            &D2DStreamServiceSender::wait_for_fabric_links,
+            R"doc(
+                Block until the sender service has released its fabric link(s) (its granted
+                forward is complete). Pair with release_fabric_links to arbitrate the link
+                against model-graph fabric ops on the same device.
+            )doc")
+        .def(
+            "release_fabric_links",
+            &D2DStreamServiceSender::release_fabric_links,
+            R"doc(
+                Grant the sender service one transfer over its fabric link(s). The service
+                forwards when it also sees data_ready, then releases the link back.
+            )doc");
+
+    // ----- Receiver handle (created only via D2DStreamService factories) -----
+    nb::class_<D2DStreamServiceReceiver>(mod, "D2DStreamServiceReceiver")
+        .def(
+            "get_backing_tensors",
+            &D2DStreamServiceReceiver::get_backing_tensors,
+            nb::rv_policy::reference_internal,
+            "Every backing tensor in segment order: the primary first, then each extra tensor.")
+        .def(
+            "get_backing_tensor",
+            &D2DStreamServiceReceiver::get_backing_tensor,
+            nb::rv_policy::reference_internal,
+            R"doc(
+                The inbound device tensor the receiver service writes incoming fabric data
+                into; a consuming op reads it once data_ready is signaled. Same instance
+                across calls.
+            )doc")
+        .def(
+            "get_per_shard_spec",
+            &D2DStreamServiceReceiver::get_per_shard_spec,
+            nb::rv_policy::reference_internal,
+            "The per-coord tt::tt_metal::TensorSpec of the backing tensor (mapper output).")
+        .def(
+            "get_worker_cores",
+            &D2DStreamServiceReceiver::get_worker_cores,
+            "Worker CoreRange the consuming op runs on; sizes the consumed ack count.")
+        .def(
+            "get_service_core",
+            &D2DStreamServiceReceiver::get_service_core,
+            nb::arg("coord"),
+            "Logical CoreCoord of the receiver service core on this coord's device.")
+        .def(
+            "get_data_ready_sem_addr",
+            &D2DStreamServiceReceiver::get_data_ready_sem_addr,
+            R"doc(
+                L1 address (on every worker core) of the data_ready semaphore the receiver
+                multicasts after a transfer lands. The consuming op polls it, then reads
+                the backing tensor.
+            )doc")
+        .def(
+            "get_consumed_counter_addr",
+            &D2DStreamServiceReceiver::get_consumed_counter_addr,
+            nb::arg("coord"),
+            R"doc(
+                L1 address (on this coord's service core) of the consumed counter the
+                consuming op atomic-incs once per worker after reading the backing tensor;
+                the receiver may then accept the next transfer.
+            )doc")
+        .def(
+            "get_metadata_addr",
+            &D2DStreamServiceReceiver::get_metadata_addr,
+            "L1 address of the metadata buffer on every worker core (metadata mode).")
+        .def(
+            "get_input_counters",
+            &D2DStreamServiceReceiver::get_input_counters,
+            nb::arg("coord"),
+            R"doc(
+                This coord's input counters: arrived is the bytes_sent word in the socket config (1 per landed
+                transfer from each sender lane), consumed is the consumed counter (an inc from every worker per
+                transfer). In relay mode the entry relay feeds bytes_sent, and an entry chip's arrived is its
+                slot's relay arrived word.
+            )doc")
+        .def(
+            "wait_for_fabric_links",
+            &D2DStreamServiceReceiver::wait_for_fabric_links,
+            "Block until the receiver service has released its fabric link(s).")
+        .def(
+            "release_fabric_links",
+            &D2DStreamServiceReceiver::release_fabric_links,
+            "Grant the receiver service one transfer over its fabric link(s).")
+        .def(
+            "get_num_stage_gates",
+            &D2DStreamServiceReceiver::get_num_stage_gates,
+            "Number of stage gates (0 if disabled).")
+        .def(
+            "get_stage_gate_descriptor",
+            &D2DStreamServiceReceiver::get_stage_gate_descriptor,
+            nb::arg("coord"),
+            "Location of this coord's stage gates.")
+        .def(
+            "set_stage_gate",
+            &D2DStreamServiceReceiver::set_stage_gate,
+            nb::arg("coord"),
+            nb::arg("gate"),
+            nb::arg("open"),
+            "Host write of one gate. Not ordered with the CQ.")
+        .def(
+            "is_stage_gate_open",
+            &D2DStreamServiceReceiver::is_stage_gate_open,
+            nb::arg("coord"),
+            nb::arg("gate"),
+            "Host read of one gate.")
+        .def("describe", &D2DStreamServiceReceiver::describe, "This receiver's entry in a D2DPipelineDescriptor.");
+
+    // ----- Factory (static methods only; not instantiable) -----
+    nb::class_<D2DStreamService>(mod, "D2DStreamService")
+        .def_static(
+            "create_pair",
+            // Single-process: both meshes live in this process, so the socket is built
+            // without cross-process rendezvous. Returns (sender, receiver).
+            [](const MeshDevicePtr& sender_mesh,
+               const MeshDevicePtr& receiver_mesh,
+               const tt::tt_metal::TensorSpec& global_spec,
+               std::unique_ptr<ttnn::distributed::TensorToMesh> mapper,
+               uint32_t fifo_size_bytes,
+               const tt::tt_metal::CoreRange& sender_worker_cores,
+               const tt::tt_metal::CoreRange& receiver_worker_cores,
+               tt::tt_metal::BufferType socket_buffer_type,
+               uint32_t metadata_size_bytes,
+               bool share_fabric_links,
+               const std::string& fabric_link_group,
+               const std::optional<D2DStageGateConfig>& stage_gate,
+               const nb::list& extra_tensors,
+               bool relay) {
+                auto cfg = make_config(
+                    global_spec,
+                    std::move(mapper),
+                    socket_buffer_type,
+                    fifo_size_bytes,
+                    sender_worker_cores,
+                    receiver_worker_cores,
+                    metadata_size_bytes,
+                    share_fabric_links,
+                    fabric_link_group,
+                    stage_gate,
+                    make_extra_tensors(*sender_mesh, extra_tensors),
+                    relay);
+                return D2DStreamService::create_pair(sender_mesh, receiver_mesh, std::move(cfg));
+            },
+            nb::arg("sender_mesh"),
+            nb::arg("receiver_mesh"),
+            nb::arg("global_spec"),
+            nb::arg("mapper"),
+            nb::arg("fifo_size_bytes"),
+            nb::arg("sender_worker_cores"),
+            nb::arg("receiver_worker_cores"),
+            nb::arg("socket_buffer_type") = tt::tt_metal::BufferType::L1,
+            nb::arg("metadata_size_bytes") = 0u,
+            nb::arg("share_fabric_links") = true,
+            nb::arg("fabric_link_group") = "",
+            nb::arg("stage_gate") = nb::none(),
+            nb::arg("extra_tensors") = nb::list(),
+            nb::arg("relay") = false,
+            R"doc(
+                Build a sender+receiver pair in a SINGLE process (both meshes owned here).
+
+                `extra_tensors` is a list of (global_spec, mapper) pairs carried on the same
+                socket after the primary tensor, one DRAM-interleaved backing tensor each, any dtype/layout.
+                Both endpoints must pass the same list.
+
+                Returns:
+                    Tuple[D2DStreamServiceSender, D2DStreamServiceReceiver]
+            )doc")
+        .def_static(
+            "create_sender",
+            // Multi-process: must run on the sender rank. The peer (receiver) is created
+            // in the receiver-rank process via create_receiver; the per-endpoint
+            // MeshSocket ctor does the cross-process rendezvous over the current world.
+            [](const MeshDevicePtr& sender_mesh,
+               const tt::tt_metal::TensorSpec& global_spec,
+               std::unique_ptr<ttnn::distributed::TensorToMesh> mapper,
+               uint32_t fifo_size_bytes,
+               const tt::tt_metal::CoreRange& sender_worker_cores,
+               const tt::tt_metal::CoreRange& receiver_worker_cores,
+               int sender_rank,
+               int receiver_rank,
+               tt::tt_metal::BufferType socket_buffer_type,
+               uint32_t metadata_size_bytes,
+               bool share_fabric_links,
+               const std::string& fabric_link_group,
+               const nb::list& extra_tensors,
+               bool relay) {
+                auto cfg = make_config(
+                    global_spec,
+                    std::move(mapper),
+                    socket_buffer_type,
+                    fifo_size_bytes,
+                    sender_worker_cores,
+                    receiver_worker_cores,
+                    metadata_size_bytes,
+                    share_fabric_links,
+                    fabric_link_group,
+                    std::nullopt,
+                    make_extra_tensors(*sender_mesh, extra_tensors),
+                    relay);
+                // distributed_context left null -> the service uses get_current_world().
+                D2DEndpointConfig endpoints{
+                    .sender_rank = Rank{sender_rank},
+                    .receiver_rank = Rank{receiver_rank},
+                    .distributed_context = nullptr};
+                return D2DStreamService::create_sender(sender_mesh, std::move(cfg), endpoints);
+            },
+            nb::arg("sender_mesh"),
+            nb::arg("global_spec"),
+            nb::arg("mapper"),
+            nb::arg("fifo_size_bytes"),
+            nb::arg("sender_worker_cores"),
+            nb::arg("receiver_worker_cores"),
+            nb::arg("sender_rank"),
+            nb::arg("receiver_rank"),
+            nb::arg("socket_buffer_type") = tt::tt_metal::BufferType::L1,
+            nb::arg("metadata_size_bytes") = 0u,
+            nb::arg("share_fabric_links") = true,
+            nb::arg("fabric_link_group") = "",
+            nb::arg("extra_tensors") = nb::list(),
+            nb::arg("relay") = false,
+            R"doc(
+                Build the SENDER endpoint in this (sender-rank) process. Must be called on
+                the rank equal to `sender_rank`; the matching `create_receiver` runs in the
+                `receiver_rank` process. Uses the current distributed world for the
+                cross-process socket rendezvous.
+
+                `extra_tensors` is a list of (global_spec, mapper) pairs carried on the same
+                socket after the primary tensor, one DRAM-interleaved backing tensor each, any dtype/layout.
+                Both endpoints must pass the same list.
+
+                Returns:
+                    D2DStreamServiceSender
+            )doc")
+        .def_static(
+            "create_receiver",
+            // Multi-process: must run on the receiver rank.
+            [](const MeshDevicePtr& receiver_mesh,
+               const tt::tt_metal::TensorSpec& global_spec,
+               std::unique_ptr<ttnn::distributed::TensorToMesh> mapper,
+               uint32_t fifo_size_bytes,
+               const tt::tt_metal::CoreRange& sender_worker_cores,
+               const tt::tt_metal::CoreRange& receiver_worker_cores,
+               int sender_rank,
+               int receiver_rank,
+               tt::tt_metal::BufferType socket_buffer_type,
+               uint32_t metadata_size_bytes,
+               bool share_fabric_links,
+               const std::string& fabric_link_group,
+               const std::optional<D2DStageGateConfig>& stage_gate,
+               const nb::list& extra_tensors,
+               bool relay,
+               bool reserve_links_for_later_service) {
+                auto cfg = make_config(
+                    global_spec,
+                    std::move(mapper),
+                    socket_buffer_type,
+                    fifo_size_bytes,
+                    sender_worker_cores,
+                    receiver_worker_cores,
+                    metadata_size_bytes,
+                    share_fabric_links,
+                    fabric_link_group,
+                    stage_gate,
+                    make_extra_tensors(*receiver_mesh, extra_tensors),
+                    relay);
+                cfg.reserve_links_for_later_service = reserve_links_for_later_service;
+                D2DEndpointConfig endpoints{
+                    .sender_rank = Rank{sender_rank},
+                    .receiver_rank = Rank{receiver_rank},
+                    .distributed_context = nullptr};
+                return D2DStreamService::create_receiver(receiver_mesh, std::move(cfg), endpoints);
+            },
+            nb::arg("receiver_mesh"),
+            nb::arg("global_spec"),
+            nb::arg("mapper"),
+            nb::arg("fifo_size_bytes"),
+            nb::arg("sender_worker_cores"),
+            nb::arg("receiver_worker_cores"),
+            nb::arg("sender_rank"),
+            nb::arg("receiver_rank"),
+            nb::arg("socket_buffer_type") = tt::tt_metal::BufferType::L1,
+            nb::arg("metadata_size_bytes") = 0u,
+            nb::arg("share_fabric_links") = true,
+            nb::arg("fabric_link_group") = "",
+            nb::arg("stage_gate") = nb::none(),
+            nb::arg("extra_tensors") = nb::list(),
+            nb::arg("relay") = false,
+            nb::arg("reserve_links_for_later_service") = true,
+            R"doc(
+                Build the RECEIVER endpoint in this (receiver-rank) process. Must be called
+                on the rank equal to `receiver_rank`; the matching `create_sender` runs in
+                the `sender_rank` process. Uses the current distributed world for the
+                cross-process socket rendezvous.
+
+                `extra_tensors` is a list of (global_spec, mapper) pairs carried on the same
+                socket after the primary tensor, one DRAM-interleaved backing tensor each, any dtype/layout.
+                Both endpoints must pass the same list.
+
+                `reserve_links_for_later_service` (relay mode): whether this process builds another
+                D2D service on this mesh after the receiver, e.g. a middle pipeline stage's outbound
+                sender. Then the entry relays leave one fabric link per direction free for it. A terminal
+                stage passes False so its entry relays use every link.
+
+                Returns:
+                    D2DStreamServiceReceiver
+            )doc")
+        .def_static(
+            "export_pipeline_descriptor",
+            [](const std::string& service_id,
+               const std::vector<std::vector<const D2DStreamServiceReceiver*>>& boundaries,
+               int root) {
+                // Waits on the other ranks; let other Python threads run meanwhile.
+                nb::gil_scoped_release release;
+                return D2DStreamService::export_pipeline_descriptor(service_id, boundaries, Rank{root});
+            },
+            nb::arg("service_id"),
+            nb::arg("boundaries"),
+            nb::arg("root") = 0,
+            R"doc(
+                Collective over the current distributed world: every rank calls it with the receivers
+                it owns, grouped by boundary: one list per pipeline stage it receives into, holding
+                every receiver across that boundary (empty list if none). `root` gathers
+                them and writes d2d_pipeline_descriptor_path(service_id). Returns a
+                D2DPipelineDescriptorFile on `root`, None elsewhere. Keep it alive for as long as
+                readers need the file: it removes the file when garbage-collected.
+            )doc");
+}
+
+void py_module(nb::module_& /* mod */) {
+    // No free functions; the service is exposed entirely via py_module_types.
+}
+
+}  // namespace ttnn::d2d_stream_service

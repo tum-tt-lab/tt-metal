@@ -1,0 +1,143 @@
+// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include "muon_composite.hpp"
+
+#include "autograd/auto_context.hpp"
+#include "core/debug.hpp"
+#include "core/tt_tensor_utils.hpp"
+#include "ops/newton_schulz_op.hpp"
+#include "serialization/serializable.hpp"
+#include "ttnn/operations/data_movement/clone/clone.hpp"
+
+namespace ttml::optimizers {
+
+namespace {
+
+/**
+ * Check if a parameter is sharded on any mesh axis.
+ */
+bool param_is_sharded(const autograd::Tensor& tensor) {
+    const auto& placements = tensor.get_value(autograd::PreferredPrecision::HALF).tensor_topology().placements();
+    for (const auto& p : placements) {
+        if (std::holds_alternative<tt::tt_metal::distributed::MeshMapperConfig::Shard>(p)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+MuonComposite::MuonComposite(
+    ttml::serialization::NamedParameters parameters, const MuonConfig& config, std::vector<ParamGroup> param_groups) :
+    OptimizerBase(std::move(parameters)), m_ns_steps(config.ns_steps) {
+    require_bf16_parameters(m_parameters, "MuonComposite");
+    for (const auto& [name, tensor_ptr] : m_parameters) {
+        if (tensor_ptr->get_requires_grad()) {
+            // FSDP and TP shards parameters along a mesh axis; the Newton-Schulz update in Muon
+            // is not elementwise, so running it against a local shard would produce a
+            // different result than running it against the full weight.
+            // TODO: implement proper FSDP and TP support for Muon
+            if (param_is_sharded(*tensor_ptr)) {
+                throw std::runtime_error(
+                    "MuonComposite: parameter '" + name +
+                    "' appears to be sharded on a mesh axis. Muon's Newton-Schulz update is "
+                    "not elementwise and cannot be applied to a shard independently. ");
+            }
+            m_momentum_buffer.emplace(
+                name,
+                autograd::create_tensor(
+                    core::zeros_like(tensor_ptr->get_value(autograd::PreferredPrecision::HALF)),
+                    /* requires_grad */ false));
+        }
+    }
+    init_param_groups(param_group_defaults(config), std::move(param_groups));
+}
+
+void MuonComposite::zero_grad() {
+    for (auto& [name, tensor_ptr] : m_parameters) {
+        if (tensor_ptr->get_requires_grad() && tensor_ptr->is_grad_initialized()) {
+            tensor_ptr->set_grad(core::zeros_like(tensor_ptr->get_value()));
+        }
+    }
+}
+
+void MuonComposite::step() {
+    if (core::debug::Debug::enable_print_tensor_stats()) {
+        print_stats();
+    }
+
+    for (const auto& group : m_param_groups) {
+        const float lr = group.options.at("lr");
+        const float momentum = group.options.at("momentum");
+
+        for (const auto& name : group.params) {
+            const auto buffer_it = m_momentum_buffer.find(name);
+            if (buffer_it == m_momentum_buffer.end()) {
+                continue;
+            }
+            auto& buffer_ptr = buffer_it->second;
+            auto buffer = buffer_ptr->get_value(autograd::PreferredPrecision::HALF);
+            const auto& tensor_ptr = m_parameters.at(name);
+            if (!tensor_ptr->is_grad_initialized()) {
+                continue;
+            }
+
+            const auto gradients = tensor_ptr->get_grad();
+
+            // By value: the ops below relabel their outputs (see optimizers::restore_topology).
+            const auto topology = tensor_ptr->get_value(autograd::PreferredPrecision::HALF).tensor_topology();
+
+            if (m_steps > 0 && momentum != 0.0F) {
+                buffer = ttnn::multiply(buffer, momentum);
+                buffer = ttnn::add(buffer, gradients);
+            } else {
+                // A copy rather than the gradient itself: Tensor copies share their attributes, so restoring the
+                // buffer's label below would otherwise relabel the caller's gradient as well.
+                buffer = ttnn::clone(
+                    gradients,
+                    /* dtype */ std::nullopt,
+                    /* memory_config */ std::nullopt,
+                    /* compute_kernel_config */ std::nullopt);
+            }
+
+            buffer_ptr->set_value(buffer);
+
+            const auto update_direction = ops::newtonschulz5(buffer, m_ns_steps, 1e-7f);
+
+            tensor_ptr->set_value(ttnn::subtract(
+                tensor_ptr->get_value(autograd::PreferredPrecision::HALF), ttnn::multiply(update_direction, lr)));
+            restore_topology({tensor_ptr, buffer_ptr}, topology);
+        }
+    }
+
+    m_steps++;
+}
+
+serialization::StateDict MuonComposite::get_state_dict() const {
+    serialization::StateDict dict;
+    dict["steps"] = m_steps;
+    dict["ns_steps"] = m_ns_steps;
+    dict["momentum_buffer"] = m_momentum_buffer;
+    save_param_groups(dict);
+    return dict;
+}
+
+void MuonComposite::set_state_dict(const serialization::StateDict& dict) {
+    restore_param_groups(dict);
+    m_steps = serialization::get_value_type<size_t>(dict, "steps");
+    m_ns_steps = serialization::get_value_type<int>(dict, "ns_steps");
+    m_momentum_buffer = std::get<serialization::NamedParameters>(dict.at("momentum_buffer"));
+}
+
+size_t MuonComposite::get_steps() const {
+    return m_steps;
+}
+
+void MuonComposite::set_steps(size_t steps) {
+    this->m_steps = steps;
+}
+
+}  // namespace ttml::optimizers

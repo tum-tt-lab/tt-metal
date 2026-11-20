@@ -1,0 +1,252 @@
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
+
+# SPDX-License-Identifier: Apache-2.0
+
+import math
+
+import torch
+from loguru import logger
+
+
+def get_atol_rtol_pcc(golden, calculated, rtol=1e-05, atol=1e-04):
+    if golden.is_complex() and calculated.is_complex():
+        golden = torch.view_as_real(golden.clone())
+        calculated = torch.view_as_real(calculated.clone())
+
+    if not (golden.is_floating_point() or calculated.is_floating_point()):
+        golden = golden.to(torch.float)
+        calculated = calculated.to(torch.float)
+
+    # Calculate atol and rtol
+    abs_diff = torch.abs(golden - calculated)
+    cal_atol = torch.max(abs_diff).item()
+    cal_rtol = torch.max(abs_diff / torch.abs(calculated)).item()
+
+    # Calculate PCC
+    def get_pcc(golden, calculated):
+        # A nan or inf anywhere makes the float64 sum non-finite, so finite sums mean
+        # there is nothing to mask and the nan/inf handling below can be skipped.
+        all_finite = math.isfinite(golden.sum(dtype=torch.float64).item()) and math.isfinite(
+            calculated.sum(dtype=torch.float64).item()
+        )
+        if not all_finite:
+            golden_all_nan = torch.all(torch.isnan(golden))
+            calculated_all_nan = torch.all(torch.isnan(calculated))
+
+            # Both tensors are nan
+            if golden_all_nan and calculated_all_nan:
+                logger.warning("Both tensors are 'nan'")
+                return 1.0
+
+            # One tensor is all nan, the other is not
+            if golden_all_nan or calculated_all_nan:
+                logger.error("One tensor is all nan, the other is not.")
+                return 0.0
+
+            # if torch.any(torch.isinf(golden)) or torch.any(torch.isinf(calculated)):
+            #    raise RuntimeError(f"Tensor overflow to infinity: \n{golden}\n{calculated}")
+
+            # if torch.any(torch.isneginf(golden)) or torch.any(torch.isneginf(calculated)):
+            #    raise RuntimeError(f"Tensor overflow to negative infinity: \n{golden}\n{calculated}")
+
+            # For now, mask all infs and nans so that we check the rest... TODO
+            golden = torch.nan_to_num(golden, nan=0.0, posinf=0.0, neginf=0.0)
+            calculated = torch.nan_to_num(calculated, nan=0.0, posinf=0.0, neginf=0.0)
+
+        if torch.equal(golden, calculated):
+            return 1.0
+
+        if golden.dtype == torch.bfloat16:
+            golden = golden.type(torch.float32)
+            calculated = calculated.type(torch.float32)
+
+        # Single element or constant tensor: PCC is undefined. Fall back to allclose
+        # using the caller's tolerances so relaxed-tolerance callers aren't penalised.
+        if golden.numel() == 1:
+            return float(torch.allclose(golden, calculated, rtol=rtol, atol=atol))
+
+        if torch.max(golden) == torch.min(golden) or torch.max(calculated) == torch.min(calculated):
+            logger.warning("One or both tensors are constant (zero std dev). PCC undefined; falling back to allclose.")
+            return float(torch.allclose(golden, calculated, rtol=rtol, atol=atol))
+
+        # Two-pass Pearson in float64, as np.ma.corrcoef computes it: each sum is divided by n
+        # before the variance product, so float64 inputs overflow and underflow where they did
+        # with np.ma. copy=True keeps the in-place centering from writing into a float64 input.
+        g = golden.detach().flatten().to(torch.float64, copy=True)
+        c = calculated.detach().flatten().to(torch.float64, copy=True)
+        g -= g.mean()
+        c -= c.mean()
+        n = g.numel()
+        covariance = torch.dot(g, c) / n
+        cal_pcc = (covariance / torch.sqrt((torch.dot(g, g) / n) * (torch.dot(c, c) / n))).item()
+        del g, c
+
+        # A zero (underflowed) denominator gives nan or inf.
+        if not math.isfinite(cal_pcc):
+            logger.warning("PCC returned NaN/inf. Falling back to allclose.")
+            return float(torch.allclose(golden, calculated, rtol=rtol, atol=atol))
+
+        return cal_pcc
+
+    cal_pcc = get_pcc(golden, calculated)
+
+    return (
+        cal_atol,
+        cal_rtol,
+        cal_pcc,
+        f"Max ATOL Delta: {cal_atol}, Max RTOL Delta: {cal_rtol}, PCC: {cal_pcc}",
+    )
+
+
+def comp_equal(golden, calculated):
+    if golden.dtype != calculated.dtype:
+        calculated = calculated.type(golden.dtype)
+
+    while len(golden.shape) < len(calculated.shape):
+        golden = torch.unsqueeze(golden, 0)
+
+    equal = torch.equal(golden, calculated)
+    if equal:
+        return equal, "Equal check passed"
+
+    _, _, _, output_str = get_atol_rtol_pcc(golden, calculated)
+    return equal, output_str + ", Equal check failed"
+
+
+def comp_shape(golden, calculated):
+    if golden.dtype != calculated.dtype:
+        calculated = calculated.type(golden.dtype)
+    output_str = "compare shape"
+    equal = golden.shape == calculated.shape
+    return equal, output_str
+
+
+def comp_allclose(golden, calculated, rtol=1e-05, atol=1e-08):
+    if golden.dtype != calculated.dtype:
+        calculated = calculated.type(golden.dtype)
+
+    passing = torch.allclose(golden, calculated, rtol, atol, True)
+    # allclose broadcasts, so a size mismatch still takes the full path below.
+    if passing and golden.numel() == calculated.numel():
+        return passing, "Allclose check passed"
+
+    _, _, _, output_str = get_atol_rtol_pcc(golden, calculated)
+    if not passing:
+        output_str += ", Allclose check failed"
+    return passing, output_str
+
+
+def comp_pcc(golden, calculated, pcc=0.99):
+    if golden.dtype != calculated.dtype:
+        calculated = calculated.type(golden.dtype)
+    _, _, cal_pcc, output_str = get_atol_rtol_pcc(golden, calculated)
+    passing = cal_pcc >= pcc
+    if not passing:
+        output_str += ", PCC check failed"
+    return passing, output_str
+
+
+def comp_and_get_pcc(golden, calculated, pcc=0.99):
+    if golden.dtype != calculated.dtype:
+        calculated = calculated.type(golden.dtype)
+    _, _, cal_pcc, output_str = get_atol_rtol_pcc(golden, calculated)
+    passing = cal_pcc >= pcc
+    if not passing:
+        output_str += f", PCC check failed (target: {pcc})"
+    return passing, output_str, cal_pcc
+
+
+def comp_pcc_list(golden, calculated, pcc=0.99):
+    total_str = ""
+    min_pcc = 1
+
+    for i in range(len(golden)):
+        if golden[i].dtype != calculated[i].dtype:
+            calculated[i] = calculated[i].type(golden[i].dtype)
+        _, _, cal_pcc, output_str = get_atol_rtol_pcc(golden[i], calculated[i])
+
+        total_str = f"{total_str}Tensor {i}: {output_str} "
+
+        if cal_pcc < min_pcc:
+            min_pcc = cal_pcc
+
+    passing = min_pcc >= pcc
+    if not passing:
+        total_str += ", PCC check failed"
+    return passing, total_str
+
+
+def comp_equal_list(golden, calculated):
+    total_str = ""
+    min_pcc = 1
+
+    equal = []
+
+    for i in range(len(golden)):
+        if golden[i].dtype != calculated[i].dtype:
+            calculated[i] = calculated[i].type(golden[i].dtype)
+        _, _, _, output_str = get_atol_rtol_pcc(golden[i], calculated[i])
+
+        equal.append(torch.equal(golden[i], calculated[i]))
+
+        total_str = f"{total_str}Tensor {i}: {output_str}"
+
+    passing = all(equal)
+    if not passing:
+        total_str += ", PCC check failed"
+    return passing, total_str
+
+
+def comp_allclose_and_pcc(golden, calculated, rtol=1e-05, atol=1e-08, pcc=0.99):
+    if golden.dtype != calculated.dtype:
+        calculated = calculated.type(golden.dtype)
+
+    _, _, cal_pcc, output_str = get_atol_rtol_pcc(golden, calculated, rtol=rtol, atol=atol)
+    passing = True
+    allclose_passing = torch.allclose(golden, calculated, rtol, atol, True)
+    passing &= allclose_passing
+    if not allclose_passing:
+        output_str += ", Allclose check failed"
+    pcc_passing = cal_pcc >= pcc
+    passing &= pcc_passing
+    if not pcc_passing:
+        output_str += ", PCC check failed"
+    return passing, output_str
+
+
+def comp_using_plot(tname, input, golden, calculated):
+    import matplotlib.pyplot as plt
+
+    if golden.dtype == torch.bfloat16:
+        golden = golden.type(torch.float32)
+        calculated = calculated.type(torch.float32)
+        input = input.type(torch.float32)
+    shape = "x".join(list(map(str, list(input.size()))))
+    plot_name = "plot_" + tname + "_" + shape + ".png"
+    input = input.flatten()
+    golden = golden.flatten()
+    calculated = calculated.flatten()
+    plt.plot(input, golden, "+r", label="CPU (golden)")
+    plt.plot(input, calculated, "-b", label="On device (calculated)")
+    plt.legend(loc="upper center")
+    plt.savefig(plot_name)
+    plt.close()
+
+
+def comp_topk_similarity(golden, calculated):
+    golden_values, golden_indices = golden[0], golden[1]
+    calculated_values, calculated_gather_values = calculated[0], calculated[1]
+
+    values_passing, output_str = comp_pcc(golden_values, calculated_values)
+
+    cosine = torch.nn.CosineSimilarity(dim=-1)
+    ttnn_torch_cosine = torch.mean(cosine(golden_values, calculated_gather_values))
+
+    indices_passing = ttnn_torch_cosine > 0.99
+
+    output_str += f", Cosine similarity: {ttnn_torch_cosine.item()}"
+
+    if not indices_passing:
+        output_str += ", Cosine similarity check failed"
+
+    return values_passing and indices_passing, output_str

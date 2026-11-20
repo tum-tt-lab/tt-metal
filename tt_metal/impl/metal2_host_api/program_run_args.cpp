@@ -1,0 +1,2032 @@
+// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include <algorithm>
+#include <cstring>
+#include <limits>
+#include <set>
+#include <span>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <variant>
+
+#include <tt-logger/tt-logger.hpp>
+#include <tt-metalium/runtime_args_data.hpp>
+#include <tt-metalium/experimental/sram_arena/sram_arena.hpp>
+#include <tt-metalium/workload/run_args/program_run_args.hpp>
+#include <tt-metalium/program.hpp>
+#include <tt-metalium/workload/specification/tensor_spec_relaxations.hpp>
+#include <tt-metalium/experimental/per_core_allocation/buffer.hpp>
+#include <tt-metalium/experimental/prefetcher_pipe.hpp>
+#include <tt-metalium/mesh_buffer.hpp>
+#include <tt_stl/fmt.hpp>
+#include "impl/sram_arena/sram_arena_impl.hpp"
+#include "impl/kernels/kernel.hpp"
+#include "impl/metal2_host_api/sram_arena_support.hpp"
+#include "impl/metal2_host_api/tensor_binding_crtas.hpp"
+#include "impl/program/program_impl.hpp"
+
+namespace tt::tt_metal {
+
+// ============================================================================
+// Validation Helpers
+// ============================================================================
+
+// Type alias for readability
+using KernelRTASchema = detail::ProgramImpl::KernelRTASchema;
+
+// Helpers for vararg-value access (now living on AdvancedKernelRunArgs).
+const Table<NodeCoord, std::vector<uint32_t>>& kernel_runtime_varargs(const ProgramRunArgs::KernelRunArgs& kp) {
+    return kp.advanced_options.runtime_varargs;
+}
+
+const experimental::AdvancedKernelRunArgs::Varargs& kernel_common_runtime_varargs(
+    const ProgramRunArgs::KernelRunArgs& kp) {
+    return kp.advanced_options.common_runtime_varargs;
+}
+
+// Program::update_program_run_args drops the per-device values of the named args it lists (see
+// ProgramImpl::PerDeviceRunArgDrops). Tensor args, DFB overrides and varargs cannot have per-device values, so only
+// named args are recorded.
+static void RecordPerDeviceRunArgDrops(detail::ProgramImpl& program_impl, const ProgramRunArgs& params) {
+    if (!program_impl.tracks_per_device_run_args()) {
+        return;
+    }
+    using Key = detail::ProgramImpl::PerDeviceRunArgKey;
+    for (const auto& kernel_params : params.kernel_run_args) {
+        const std::string& kernel_name = kernel_params.kernel.get();
+        const KernelHandle kernel = program_impl.get_kernel_handle(kernel_name);
+        if (!program_impl.tracks_per_device_run_args_of(kernel)) {
+            continue;
+        }
+        const KernelRTASchema* schema = program_impl.get_kernel_rta_schema(kernel_name);
+        TT_FATAL(schema != nullptr, "Kernel '{}' has no RTA schema registered.", kernel_name);
+        for (const auto& [name, per_node] : kernel_params.runtime_arg_values) {
+            const auto it = schema->runtime_arg_name_to_slot.find(name);
+            if (it == schema->runtime_arg_name_to_slot.end()) {
+                continue;  // the update itself fails on it
+            }
+            for (const auto& [node, value] : per_node) {
+                program_impl.record_per_device_run_arg_drop(Key{kernel, node, static_cast<uint32_t>(it->second)});
+            }
+        }
+        for (const auto& [name, per_node] : kernel_params.runtime_array_arg_values) {
+            const auto it = schema->runtime_array_arg_slots.find(name);
+            if (it == schema->runtime_array_arg_slots.end()) {
+                continue;
+            }
+            for (const auto& [node, value] : per_node) {
+                program_impl.record_per_device_run_arg_drop(
+                    Key{kernel, node, static_cast<uint32_t>(it->second.first_slot)});
+            }
+        }
+        for (const auto& [name, value] : kernel_params.common_runtime_arg_values) {
+            const auto it = schema->common_runtime_arg_name_to_slot.find(name);
+            if (it != schema->common_runtime_arg_name_to_slot.end()) {
+                program_impl.record_per_device_run_arg_drop(
+                    Key{kernel, std::nullopt, static_cast<uint32_t>(it->second)});
+            }
+        }
+        for (const auto& [name, value] : kernel_params.common_runtime_array_arg_values) {
+            const auto it = schema->common_runtime_array_arg_slots.find(name);
+            if (it != schema->common_runtime_array_arg_slots.end()) {
+                program_impl.record_per_device_run_arg_drop(
+                    Key{kernel, std::nullopt, static_cast<uint32_t>(it->second.first_slot)});
+            }
+        }
+    }
+}
+
+// Validation of the array args a KernelRunArgs supplies, shared by the full and partial-update paths:
+// each supplied array must be declared, set only on nodes the kernel runs on, and have exactly its
+// declared length. (The full path also requires every declared array; see ValidateProgramRunArgs.)
+void ValidateSuppliedArrayArgValues(
+    const ProgramRunArgs::KernelRunArgs& kernel_params,
+    const KernelRTASchema& schema,
+    const std::set<CoreCoord>& kernel_nodes) {
+    const auto& kernel_name = kernel_params.kernel;
+    for (const auto& [name, per_node] : kernel_params.runtime_array_arg_values) {
+        const auto slots = schema.runtime_array_arg_slots.find(name);
+        TT_FATAL(
+            slots != schema.runtime_array_arg_slots.end(),
+            "Kernel '{}' sets RTA array '{}' which is not declared in the schema.",
+            kernel_name,
+            name);
+        for (const auto& [node, value] : per_node) {
+            TT_FATAL(
+                kernel_nodes.contains(node),
+                "Kernel '{}' is setting runtime_array_arg_values for node {}, but the kernel does not run on that "
+                "node.",
+                kernel_name,
+                node.str());
+            TT_FATAL(
+                value.size() == slots->second.size,
+                "Kernel '{}' node {} RTA array '{}' expects {} elements, but {} were provided",
+                kernel_name,
+                node.str(),
+                name,
+                slots->second.size,
+                value.size());
+        }
+    }
+    for (const auto& [name, value] : kernel_params.common_runtime_array_arg_values) {
+        const auto slots = schema.common_runtime_array_arg_slots.find(name);
+        TT_FATAL(
+            slots != schema.common_runtime_array_arg_slots.end(),
+            "Kernel '{}' sets CRTA array '{}' which is not declared in the schema.",
+            kernel_name,
+            name);
+        TT_FATAL(
+            value.size() == slots->second.size,
+            "Kernel '{}' CRTA array '{}' expects {} elements, but {} were provided",
+            kernel_name,
+            name,
+            slots->second.size,
+            value.size());
+    }
+}
+
+// Serialization-time length check for an array arg value. It runs even under ValidationMode::SKIP: it costs
+// one comparison, and a wrong-length value would otherwise overrun into the neighbouring args
+// (RuntimeArgsData's own bounds check is debug-only).
+void CheckArrayArgValueLength(
+    const KernelRTASchema::ArraySlots& slots,
+    const ArrayArgValue& value,
+    std::string_view kernel_name,
+    std::string_view array_name) {
+    TT_FATAL(
+        value.size() == slots.size,
+        "Kernel '{}' array '{}' expects {} elements, but {} were provided",
+        kernel_name,
+        array_name,
+        slots.size,
+        value.size());
+}
+
+// Write an array arg's value to its slots in a dispatch buffer. Checks the length first, even under
+// ValidationMode::SKIP (see CheckArrayArgValueLength).
+void WriteArrayArgValue(
+    uint32_t* buffer,
+    const KernelRTASchema::ArraySlots& slots,
+    const ArrayArgValue& value,
+    std::string_view kernel_name,
+    std::string_view array_name) {
+    CheckArrayArgValueLength(slots, value, kernel_name, array_name);
+    for (size_t i = 0; i < slots.size; ++i) {
+        buffer[slots.first_slot + i] = value[i].to_uint32();
+    }
+}
+
+// The sharded distribution geometry a spec resolves to, or nullopt when it is interleaved. Mirrors
+// shard_distribution_of in tensor_spec_relaxations.cpp, which is file-private there. Distinct name
+// because these two translation units share a unity build.
+static std::optional<BufferDistributionSpec> resolve_shard_distribution(const TensorSpec& spec) {
+    if (!spec.memory_config().is_sharded()) {
+        return std::nullopt;
+    }
+    return spec.compute_buffer_sharding_args().buffer_distribution_spec();
+}
+
+// The tensor_layout part of report_tensor_arg_mismatch, shared by both relaxed modes. Checked in two
+// parts, because the alignment is the one component of tensor_layout that
+// relax_tensor_layout_alignment frees. mode_name names the active relaxation, for the messages.
+static void report_tensor_layout_mismatch(
+    const TensorParamName& param_name,
+    const TensorLayout& runtime_layout,
+    const TensorLayout& expected_layout,
+    const TensorSpecRelaxations& relaxation,
+    std::string_view mode_name) {
+    TT_FATAL(
+        runtime_layout.get_data_type() == expected_layout.get_data_type() &&
+            runtime_layout.get_page_config() == expected_layout.get_page_config() &&
+            runtime_layout.get_memory_config() == expected_layout.get_memory_config(),
+        "TensorArgument for binding '{}' supplied a MeshTensor whose tensor_layout does not match the "
+        "binding's declared layout. {} loosens the match only along the shape; dtype, page_config, and "
+        "memory_config must still match exactly.",
+        param_name,
+        mode_name);
+    if (!relaxation.relax_tensor_layout_alignment) {
+        TT_FATAL(
+            runtime_layout.get_alignment() == expected_layout.get_alignment(),
+            "TensorArgument for binding '{}' supplied a MeshTensor whose TensorLayout has {} where the binding "
+            "declares {}. {} lets the shape vary, but the tensor must still be padded to the declared alignment. "
+            "To accept other alignments, also set relax_tensor_layout_alignment.",
+            param_name,
+            runtime_layout.get_alignment(),
+            expected_layout.get_alignment(),
+            mode_name);
+    }
+}
+
+// Emit a precise diagnostic for a tensor argument that failed tensorspecs_match_with_relaxation, then
+// throw. Called only on the rejection path: the branches mirror the match to produce a specific
+// message, and the trailing TT_THROW guarantees rejection even if a branch ever drifts from the match.
+static void report_tensor_arg_mismatch(
+    const TensorParamName& param_name,
+    const TensorSpec& runtime_spec,
+    const TensorSpec& expected_spec,
+    const TensorSpecRelaxations& relaxation) {
+    if (relaxation.dynamic_tensor_shape) {
+        report_tensor_layout_mismatch(
+            param_name,
+            runtime_spec.tensor_layout(),
+            expected_spec.tensor_layout(),
+            relaxation,
+            "dynamic_tensor_shape");
+        // The rank is the one shape term dynamic_tensor_shape still pins, and relax_logical_rank
+        // frees it.
+        if (!relaxation.relax_logical_rank) {
+            TT_FATAL(
+                runtime_spec.logical_shape().rank() == expected_spec.logical_shape().rank(),
+                "TensorArgument for binding '{}' supplied a MeshTensor whose logical_shape rank ({}) differs from the "
+                "declared rank ({}). dynamic_tensor_shape lets the per-dim shape values vary, but the rank must "
+                "remain constant. To accept other ranks, also set relax_logical_rank.",
+                param_name,
+                runtime_spec.logical_shape().rank(),
+                expected_spec.logical_shape().rank());
+        }
+        if (relaxation.match_page_size) {
+            TT_FATAL(
+                runtime_spec.compute_page_size_bytes() == expected_spec.compute_page_size_bytes(),
+                "TensorArgument for binding '{}' supplied a MeshTensor whose page size ({} bytes) differs from the "
+                "binding's declared page size ({} bytes). match_page_size declares that the page size is constant "
+                "even though the shape varies, so it is pinned rather than re-emitted per dispatch -- which is what "
+                "lets the TensorAccessor keep it as a compile-time constant. Drop match_page_size if the width really "
+                "does vary; on an interleaved row-major tensor the page size is last_dim_width * element_size, so it "
+                "varies with the shape unless the last dimension is held fixed.",
+                param_name,
+                runtime_spec.compute_page_size_bytes(),
+                expected_spec.compute_page_size_bytes());
+        }
+        // The distribution geometry stays load-bearing even though the shape values are free, so it
+        // is the remaining way this mode can reject. Worth its own message: with the layout and rank
+        // both matching, the generic backstop below would leave a user staring at a spec that looks
+        // like it should have been accepted.
+        const std::optional<BufferDistributionSpec> runtime_dist = resolve_shard_distribution(runtime_spec);
+        const std::optional<BufferDistributionSpec> expected_dist = resolve_shard_distribution(expected_spec);
+        if (runtime_dist.has_value() && expected_dist.has_value()) {
+            TT_FATAL(
+                runtime_dist->shard_shape_in_pages() == expected_dist->shard_shape_in_pages() &&
+                    runtime_dist->cores() == expected_dist->cores(),
+                "TensorArgument for binding '{}' supplied a MeshTensor whose sharded distribution geometry does not "
+                "match the binding's declared geometry: shard shape in pages {} vs {}, over {} banks vs {}. "
+                "dynamic_tensor_shape frees the shape VALUES, but the shard shape and bank list are baked when the "
+                "ProgramSpec is built and are not re-emitted per dispatch. Note that sharing a shard spec does NOT "
+                "guarantee sharing geometry: the tensor and shard shapes are jointly squeezed to minimize rank, and "
+                "the squeeze depends on the shape values.",
+                param_name,
+                runtime_dist->shard_shape_in_pages(),
+                expected_dist->shard_shape_in_pages(),
+                runtime_dist->cores().size(),
+                expected_dist->cores().size());
+        }
+    } else if (relaxation.match_padded_shape_only) {
+        report_tensor_layout_mismatch(
+            param_name,
+            runtime_spec.tensor_layout(),
+            expected_spec.tensor_layout(),
+            relaxation,
+            "match_padded_shape_only");
+        TT_FATAL(
+            runtime_spec.padded_shape() == expected_spec.padded_shape(),
+            "TensorArgument for binding '{}' supplied a MeshTensor whose padded_shape does not match the binding's "
+            "declared padded_shape. match_padded_shape_only requires padded_shape to be preserved across binds; "
+            "use dynamic_tensor_shape if you need padded_shape to vary as well.",
+            param_name);
+    } else {
+        TT_FATAL(
+            runtime_spec == expected_spec,
+            "TensorArgument for binding '{}' supplied a MeshTensor whose TensorSpec does not match the binding's "
+            "declared spec. The binding declaration in ProgramSpec is the single source of truth for layout; "
+            "the supplied tensor must conform to it.",
+            param_name);
+    }
+    TT_THROW(
+        "TensorArgument for binding '{}' supplied a MeshTensor whose TensorSpec does not match the declared "
+        "spec under the active relaxation.",
+        param_name);
+}
+
+// Internal validation function - validates a TensorArgument list against the Program's TensorParameters.
+// Shared by the full path (Program::set_program_run_args, Program::update_tensor_args; require_all=true) and the
+// arbitrary partial-update path (Program::update_program_run_args; require_all=false).
+//   - No duplicate tensor_parameter_name entries
+//   - Every entry references a TensorParameter declared in the ProgramSpec
+//   - The supplied MeshTensor's TensorSpec matches the binding's expected TensorSpec, with the
+//     match relaxed according to the TensorParameter's loosening flags, ordered here roughly from
+//     strictest to loosest. dynamic_tensor_shape takes PRECEDENCE over match_padded_shape_only when
+//     both are set -- precedence, not containment: the two are not strictly ordered, since padded
+//     shape matching tolerates the logical-rank changes padding absorbs while dynamic_tensor_shape
+//     pins the rank. The worked pair is in CPU_DynamicDoesNotContainPaddedShapeOnly
+//     (metal2_host_api/unit_tests/tensor_spec_relaxations/tensor_spec_relaxations.cpp).
+//       - Neither flag set (default): full TensorSpec equality.
+//       - match_padded_shape_only=true (only): tensor_layout() must match exactly, and
+//         padded_shape() must match exactly. logical_shape() may differ.
+//       - dynamic_tensor_shape=true: tensor_layout() must match exactly, and the logical_shape
+//         rank must match. Both logical_shape and padded_shape per-dim values may differ.
+//       - dynamic_tensor_shape=true with relax_logical_rank=true: tensor_layout() alone must
+//         match. The rank is freed along with the per-dim values.
+//       - match_page_size=true (with dynamic_tensor_shape): as above, plus the page size must
+//         match. A TIGHTENING rather than a relaxation -- it declares that the width is constant
+//         even though the shape varies, so the accessor can keep the page size compile-time.
+//       - relax_tensor_layout_alignment=true (with either flag): tensor_layout() need not match on
+//         its alignment. Under match_padded_shape_only the padded shape is still pinned, so only
+//         the logical shape and alignment that produce it may differ. Under dynamic_tensor_shape a
+//         tensor padded differently is accepted; there it composes with the two flags above.
+//     relax_logical_rank is inert unless dynamic_tensor_shape is also set, and
+//     relax_tensor_layout_alignment unless either flag is. The load-bearing field set for every
+//     combination is derived in one place, by pertinent_fields() (tensor_spec_relaxations.cpp),
+//     which both this validation and the relaxation-aware hash use.
+//     See the field doc comments in tensor_spec_relaxations.hpp for the full contracts.
+//   - When require_all is true: every declared TensorParameter must be set.
+//   - When require_all is false (partial update): any TensorParameter may be omitted; its
+//     previously-bound MeshTensor is retained. Supplied entries are still validated as above.
+void ValidateTensorArgs(
+    const Program& program,
+    const Table<TensorParamName, ProgramRunArgs::TensorArgument>& tensor_args,
+    bool require_all = true) {
+    const detail::ProgramImpl& program_impl = program.impl();
+
+    std::unordered_set<std::string> tensor_parameters_with_params;
+    for (const auto& [param_name, tensor_arg] : tensor_args) {
+        tensor_parameters_with_params.insert(param_name.get());
+        const TensorSpec* expected_spec = program_impl.get_tensor_parameter_layout(param_name.get());
+        TT_FATAL(expected_spec != nullptr, "TensorArgument references unknown TensorParameter '{}'.", param_name);
+        const TensorSpec& runtime_spec = mesh_tensor_of(tensor_arg).tensor_spec();
+        const TensorSpecRelaxations relaxation = program_impl.get_tensor_parameter_relaxations(param_name.get());
+        // Authoritative accept/reject via the same predicate the program-cache hash keys on, so
+        // run-time validation and cache-equivalence cannot disagree. On rejection,
+        // report_tensor_arg_mismatch emits a specific diagnostic (and always throws).
+        if (!tensorspecs_match_with_relaxation(runtime_spec, *expected_spec, relaxation)) {
+            report_tensor_arg_mismatch(param_name, runtime_spec, *expected_spec, relaxation);
+        }
+    }
+    // Completeness is only enforced on the full path. On the partial-update path any TensorParameter
+    // may be omitted (its previously-bound MeshTensor is retained).
+    if (require_all) {
+        for (const std::string& declared : program_impl.get_registered_tensor_parameter_names()) {
+            TT_FATAL(
+                tensor_parameters_with_params.contains(declared),
+                "TensorParameter '{}' is declared in the Program but has no TensorArgument entry.",
+                declared);
+        }
+    }
+}
+
+void ValidateSRAMArenaArgs(
+    const Program& program,
+    const Table<experimental::SRAMArenaParamName, experimental::AdvancedProgramRunArgs::SRAMArenaArgument>& args,
+    bool require_all) {
+    const auto& declarations = program.impl().get_sram_arena_parameters();
+    for (const auto& [name, argument] : args) {
+        const auto it = declarations.find(name.get());
+        TT_FATAL(it != declarations.end(), "SRAMArenaArgument references unknown SRAMArenaParameter '{}'.", name);
+        const auto& allocation = argument.get().impl();
+        TT_FATAL(
+            allocation.backing.device() == &it->second.device.get(),
+            "SRAMArenaArgument for '{}' belongs to a different MeshDevice.",
+            name);
+        TT_FATAL(
+            allocation.matches_properties(it->second.properties),
+            "SRAMArenaArgument for '{}' properties do not match the SRAMArenaParameter declaration.",
+            name);
+    }
+    if (require_all) {
+        for (const auto& [name, declaration] : declarations) {
+            TT_FATAL(
+                args.contains(experimental::SRAMArenaParamName{name}),
+                "SRAMArenaParameter '{}' is declared in the Program but has no SRAMArenaArgument entry.",
+                name);
+        }
+    }
+}
+
+void BindSRAMArenaArgs(
+    detail::ProgramImpl& program,
+    const Table<experimental::SRAMArenaParamName, experimental::AdvancedProgramRunArgs::SRAMArenaArgument>& args) {
+    if (args.empty()) {
+        return;
+    }
+    for (const auto& binding : program.get_dfb_storage_bindings()) {
+        const auto* source = std::get_if<SRAMArenaSource>(&binding.source);
+        if (source == nullptr) {
+            continue;
+        }
+        if (const auto argument = args.get(source->arena)) {
+            const auto base = argument->get().impl().address();
+            const uint64_t address = uint64_t{base} + source->offset;
+            TT_FATAL(
+                address <= std::numeric_limits<uint32_t>::max(),
+                "SRAMArena allocation address {} for DFB id {} (SRAMArenaParameter '{}') exceeds uint32_t max.",
+                address,
+                binding.dfb_id,
+                source->arena);
+            program.get_dataflow_buffer(binding.dfb_id)->set_borrowed_memory_base_addr(static_cast<uint32_t>(address));
+        }
+    }
+    for (const auto& name : program.get_registered_kernel_names()) {
+        auto kernel = program.get_kernel_by_spec_name(name);
+        for (auto& binding : kernel->scratchpad_binding_handles()) {
+            if (!binding.allocation_override) {
+                continue;
+            }
+            const auto& source = *binding.allocation_override;
+            if (const auto argument = args.get(source.arena)) {
+                const auto base = argument->get().impl().address();
+                SetScratchpadBindingAddress(*kernel, binding, base + source.offset);
+            }
+        }
+    }
+}
+
+// Validates a GlobalSemaphoreArgument list against the Program's GlobalSemaphoreParameters.
+void ValidateGlobalSemaphoreArgs(
+    const Program& program,
+    const Table<GlobalSemaphoreParamName, ProgramRunArgs::GlobalSemaphoreArgument>& global_semaphore_args,
+    bool require_all) {
+    const detail::ProgramImpl& program_impl = program.impl();
+    for (const auto& [param_name, arg] : global_semaphore_args) {
+        const distributed::MeshDevice* device = program_impl.get_global_semaphore_parameter_device(param_name.get());
+        TT_FATAL(
+            device != nullptr, "GlobalSemaphoreArgument references unknown GlobalSemaphoreParameter '{}'.", param_name);
+        TT_FATAL(
+            arg.get().device() == static_cast<const IDevice*>(device),
+            "GlobalSemaphoreArgument for '{}' supplies a GlobalSemaphore created on a different MeshDevice than the "
+            "one this Program was built for.",
+            param_name);
+    }
+    if (require_all) {
+        for (const std::string& declared : program_impl.get_registered_global_semaphore_parameter_names()) {
+            TT_FATAL(
+                global_semaphore_args.contains(GlobalSemaphoreParamName{declared}),
+                "GlobalSemaphoreParameter '{}' is declared in the Program but has no GlobalSemaphoreArgument entry.",
+                declared);
+        }
+    }
+}
+
+uint32_t GlobalSemaphoreAddressWord(const GlobalSemaphoreParamName& param_name, const GlobalSemaphore& semaphore) {
+    const DeviceAddr address = semaphore.address();
+    TT_FATAL(
+        address <= std::numeric_limits<uint32_t>::max(),
+        "GlobalSemaphore argument for '{}' has address {}, which exceeds uint32_t max",
+        param_name,
+        address);
+    return static_cast<uint32_t>(address);
+}
+
+// A PrefetcherPipe relay DFB is exactly the pipe ring (entry_size * num_entries == ring_size, entry
+// size == the pipe's dense entry size), so its size cannot be overridden per run.
+void RejectPrefetcherPipeRelayResize(
+    const detail::ProgramImpl& program_impl, const ProgramRunArgs::DFBRunOverrides& dfb_params) {
+    if (!dfb_params.entry_size.has_value() && !dfb_params.num_entries.has_value()) {
+        return;
+    }
+    const uint32_t dfb_id = program_impl.get_dfb_handle(dfb_params.dfb.get());
+    TT_FATAL(
+        !program_impl.get_prefetcher_pipe_id_for_relay(dfb_id).has_value(),
+        "dfb_run_overrides resizes DFB '{}', which relays a PrefetcherPipe. A relay DFB's geometry is the pipe's "
+        "(entry_size and ring_size are fixed by the PrefetcherPipeParameter) and cannot be overridden per run.",
+        dfb_params.dfb);
+}
+
+void ValidateDFBRunOverrides(const detail::ProgramImpl& program_impl, const ProgramRunArgs& params, bool require_all) {
+    // Unlike kernels, DFBs don't require DFBRunOverrides.
+    // (Borrowed-memory DFBs don't need a DFBRunOverrides entry either — they identify their backing
+    // MeshTensor by name via DataflowBufferSpec::borrowed_from, and the tensor flows through
+    // tensor_args.)
+
+    // Validate supplied DFB overrides for both full and partial argument updates:
+    // reject duplicates, zero sizes, and pipe-relay resizing, and check arena capacity.
+    // A partial update that resizes a tensor-backed DFB must also supply its backing
+    // tensor so attachment can check the new size against the buffer's capacity.
+    // Full argument sets already require all backing tensors.
+    std::unordered_set<DFBSpecName> dfbs_with_params;
+    for (const auto& dfb_params : params.dfb_run_overrides) {
+        const auto& dfb_spec_name = dfb_params.dfb;
+        // dfb_run_overrides is a Group (no structural key), so uniqueness must be validated here.
+        auto [it, inserted] = dfbs_with_params.insert(dfb_spec_name);
+        TT_FATAL(
+            inserted,
+            "Duplicate DFB '{}' in ProgramRunArgs.dfb_run_overrides. Each DFB must appear at most once.",
+            dfb_spec_name);
+        if (dfb_params.entry_size.has_value()) {
+            TT_FATAL(
+                dfb_params.entry_size.value() > 0,
+                "dfb_run_overrides entry for DFB '{}' has entry_size override = 0. entry_size must be set to a "
+                "non-zero value.",
+                dfb_spec_name);
+        }
+        if (dfb_params.num_entries.has_value()) {
+            TT_FATAL(
+                dfb_params.num_entries.value() > 0,
+                "dfb_run_overrides entry for DFB '{}' has num_entries override = 0. num_entries must be set to a "
+                "non-zero value.",
+                dfb_spec_name);
+        }
+        RejectPrefetcherPipeRelayResize(program_impl, dfb_params);
+        const bool resizes = dfb_params.entry_size.has_value() || dfb_params.num_entries.has_value();
+        if (!resizes) {
+            continue;
+        }
+        const auto& bindings = program_impl.get_dfb_storage_bindings();
+        const auto binding = std::ranges::find(
+            bindings,
+            program_impl.get_dfb_handle(dfb_spec_name.get()),
+            &detail::ProgramImpl::DFBStorageBinding::dfb_id);
+        if (binding == bindings.end()) {
+            continue;
+        }
+        if (const auto* source = std::get_if<SRAMArenaSource>(&binding->source)) {
+            const auto& properties = program_impl.get_sram_arena_parameters().at(source->arena.get()).properties;
+            const auto& config = program_impl.get_dataflow_buffer(binding->dfb_id)->config;
+            const uint64_t size_per_node = uint64_t{dfb_params.entry_size.value_or(config.entry_size)} *
+                                           dfb_params.num_entries.value_or(config.num_entries);
+            ValidateSRAMArenaCapacity(*source, properties, fmt::format("DFB '{}'", dfb_spec_name), size_per_node);
+        }
+        // A partial tensor-backed resize needs its tensor to repeat the per-bank size check.
+        if (const auto* tensor_name = std::get_if<TensorParamName>(&binding->source)) {
+            TT_FATAL(
+                require_all || params.tensor_args.contains(*tensor_name),
+                "dfb_run_overrides resizes borrowed-memory DFB '{}', but its backing TensorParameter '{}' was "
+                "not supplied in this Program::update_program_run_args. Resizing a borrowed DFB on the "
+                "partial-update fast path requires supplying its backing tensor, so the per-bank fit check can "
+                "re-validate against the new size (the full Program::set_program_run_args path enforces this by "
+                "requiring all tensors).",
+                dfb_spec_name,
+                *tensor_name);
+        }
+    }
+}
+
+// Validates a PrefetcherPipeArgument list against the Program's PrefetcherPipeParameters.
+// Shared by the full path (Program::set_program_run_args; require_all=true) and the partial-update path
+// (Program::update_program_run_args; require_all=false).
+//   - Every entry references a PrefetcherPipeParameter declared in the ProgramSpec.
+//   - The supplied pipe lives on the MeshDevice the Program was built for.
+//   - The supplied pipe's geometry (receiver nodes, ring size) matches the parameter's. The spec
+//     names no sender; when this Program runs the sender kernel, the pipe's sender must be one of
+//     that kernel's nodes, which the bind checks per slot.
+//   - The binding is sticky: a parameter already bound to a different pipe object is rejected,
+//     unless that pipe has the bound one's binding key (a re-carve at the same addresses), which
+//     replaces it. Re-supplying the same object is a no-op.
+//   - When require_all is true: every declared parameter must be supplied, unless it is already
+//     bound (the binding is program-lifetime state, so a later full Program::set_program_run_args may omit it).
+// Pipe-object-dependent checks that need the slot (lane capacity, relay ring agreement) run at
+// bind time in ProgramImpl::bind_prefetcher_pipe_parameters.
+void ValidatePrefetcherPipeArgs(
+    const Program& program,
+    const Table<experimental::PrefetcherPipeParamName, experimental::AdvancedProgramRunArgs::PrefetcherPipeArgument>&
+        pipe_args,
+    bool require_all) {
+    const detail::ProgramImpl& program_impl = program.impl();
+
+    std::unordered_set<std::string> supplied;
+    for (const auto& [param_name, pipe_arg] : pipe_args) {
+        supplied.insert(param_name.get());
+        const auto* binding = program_impl.get_prefetcher_pipe_parameter(param_name.get());
+        TT_FATAL(
+            binding != nullptr,
+            "ProgramRunArgs supplies a PrefetcherPipe argument for '{}', but the Program declares no "
+            "PrefetcherPipeParameter of that name.",
+            param_name);
+        const experimental::PrefetcherPipe& pipe = pipe_arg.get();
+        TT_FATAL(
+            pipe.get_device() == binding->device,
+            "PrefetcherPipeArgument for '{}' supplies a pipe allocated on a different MeshDevice than the one this "
+            "Program was built for. A pipe's ring and config pages are L1 on its own mesh; create the pipe on the "
+            "Program's mesh.",
+            param_name);
+        TT_FATAL(
+            binding->accepts(pipe.impl()),
+            "PrefetcherPipeArgument for '{}' supplies a different PrefetcherPipe object than the one this Program "
+            "is bound to. A Program binds a parameter to one pipe, or to one that replaces it at the same addresses "
+            "with the same geometry; build a new Program to use another pipe.",
+            param_name);
+        TT_FATAL(
+            pipe.receiver_cores().num_cores() == binding->receivers.num_cores() &&
+                pipe.receiver_cores().intersection(binding->receivers).num_cores() == binding->receivers.num_cores(),
+            "PrefetcherPipeArgument for '{}' supplies a pipe whose receiver nodes {} differ from the declared "
+            "receivers {}.",
+            param_name,
+            pipe.receiver_cores().str(),
+            binding->receivers.str());
+        TT_FATAL(
+            pipe.ring_size() == binding->ring_size,
+            "PrefetcherPipeArgument for '{}' supplies a pipe with ring_size {} but the parameter declares ring_size "
+            "{}.",
+            param_name,
+            pipe.ring_size(),
+            binding->ring_size);
+    }
+    if (require_all) {
+        for (const std::string& declared : program_impl.get_registered_prefetcher_pipe_parameter_names()) {
+            if (supplied.contains(declared)) {
+                continue;
+            }
+            TT_FATAL(
+                program_impl.get_prefetcher_pipe_parameter(declared)->is_bound(),
+                "PrefetcherPipeParameter '{}' is declared in the Program but has no PrefetcherPipeArgument entry.",
+                declared);
+        }
+    }
+}
+
+// Bind every supplied PrefetcherPipe to its parameter's slots, as one all-or-nothing batch: the
+// program preflights every binding (slot geometry, credit lanes, relay ring agreement) before it
+// mutates anything, so a rejected Program::set_program_run_args leaves no parameter half-bound. Sticky: an
+// already-bound parameter re-supplied with the same object is a no-op (validation rejected a
+// different object).
+void BindPrefetcherPipeArgs(
+    detail::ProgramImpl& program_impl,
+    const Table<experimental::PrefetcherPipeParamName, experimental::AdvancedProgramRunArgs::PrefetcherPipeArgument>&
+        pipe_args) {
+    std::vector<detail::ProgramImpl::PrefetcherPipeParameterBind> binds;
+    binds.reserve(pipe_args.size());
+    for (const auto& [param_name, pipe_arg] : pipe_args) {
+        binds.push_back({.name = param_name.get(), .pipe = &pipe_arg.get().impl()});
+    }
+    program_impl.bind_prefetcher_pipe_parameters(binds);
+}
+
+// Internal validation function - validates ProgramRunArgs against the Program's schema.
+//
+// Named RTAs/CRTAs and vararg RTAs/CRTAs are validated separately:
+//   - Named args must have EVERY declared name set (and no extras). Named RTA values are
+//     required for every node the kernel runs on.
+//   - Vararg counts per-node must match the schema. A node with no vararg entry in the schema
+//     expects zero varargs (but may still have named RTAs, if the schema declares them).
+void ValidateProgramRunArgs(const Program& program, const ProgramRunArgs& params) {
+    const detail::ProgramImpl& program_impl = program.impl();
+
+    // Track which kernels we've seen parameters for
+    std::unordered_set<KernelSpecName> kernels_with_params;
+
+    // Validate kernel runtime parameters
+    for (const auto& kernel_params : params.kernel_run_args) {
+        const auto& kernel_name = kernel_params.kernel;
+        // kernel_run_args is a Group (no structural key), so uniqueness must be validated here.
+        auto [it, inserted] = kernels_with_params.insert(kernel_name);
+        TT_FATAL(
+            inserted,
+            "Duplicate kernel '{}' in ProgramRunArgs.kernel_run_args. Each kernel must appear exactly once.",
+            kernel_name);
+
+        // Check that the kernel exists
+        const KernelRTASchema* schema = program_impl.get_kernel_rta_schema(kernel_name.get());
+        TT_FATAL(
+            schema != nullptr,
+            "Kernel '{}' has no RTA schema registered. Was the Program created from a ProgramSpec?",
+            kernel_name);
+
+        // Nodes the kernel runs on — the required domain for named-RTA coverage.
+        const std::shared_ptr<Kernel> kernel = program_impl.get_kernel_by_spec_name(kernel_name.get());
+        const std::set<CoreCoord>& kernel_nodes = kernel->logical_cores();
+
+        // Validate vararg RTA counts per node
+        std::unordered_set<NodeCoord> nodes_with_vararg_params;
+        for (const auto& [node_coord, args] : kernel_runtime_varargs(kernel_params)) {
+            nodes_with_vararg_params.insert(node_coord);
+
+            TT_FATAL(
+                kernel_nodes.contains(node_coord),
+                "Kernel '{}' is setting runtime_varargs for node {}, but the kernel does not run on that node.",
+                kernel_name,
+                node_coord.str());
+
+            auto it_schema = schema->num_runtime_varargs_per_node.find(node_coord);
+            const size_t expected_varargs =
+                (it_schema != schema->num_runtime_varargs_per_node.end()) ? it_schema->second : 0;
+            TT_FATAL(
+                args.size() == expected_varargs,
+                "Kernel '{}' node {} expects {} vararg runtime args, but {} were provided",
+                kernel_name,
+                node_coord.str(),
+                expected_varargs,
+                args.size());
+        }
+        // Every node with a non-zero schema vararg entry must have values provided.
+        // Zero-count entries should already be filtered out during schema expansion
+        for (const auto& [node_coord, expected_count] : schema->num_runtime_varargs_per_node) {
+            if (expected_count == 0) {
+                continue;
+            }
+            TT_FATAL(
+                nodes_with_vararg_params.contains(node_coord),
+                "Kernel '{}' is missing vararg runtime args for node {} (expected {} args)",
+                kernel_name,
+                node_coord.str(),
+                expected_count);
+        }
+
+        // Validate vararg CRTA count
+        TT_FATAL(
+            kernel_common_runtime_varargs(kernel_params).size() == schema->num_common_runtime_varargs,
+            "Kernel '{}' expects {} vararg common runtime args, but {} were provided",
+            kernel_name,
+            schema->num_common_runtime_varargs,
+            kernel_common_runtime_varargs(kernel_params).size());
+
+        // Validate named RTAs: every declared name set per-node, no extras.
+        const auto& named_rta_names = schema->runtime_arg_names;
+        const std::unordered_set<std::string> named_rta_name_set(named_rta_names.begin(), named_rta_names.end());
+
+        std::unordered_map<NodeCoord, size_t> named_rta_count_per_node;
+        for (const auto& [name, per_node] : kernel_params.runtime_arg_values) {
+            for (const auto& [node, _value] : per_node) {
+                (void)_value;
+                TT_FATAL(
+                    kernel_nodes.contains(node),
+                    "Kernel '{}' is setting runtime_arg_values for node {}, but the kernel does not run on that node.",
+                    kernel_name,
+                    node.str());
+                named_rta_count_per_node[node]++;
+            }
+        }
+        for (const auto& [node, provided] : named_rta_count_per_node) {
+            TT_FATAL(
+                provided == named_rta_names.size(),
+                "Kernel '{}' node {} expects {} named RTAs, but {} were provided",
+                kernel_name,
+                node.str(),
+                named_rta_names.size(),
+                provided);
+        }
+        for (const auto& [name, per_node] : kernel_params.runtime_arg_values) {
+            for (const auto& [node, _value] : per_node) {
+                (void)_value;
+                TT_FATAL(
+                    named_rta_name_set.contains(name),
+                    "Kernel '{}' node {} sets named RTA '{}' which is not declared in the schema.",
+                    kernel_name,
+                    node.str(),
+                    name);
+            }
+        }
+        if (!named_rta_names.empty()) {
+            for (const auto& node : kernel_nodes) {
+                TT_FATAL(
+                    named_rta_count_per_node.contains(node),
+                    "Kernel '{}' has named RTAs declared but no runtime_arg_values provided for node {}.",
+                    kernel_name,
+                    node.str());
+            }
+        }
+
+        // Validate named CRTAs: every declared name supplied, no extras.
+        // The TensorBinding address section lives in its own structurally-separate part of the
+        // kernel's CRTA buffer and is filled from TensorArgument at enqueue.
+        // (This is separate from the schema->common_runtime_arg_names.)
+        const auto& named_crta_names = schema->common_runtime_arg_names;
+        for (const auto& name : named_crta_names) {
+            TT_FATAL(
+                kernel_params.common_runtime_arg_values.get(name).has_value(),
+                "Kernel '{}' is missing named CRTA '{}'.",
+                kernel_name,
+                name);
+        }
+        TT_FATAL(
+            kernel_params.common_runtime_arg_values.size() == named_crta_names.size(),
+            "Kernel '{}' expects {} user-named CRTAs, but {} were provided",
+            kernel_name,
+            named_crta_names.size(),
+            kernel_params.common_runtime_arg_values.size());
+
+        // Validate array args: the supplied ones are well-formed (as on the update path), and every
+        // declared array is supplied, on every node the kernel runs on for an RTA array.
+        ValidateSuppliedArrayArgValues(kernel_params, *schema, kernel_nodes);
+        if (const auto& rta_array_slots = schema->runtime_array_arg_slots; !rta_array_slots.empty()) {
+            std::unordered_map<NodeCoord, size_t> rta_array_count_per_node;
+            for (const auto& [name, per_node] : kernel_params.runtime_array_arg_values) {
+                for (const auto& [node, _value] : per_node) {
+                    (void)_value;
+                    rta_array_count_per_node[node]++;
+                }
+            }
+            for (const auto& node : kernel_nodes) {
+                const auto count = rta_array_count_per_node.find(node);
+                const size_t provided = count == rta_array_count_per_node.end() ? 0 : count->second;
+                TT_FATAL(
+                    provided == rta_array_slots.size(),
+                    "Kernel '{}' node {} expects {} RTA arrays, but {} were provided",
+                    kernel_name,
+                    node.str(),
+                    rta_array_slots.size(),
+                    provided);
+            }
+        }
+        for (const auto& [name, _slots] : schema->common_runtime_array_arg_slots) {
+            (void)_slots;
+            TT_FATAL(
+                kernel_params.common_runtime_array_arg_values.contains(name),
+                "Kernel '{}' is missing CRTA array '{}'.",
+                kernel_name,
+                name);
+        }
+    }
+
+    // Validate that all registered kernels with a non-empty RTA/CRTA schema have parameters.
+    // Kernels whose schema declares no named RTAs or CRTAs (scalar or array), no vararg RTAs, and no
+    // vararg CRTAs have no runtime arguments to supply per enqueue and do not need a kernel_run_args
+    // entry. This holds even if the kernel binds tensors: a TensorBinding's base address (and any
+    // dynamic accessor fields) is filled automatically by Program::set_program_run_args for every binding-bearing
+    // kernel — including a binding-only kernel omitted from kernel_run_args, via its second pass —
+    // so tensor bindings alone no longer force an (otherwise-empty) kernel_run_args entry.
+    auto registered_names = program_impl.get_registered_kernel_names();
+    for (const auto& name : registered_names) {
+        if (kernels_with_params.contains(KernelSpecName{name})) {
+            continue;
+        }
+        const KernelRTASchema* schema = program_impl.get_kernel_rta_schema(name);
+        if (schema == nullptr) {
+            continue;
+        }
+        const bool has_anything_to_supply =
+            !schema->runtime_arg_names.empty() || !schema->common_runtime_arg_names.empty() ||
+            !schema->runtime_array_arg_slots.empty() || !schema->common_runtime_array_arg_slots.empty() ||
+            !schema->num_runtime_varargs_per_node.empty() || schema->num_common_runtime_varargs > 0;
+        TT_FATAL(
+            !has_anything_to_supply,
+            "Kernel '{}' is registered in the Program with a non-empty RTA/CRTA schema but has no "
+            "runtime parameters specified in ProgramRunArgs.",
+            name);
+    }
+
+    ValidateDFBRunOverrides(program_impl, params, /*require_all=*/true);
+
+    // Validate tensor runtime parameters (delegated to shared helper).
+    ValidateTensorArgs(program, params.tensor_args);
+
+    ValidateGlobalSemaphoreArgs(program, params.global_semaphore_args, /*require_all=*/true);
+
+    ValidateSRAMArenaArgs(program, params.advanced_options.sram_arena_args, /*require_all=*/true);
+
+    // Validate PrefetcherPipe arguments (delegated to shared helper; full path requires all).
+    ValidatePrefetcherPipeArgs(program, params.advanced_options.prefetcher_pipe_args, /*require_all=*/true);
+}
+
+const MeshTensor* FindBoundTensor(
+    const TensorBindingHandle& handle,
+    const std::unordered_map<std::string, const MeshTensor*>& tensor_by_param,
+    bool required) {
+    auto it = tensor_by_param.find(handle.tensor_parameter_name);
+    if (it == tensor_by_param.end()) {
+        TT_FATAL(
+            !required,
+            "Internal error: tensor binding '{}' has no resolved MeshTensor (validation should have caught this).",
+            handle.tensor_parameter_name);
+        return nullptr;
+    }
+    return it->second;
+}
+
+// Write each per-node TensorBinding's base address into the RTA buffer of every node `kernel` runs on,
+// at the handle's addr_rta_offset. Bindings whose tensor is absent from tensor_by_param are left
+// untouched unless require_all is set (partial updates omit them).
+// Pre-condition: every node of the kernel has its RTA buffer allocated (it holds the per-node section).
+//
+// NOTE: As with the CRTA path, the address comes from the MeshTensor's reference buffer, which assumes
+// every device in the mesh places the tensor at the same per-node addresses.
+void PatchPerNodeBindingRtas(
+    Kernel& kernel,
+    const std::unordered_map<std::string, const MeshTensor*>& tensor_by_param,
+    std::string_view kernel_name,
+    bool require_all) {
+    for (const auto& handle : kernel.tensor_binding_handles()) {
+        if (!handle.is_per_node) {
+            continue;
+        }
+        const MeshTensor* tensor = FindBoundTensor(handle, tensor_by_param, require_all);
+        if (tensor == nullptr) {
+            continue;
+        }
+        const Buffer* buffer = tensor->mesh_buffer().get_reference_buffer();
+        TT_FATAL(
+            buffer != nullptr,
+            "Tensor argument for per-node TensorParameter '{}' has no backing Buffer.",
+            handle.tensor_parameter_name);
+        // TensorSpec validation already pins the per-node allocation flag (it is part of MemoryConfig equality),
+        // so this only trips if the buffer disagrees with its own tensor's MemoryConfig.
+        TT_FATAL(
+            experimental::per_core_allocation::is_per_core_allocation(*buffer),
+            "Tensor argument for per-node TensorParameter '{}' is backed by a Buffer that is not per-node allocated.",
+            handle.tensor_parameter_name);
+        const auto& node_addresses = experimental::per_core_allocation::get_per_core_addresses(*buffer);
+        const uint32_t word = handle.addr_rta_offset / sizeof(uint32_t);
+        for (const CoreCoord& node : kernel.logical_cores()) {
+            auto a_it = node_addresses.find(node);
+            TT_FATAL(
+                a_it != node_addresses.end(),
+                "Internal error: kernel '{}' runs on node {}, where the tensor bound to per-node TensorParameter '{}' "
+                "has no shard (validation should have caught this).",
+                kernel_name,
+                node.str(),
+                handle.tensor_parameter_name);
+            const DeviceAddr address = a_it->second;
+            TT_FATAL(
+                address <= std::numeric_limits<uint32_t>::max(),
+                "Tensor argument for TensorParameter '{}' base address {} on node {} exceeds uint32_t max",
+                handle.tensor_parameter_name,
+                address,
+                node.str());
+            RuntimeArgsData& rta = kernel.runtime_args_data(node);
+            TT_FATAL(
+                rta.data() != nullptr && word < rta.size(),
+                "Internal error: kernel '{}' node {} RTA buffer has no slot for per-node tensor binding '{}'.",
+                kernel_name,
+                node.str(),
+                handle.accessor_name);
+            rta[word] = static_cast<uint32_t>(address);
+        }
+    }
+}
+
+uint32_t ResolveBorrowedDFBTensorAddress(
+    const experimental::dfb::detail::DataflowBufferImpl& dfb,
+    const TensorParamName& tensor_name,
+    const MeshTensor& tensor) {
+    const auto& buffer = *tensor.mesh_buffer().get_reference_buffer();
+
+    // Attach-time legality checks (analogous to dynamic CB's
+    // CircularBufferConfig::set_globally_allocated_address_and_total_size validations).
+    //   - L1-residency: only L1 buffers may back a DFB.
+    //   - Sizing: the DFB's total bytes must fit in the buffer's per-bank allocation.
+    // ProgramSpec-time validation already enforced the TensorSpec-level analogs; these
+    // refine the check now that a concrete Buffer is in hand.
+    TT_FATAL(
+        buffer.is_l1(),
+        "Borrowed-memory DFB id {} (from TensorParameter '{}') requires an L1-resident backing memory.",
+        dfb.id,
+        tensor_name);
+    const uint32_t dfb_total_bytes = dfb.config.entry_size * dfb.config.num_entries;
+    TT_FATAL(
+        dfb_total_bytes <= buffer.aligned_size_per_bank(),
+        "Borrowed-memory DFB id {} (from TensorParameter '{}') has total size {} B, which exceeds the borrowed "
+        "Buffer's per-bank size of {} B.",
+        dfb.id,
+        tensor_name,
+        dfb_total_bytes,
+        buffer.aligned_size_per_bank());
+    const auto address = buffer.address();
+    TT_FATAL(
+        address <= std::numeric_limits<uint32_t>::max(),
+        "Borrowed Buffer base address {} for DFB id {} (TensorParameter '{}') exceeds uint32_t max.",
+        address,
+        dfb.id,
+        tensor_name);
+    return static_cast<uint32_t>(address);
+}
+
+// Attach the actual L1 Buffer's address to every tensor-backed DFB, by resolving each DFB's named
+// TensorParameter to the corresponding MeshTensor passed in tensor_args and extracting its
+// MeshBuffer's reference buffer. Under the lockstep mesh allocation invariant, any one of the
+// per-device buffers is a valid representative — same convention used by dynamic CB via
+// `MeshTensor::mesh_buffer().get_reference_buffer()`.
+//
+// How this works:
+//   - The ProgramSpec declares that the DFB borrows from a named TensorParameter.
+//   - At each runtime attach point (this function), ResolveBorrowedDFBTensorAddress extracts
+//     the Buffer from the bound MeshTensor and validates it before its address is installed in the DFB.
+//   - Re-entry (a subsequent run-params call with a different MeshTensor) just re-attaches.
+//
+// Pre-condition: On the full path, ValidateTensorArgs has enforced that every declared TensorParameter
+// has a corresponding TensorArgument, so the lookup cannot miss for any registered tensor binding.
+// On partial updates, omitted TensorParameters retain their existing DFB addresses.
+void AttachBorrowedDFBBuffers(
+    detail::ProgramImpl& program_impl,
+    const std::unordered_map<std::string, const MeshTensor*>& tensor_by_param,
+    bool require_all = true) {
+    // tensor_by_param is the param_name -> MeshTensor lookup the caller already built to fill the
+    // binding CRTA sections; reuse it here rather than rebuilding an identical map per enqueue.
+    for (const auto& binding : program_impl.get_dfb_storage_bindings()) {
+        const auto* tensor_name = std::get_if<TensorParamName>(&binding.source);
+        if (tensor_name == nullptr) {
+            continue;
+        }
+        const auto it = tensor_by_param.find(tensor_name->get());
+        if (it == tensor_by_param.end()) {
+            // Partial update (require_all=false): the borrowed TensorParameter was omitted; the DFB
+            // keeps its previously-attached address. On the full path (require_all=true) every
+            // borrowed tensor binding must have been supplied.
+            TT_FATAL(
+                !require_all,
+                "Internal error: DFB id {} borrows from TensorParameter '{}' but no TensorArgument supplied it "
+                "(validation should have caught this).",
+                binding.dfb_id,
+                *tensor_name);
+            continue;
+        }
+        auto dfb = program_impl.get_dataflow_buffer(binding.dfb_id);
+        // Attach the address to the device-side DFB. Per-enqueue update_program_dispatch_commands
+        // re-serializes the DFB config from the cache this populates, so no further dispatch-command
+        // invalidation is needed for either first-call or re-entry.
+        dfb->set_borrowed_memory_base_addr(ResolveBorrowedDFBTensorAddress(*dfb, *tensor_name, *it->second));
+    }
+}
+
+// ============================================================================
+// PUBLIC ENTRY POINTS: Program::set_program_run_args + Program::update_tensor_args
+// ============================================================================
+
+void Program::set_program_run_args(const ProgramRunArgs& params, ValidationMode validation) {
+    log_debug(tt::LogMetal, "Setting ProgramRunArgs");
+
+    // Metal 2.0 run-args API: only valid on a Program created from a ProgramSpec (the run-args
+    // schema lives on the spec). Legacy Programs configure runtime args via SetRuntimeArgs.
+    TT_FATAL(
+        impl().created_from_spec(),
+        "Program::set_program_run_args requires a Metal 2.0 Program. "
+        "For a legacy Program, use SetRuntimeArgs / SetCommonRuntimeArgs.");
+
+    // Validate parameters against the schema (can be skipped for trusted inputs, e.g. cached-program
+    // re-enqueue inner loops where the args have already been validated once).
+    if (validation == ValidationMode::FULL) {
+        ValidateProgramRunArgs(*this, params);
+    }
+
+    tt_metal::detail::ProgramImpl& program_impl = impl();
+
+    // Build a tensor_parameter_name -> MeshTensor lookup from the user's TensorArgument entries.
+    // Used below to fill each kernel's TensorBinding CRTA section: at minimum, the binding's
+    // base address (always present); additionally, any runtime accessor field words the
+    // TensorParameter opts into via dynamic_tensor_shape.
+    // NOTE: We assume lockstep mesh allocation, so a device-independent set of values per binding.
+    std::unordered_map<std::string, const MeshTensor*> tensor_by_param;
+    tensor_by_param.reserve(params.tensor_args.size());
+    for (const auto& [param_name, tensor_arg] : params.tensor_args) {
+        tensor_by_param.emplace(param_name.get(), &mesh_tensor_of(tensor_arg));
+    }
+
+    // Append a kernel's TensorBinding CRTA section to `out`, in binding-handle order. Each binding
+    // contributes (1 + num_runtime_field_crta_words) words: [base address, optional runtime accessor
+    // fields...], sourced from the bound MeshTensor via tensor_by_param. Shared by the main
+    // kernel_run_args loop below and the binding-only second pass after it.
+    auto append_binding_crtas = [&](const auto& binding_handles, std::vector<uint32_t>& out) {
+        for (const auto& handle : binding_handles) {
+            if (handle.is_per_node) {
+                continue;  // Lives in the per-node RTAs (see PatchPerNodeBindingRtas).
+            }
+            const MeshTensor& tensor = *FindBoundTensor(handle, tensor_by_param, /*required=*/true);
+            EmitBindingCrtaValues(handle, tensor, [&out](uint32_t w) { out.push_back(w); });
+        }
+    };
+
+    // Append a kernel's scratchpad CRTA section to `out`, in binding order: one word per scratchpad
+    // binding, holding the scratchpad's allocated L1 base address. On the factory path,
+    // reserve_runtime_arg_buffers + allocate_scratchpads may already have filled this; on the
+    // legacy order (Program::set_program_run_args before allocate_scratchpads) the address is 0 here and is
+    // patched later. On any re-assembly the handle already carries the allocated address, so it
+    // is filled directly. The section is always present (sized by the kernel's scratchpad
+    // bindings), so the buffer's word count is stable across re-set calls (install_crtas asserts
+    // that).
+    auto append_scratchpad_crtas = [](const auto& scratchpad_handles, std::vector<uint32_t>& out) {
+        for (const auto& handle : scratchpad_handles) {
+            out.push_back(handle.allocated_address);
+        }
+    };
+
+    auto append_global_semaphore_crtas = [&params](const auto& global_semaphore_handles, std::vector<uint32_t>& out) {
+        for (const auto& handle : global_semaphore_handles) {
+            const GlobalSemaphoreParamName param_name{handle.global_semaphore_parameter_name};
+            const auto arg = params.global_semaphore_args.get(param_name);
+            TT_FATAL(
+                arg.has_value(),
+                "Internal error: GlobalSemaphore binding '{}' has no GlobalSemaphoreArgument (validation should have "
+                "caught this).",
+                param_name);
+            out.push_back(GlobalSemaphoreAddressWord(param_name, arg->get()));
+        }
+    };
+
+    // Install a kernel's assembled CRTA buffer. set_common_runtime_args allocates storage but fatals
+    // if called twice, so it can only be used the first time; on subsequent Program::set_program_run_args calls
+    // (e.g. re-enqueue with new args) the already-allocated buffer is patched in place. Shared by the
+    // main kernel_run_args loop and the binding-only second pass so both handle the re-set case.
+    auto install_crtas = [](const std::shared_ptr<Kernel>& kernel,
+                            const std::vector<uint32_t>& combined_crtas,
+                            std::string_view kernel_name) {
+        if (combined_crtas.empty()) {
+            return;
+        }
+        if (kernel->common_runtime_args().empty()) {
+            kernel->set_common_runtime_args(combined_crtas);
+        } else {
+            RuntimeArgsData& crta = kernel->common_runtime_args_data();
+            TT_FATAL(
+                crta.size() == combined_crtas.size(),
+                "Kernel '{}' common runtime args count cannot change from {} to {}",
+                kernel_name,
+                crta.size(),
+                combined_crtas.size());
+            std::memcpy(crta.data(), combined_crtas.data(), combined_crtas.size() * sizeof(uint32_t));
+        }
+    };
+
+    // Process kernel runtime arguments.
+    // Named RTAs/CRTAs and vararg RTAs/CRTAs share a single dispatch buffer each (RTA + CRTA).
+    //
+    // Layout:
+    //   RTA per-node:  [named_rta_0 ... named_rta_N-1, RTA arrays, per_node_ta_addr_0 ... per_node_ta_addr_P-1,
+    //                   vararg_0 ... vararg_M-1]
+    //   CRTA:          [named_crta_0 ... named_crta_K-1, CRTA arrays, ta_addr_0 ... ta_addr_B-1, scratch_addr_0 ...
+    //   scratch_addr_S-1,
+    //                   vararg_0 ... vararg_L-1]
+    //
+    // RTA layout has three sections: named RTAs (scalars, then arrays), per-node TensorBinding addresses, and RTA
+    // varargs.
+    // CRTA layout has four sections: named CRTAs (scalars, then arrays), TensorBinding addresses, Scratchpad
+    // addresses, and CRTA varargs.
+    //
+    // TensorBinding address section is used by headergen to emit the `tensor::` namespace tokens.
+    // The device-side get_vararg / get_common_vararg helpers invisibly add the combined named-arg + binding
+    // offset, so kernel code indexes varargs from 0.
+    for (const auto& kernel_params : params.kernel_run_args) {
+        const auto& kernel_name = kernel_params.kernel;
+        std::shared_ptr<Kernel> kernel = program_impl.get_kernel_by_spec_name(kernel_name.get());
+        const KernelRTASchema* schema = program_impl.get_kernel_rta_schema(kernel_name.get());
+        TT_FATAL(schema != nullptr, "Kernel '{}' has no RTA schema registered.", kernel_name);
+
+        const size_t rta_vararg_offset = kernel->get_rta_layout().vararg_section_offset;
+        const auto& slot_of = schema->runtime_arg_name_to_slot;
+        const auto& array_slots_of = schema->runtime_array_arg_slots;
+
+        // RTA layout per node: [named_rta_0 ... named_rta_{N-1}, RTA arrays, per-node TensorBinding
+        // addresses, vararg_0 ... vararg_{M-1}].
+        // Named RTAs (scalar and array) are scattered to their declaration slots via the schema's
+        // name->slot indexes (one hash lookup per supplied arg, O(N)/node — matching how
+        // Program::update_program_run_args serializes); varargs are positional and follow the named section.
+        if (!kernel->cores_with_runtime_args().empty()) {
+            // ---- Fast path (subsequent call): the per-node RTA buffers already exist, sized and
+            // allocated by a prior call. Patch them in place, iterating ONLY the supplied args —
+            // exactly as Program::update_program_run_args does (and as ValidateProgramRunArgs iterates). This
+            // deliberately avoids the first-call machinery below: no per-call node->args lookup
+            // maps and no walk over the kernel's full logical-core set. That bookkeeping exists
+            // only to *join* a node's named + vararg sections into one combined buffer for the
+            // first allocation; once the buffer exists there is nothing to join or size, so the
+            // named and vararg sections are patched independently and the join is pure overhead.
+            // (This is the per-node fixed cost that made Set ~5us/call slower than the otherwise
+            // identical Update path, flat in N.)
+            for (const auto& [name, per_node] : kernel_params.runtime_arg_values) {
+                const auto s = slot_of.find(name);
+                for (const auto& [node, value] : per_node) {
+                    TT_FATAL(
+                        s != slot_of.end(),
+                        "Internal error: named RTA '{}' not in schema for kernel '{}' node {}.",
+                        name,
+                        kernel_name,
+                        node.str());
+                    RuntimeArgsData& rta = kernel->runtime_args_data(node);
+                    TT_FATAL(
+                        rta.data() != nullptr,
+                        "Program::set_program_run_args fast path: kernel '{}' node {} has no allocated RTA buffer "
+                        "though the kernel reports prior runtime args. Internal invariant violation.",
+                        kernel_name,
+                        node.str());
+                    rta[s->second] = value.to_uint32();
+                }
+            }
+            for (const auto& [name, per_node] : kernel_params.runtime_array_arg_values) {
+                const auto a = array_slots_of.find(name);
+                TT_FATAL(
+                    a != array_slots_of.end(),
+                    "Internal error: RTA array '{}' not in schema for kernel '{}'.",
+                    name,
+                    kernel_name);
+                for (const auto& [node, value] : per_node) {
+                    RuntimeArgsData& rta = kernel->runtime_args_data(node);
+                    TT_FATAL(
+                        rta.data() != nullptr,
+                        "Program::set_program_run_args fast path: kernel '{}' node {} has no allocated RTA buffer "
+                        "though the kernel reports prior runtime args. Internal invariant violation.",
+                        kernel_name,
+                        node.str());
+                    WriteArrayArgValue(rta.data(), a->second, value, kernel_name.get(), name);
+                }
+            }
+            for (const auto& [node, vals] : kernel_runtime_varargs(kernel_params)) {
+                if (vals.empty()) {
+                    continue;
+                }
+                RuntimeArgsData& rta = kernel->runtime_args_data(node);
+                TT_FATAL(
+                    rta.data() != nullptr,
+                    "Program::set_program_run_args fast path: kernel '{}' node {} has varargs but no "
+                    "allocated RTA buffer.",
+                    kernel_name,
+                    node.str());
+                uint32_t* vdst = rta.data() + rta_vararg_offset;
+                for (const uint32_t v : vals) {
+                    *vdst++ = v;
+                }
+            }
+        } else {
+            // ---- First call: no RTA buffers exist yet. Each node's buffer must be allocated by
+            // set_runtime_args, which can be called only once per node and sizes the buffer to the
+            // node's combined named+vararg width — so we must join a node's named and vararg values
+            // before allocating. Build the node->values lookups and walk the kernel's logical cores
+            // (the node coverage validation has confirmed) to assemble each combined buffer. This
+            // runs once; every subsequent call takes the fast path above.
+            std::unordered_map<NodeCoord, std::vector<std::pair<size_t, uint32_t>>> named_rtas_by_node;
+            for (const auto& [name, per_node] : kernel_params.runtime_arg_values) {
+                const auto s = slot_of.find(name);
+                for (const auto& [node, value] : per_node) {
+                    TT_FATAL(
+                        s != slot_of.end(),
+                        "Internal error: named RTA '{}' not in schema for kernel '{}' node {}.",
+                        name,
+                        kernel_name,
+                        node.str());
+                    named_rtas_by_node[node].emplace_back(s->second, value.to_uint32());
+                }
+            }
+            // RTA arrays join the same per-node (slot, value) list, one entry per element.
+            for (const auto& [name, per_node] : kernel_params.runtime_array_arg_values) {
+                const auto a = array_slots_of.find(name);
+                TT_FATAL(
+                    a != array_slots_of.end(),
+                    "Internal error: RTA array '{}' not in schema for kernel '{}'.",
+                    name,
+                    kernel_name);
+                const KernelRTASchema::ArraySlots& slots = a->second;
+                for (const auto& [node, value] : per_node) {
+                    CheckArrayArgValueLength(slots, value, kernel_name.get(), name);
+                    auto& node_rtas = named_rtas_by_node[node];
+                    for (size_t i = 0; i < slots.size; ++i) {
+                        node_rtas.emplace_back(slots.first_slot + i, value[i].to_uint32());
+                    }
+                }
+            }
+            std::unordered_map<NodeCoord, const std::vector<uint32_t>*> varargs_by_node;
+            for (const auto& [node, args] : kernel_runtime_varargs(kernel_params)) {
+                varargs_by_node[node] = &args;
+            }
+
+            const std::set<CoreCoord>& kernel_nodes = kernel->logical_cores();
+            for (const auto& node : kernel_nodes) {
+                auto named_it = named_rtas_by_node.find(node);
+                auto vararg_it = varargs_by_node.find(node);
+                const bool has_named = named_it != named_rtas_by_node.end();
+                const bool has_varargs = vararg_it != varargs_by_node.end();
+                if (rta_vararg_offset == 0 && !has_varargs) {
+                    continue;  // Nothing to set on this node.
+                }
+                const size_t num_varargs = has_varargs ? vararg_it->second->size() : 0;
+
+                // Value-initialized to the exact combined width so the scatter can assign by slot.
+                // The per-node TensorBinding section is filled by PatchPerNodeBindingRtas below.
+                std::vector<uint32_t> combined(rta_vararg_offset + num_varargs, 0u);
+                if (has_named) {
+                    for (const auto& [slot, value] : named_it->second) {
+                        combined[slot] = value;
+                    }
+                }
+                if (has_varargs) {
+                    std::copy(
+                        vararg_it->second->begin(), vararg_it->second->end(), combined.begin() + rta_vararg_offset);
+                }
+                kernel->set_runtime_args(node, combined);
+            }
+        }
+        PatchPerNodeBindingRtas(*kernel, tensor_by_param, kernel_name.get(), /*require_all=*/true);
+
+        // Assemble the kernel's per-enqueue CRTA buffer in four structurally-separate sections:
+        //   1. User-named CRTAs: the scalars, in schema order, sourced from common_runtime_arg_values;
+        //      then the arrays, at their schema slots, sourced from common_runtime_array_arg_values.
+        //   2. TensorBinding section, in binding-handle order, sourced from TensorArgument via the
+        //      tensor_by_param lookup. Each binding occupies (1 + num_runtime_field_crta_words)
+        //      words: [address, optional shape...]. The handle's addr_crta_offset lines up with
+        //      the address slot position chosen here.
+        //   3. Scratchpad section, in binding order, one word each (the allocated L1 base address,
+        //      0 here until allocate_scratchpads patches it at program-compile time).
+        //   4. GlobalSemaphore section, in binding order, one word each (the bound GlobalSemaphore's address).
+        //   5. Common runtime varargs, in caller-supplied order.
+        const auto& binding_handles = kernel->tensor_binding_handles();
+        std::vector<uint32_t> combined_crtas;
+        combined_crtas.reserve(
+            kernel->get_crta_layout().vararg_section_offset + kernel_common_runtime_varargs(kernel_params).size());
+        for (const auto& name : schema->common_runtime_arg_names) {
+            auto v_it = kernel_params.common_runtime_arg_values.find(name);
+            TT_FATAL(
+                v_it != kernel_params.common_runtime_arg_values.end(),
+                "Internal error: named CRTA '{}' missing for kernel '{}'.",
+                name,
+                kernel_name);
+            combined_crtas.push_back(v_it->second.to_uint32());
+        }
+        // Extend to the end of section 1, then write each array at its slots.
+        combined_crtas.resize(kernel->get_crta_layout().num_named_words, 0u);
+        for (const auto& [name, slots] : schema->common_runtime_array_arg_slots) {
+            const auto value = kernel_params.common_runtime_array_arg_values.get(name);
+            TT_FATAL(value.has_value(), "Internal error: CRTA array '{}' missing for kernel '{}'.", name, kernel_name);
+            WriteArrayArgValue(combined_crtas.data(), slots, *value, kernel_name.get(), name);
+        }
+        append_binding_crtas(binding_handles, combined_crtas);
+        append_scratchpad_crtas(kernel->scratchpad_binding_handles(), combined_crtas);
+        append_global_semaphore_crtas(kernel->global_semaphore_binding_handles(), combined_crtas);
+        combined_crtas.insert(
+            combined_crtas.end(),
+            kernel_common_runtime_varargs(kernel_params).begin(),
+            kernel_common_runtime_varargs(kernel_params).end());
+
+        install_crtas(kernel, combined_crtas, kernel_name.get());
+    }
+
+    // Second pass: kernels that bind tensors, a scratchpad and/or a GlobalSemaphore but were omitted from
+    // kernel_run_args. A kernel whose only per-enqueue state is binding addresses (no named
+    // RTAs/CRTAs and no varargs — a scratchpad's address is framework-supplied, not user-supplied) is
+    // allowed to be absent from kernel_run_args (see ValidateProgramRunArgs). The loop above only visits
+    // kernels present in kernel_run_args, so such a kernel's binding + scratchpad CRTA sections would
+    // never be written. Fill them here. Kernels with neither need no CRTA buffer.
+    std::unordered_set<std::string> kernels_in_run_args;
+    kernels_in_run_args.reserve(params.kernel_run_args.size());
+    for (const auto& kernel_params : params.kernel_run_args) {
+        kernels_in_run_args.insert(kernel_params.kernel.get());
+    }
+    for (const auto& kernel_name : program_impl.get_registered_kernel_names()) {
+        if (kernels_in_run_args.contains(kernel_name)) {
+            continue;  // Already filled (and its CRTA buffer allocated) by the loop above.
+        }
+        std::shared_ptr<Kernel> kernel = program_impl.get_kernel_by_spec_name(kernel_name);
+        const auto& binding_handles = kernel->tensor_binding_handles();
+        const auto& scratchpad_handles = kernel->scratchpad_binding_handles();
+        const auto& global_semaphore_handles = kernel->global_semaphore_binding_handles();
+        if (binding_handles.empty() && scratchpad_handles.empty() && global_semaphore_handles.empty()) {
+            continue;  // No bindings => nothing to supply; no CRTA dispatch buffer needed.
+        }
+        // Binding-only kernel: its CRTA buffer is exactly the binding sections (it has
+        // no named CRTAs or varargs, else validation would have required a kernel_run_args entry).
+        // install_crtas allocates the buffer on the first Program::set_program_run_args call and patches it in place
+        // on later ones (e.g. re-enqueue with a new tensor), mirroring the main loop.
+        // Likewise, each node's RTA buffer is exactly the per-node TensorBinding section.
+        if (const uint32_t per_node_words = kernel->get_rta_layout().binding_section_words; per_node_words > 0) {
+            if (kernel->cores_with_runtime_args().empty()) {
+                const std::vector<uint32_t> zeros(per_node_words, 0u);
+                for (const auto& node : kernel->logical_cores()) {
+                    kernel->set_runtime_args(node, zeros);
+                }
+            }
+            PatchPerNodeBindingRtas(*kernel, tensor_by_param, kernel_name, /*require_all=*/true);
+        }
+        std::vector<uint32_t> combined_crtas;
+        append_binding_crtas(binding_handles, combined_crtas);
+        append_scratchpad_crtas(scratchpad_handles, combined_crtas);
+        append_global_semaphore_crtas(global_semaphore_handles, combined_crtas);
+        install_crtas(kernel, combined_crtas, kernel_name);
+    }
+
+    // Process DFB runtime parameters:
+    //   - DFB size overrides (entry_size / num_entries)
+    //   - Borrowed-memory DFB backing L1 Buffer*
+    // Apply size overrides BEFORE attaching borrowed buffers so the borrowed per-bank fit check in
+    // AttachBorrowedDFBBuffers validates the NEW size. Overrides are applied as a single batch so an alias
+    // group can be validated for size agreement before any DFB is mutated.
+    std::vector<tt_metal::detail::ProgramImpl::DfbSizeOverride> size_overrides;
+    size_overrides.reserve(params.dfb_run_overrides.size());
+    for (const auto& dfb_params : params.dfb_run_overrides) {
+        if (!dfb_params.entry_size.has_value() && !dfb_params.num_entries.has_value()) {
+            continue;
+        }
+        size_overrides.push_back(
+            {program_impl.get_dfb_handle(*dfb_params.dfb), dfb_params.entry_size, dfb_params.num_entries});
+    }
+    program_impl.apply_dfb_size_overrides(size_overrides);
+    AttachBorrowedDFBBuffers(program_impl, tensor_by_param);
+
+    // Bind PrefetcherPipe objects to their parameters' slots (per node; a relay DFB over them is
+    // pointed at the pipe ring here). Sticky across calls.
+    BindPrefetcherPipeArgs(program_impl, params.advanced_options.prefetcher_pipe_args);
+
+    // Install arena addresses after DFB, tensor, and pipe checks succeed.
+    BindSRAMArenaArgs(program_impl, params.advanced_options.sram_arena_args);
+    for (const auto& [param_name, tensor] : tensor_by_param) {
+        program_impl.set_bound_tensor_footprint(param_name, tt_metal::detail::make_bound_tensor_footprint(*tensor));
+    }
+    program_impl.mark_program_run_args_initialized();
+    // Every arg was just set for the whole program: per-device values are dropped (see
+    // ProgramImpl::PerDeviceRunArgDrops).
+    program_impl.record_per_device_run_args_drop_all();
+}
+
+void Program::update_tensor_args(
+    const Table<TensorParamName, ProgramRunArgs::TensorArgument>& tensor_args, ValidationMode validation) {
+    log_debug(tt::LogMetal, "Updating tensor args (partial fast-path)");
+
+    tt_metal::detail::ProgramImpl& program_impl = impl();
+    // Metal 2.0 run-args API: only valid on a Program created from a ProgramSpec. (A legacy Program
+    // would also fail the initialized-check below, but this gives the accurate reason.)
+    TT_FATAL(
+        program_impl.created_from_spec(),
+        "Program::update_tensor_args requires a Metal 2.0 Program. "
+        "For a legacy Program, use SetRuntimeArgs / SetCommonRuntimeArgs.");
+    TT_FATAL(
+        program_impl.program_run_args_initialized(),
+        "Program::update_tensor_args called on Program before Program::set_program_run_args. Call "
+        "Program::set_program_run_args at least once first.");
+
+    // Validate the TensorArgument list (shared with the full-path validator).
+    if (validation == ValidationMode::FULL) {
+        ValidateTensorArgs(*this, tensor_args);
+    }
+
+    // Build a tensor_parameter_name -> MeshTensor lookup.
+    // As in Program::set_program_run_args, this assumes lockstep mesh allocation:
+    // a single device-independent value set per binding.
+    std::unordered_map<std::string, const MeshTensor*> tensor_by_param;
+    tensor_by_param.reserve(tensor_args.size());
+    for (const auto& [param_name, tensor_arg] : tensor_args) {
+        tensor_by_param.emplace(param_name.get(), &mesh_tensor_of(tensor_arg));
+    }
+
+    // For every kernel with tensor bindings, patch the binding slots in its CRTA buffer in
+    // place. Each binding occupies (1 + num_runtime_field_crta_words) words starting at
+    // handle.addr_crta_offset: the always-present address word, plus any runtime accessor
+    // field words (shape, when dynamic_tensor_shape is set). The rest of the buffer (named
+    // CRTAs, vararg CRTAs) is left untouched and retains the values installed by the most
+    // recent Program::set_program_run_args call. The kernel's RTA buffers are also left untouched, except
+    // for the per-node TensorBinding section (a per-node binding's address lives there).
+    for (const auto& kernel_name : program_impl.get_registered_kernel_names()) {
+        std::shared_ptr<Kernel> kernel = program_impl.get_kernel_by_spec_name(kernel_name);
+        const auto& binding_handles = kernel->tensor_binding_handles();
+        if (binding_handles.empty()) {
+            continue;
+        }
+
+        PatchPerNodeBindingRtas(*kernel, tensor_by_param, kernel_name, /*require_all=*/true);
+        if (kernel->get_crta_layout().binding_section_words == 0) {
+            continue;  // No CRTA-resident bindings.
+        }
+
+        // Pre-condition: Program::set_program_run_args must have been called previously to size and
+        // populate this kernel's CRTA buffer. Without it, there is no buffer to patch into.
+        TT_FATAL(
+            !kernel->common_runtime_args().empty(),
+            "Program::update_tensor_args called on Program before Program::set_program_run_args: kernel '{}' has "
+            "tensor bindings but its CRTA buffer has not been allocated. Call Program::set_program_run_args at "
+            "least once first.",
+            kernel_name);
+
+        RuntimeArgsData& crta = kernel->common_runtime_args_data();
+        for (const auto& handle : binding_handles) {
+            if (handle.is_per_node) {
+                continue;
+            }
+            const MeshTensor& tensor = *FindBoundTensor(handle, tensor_by_param, /*required=*/true);
+            // addr_crta_offset is a byte offset; data() is uint32_t*.
+            uint32_t* dst = crta.data() + (handle.addr_crta_offset / sizeof(uint32_t));
+            EmitBindingCrtaValues(handle, tensor, [&dst](uint32_t w) { *dst++ = w; });
+        }
+    }
+
+    // Process DFB runtime parameters to update borrowed-memory DFB backing L1 Buffer*s.
+    AttachBorrowedDFBBuffers(program_impl, tensor_by_param);
+    for (const auto& [param_name, tensor] : tensor_by_param) {
+        program_impl.set_bound_tensor_footprint(param_name, tt_metal::detail::make_bound_tensor_footprint(*tensor));
+    }
+}
+
+// Union the args of `src` into `dst` for a single kernel (same kernel name). Used by
+// MergeProgramRunArgs. Named RTAs (per node) and named CRTAs, scalar and array, union by name; a
+// given name may appear in at most one input (disjoint), else error unless ValidationMode::SKIP. Positional
+// varargs cannot be name-merged: at most one input may supply them for a given node / for common varargs.
+void MergeKernelRunArgsInto(
+    ProgramRunArgs::KernelRunArgs& dst, const ProgramRunArgs::KernelRunArgs& src, ValidationMode validation) {
+    const auto& kernel_name = dst.kernel;
+
+    // Named CRTAs.
+    for (const auto& [name, value] : src.common_runtime_arg_values) {
+        if (validation == ValidationMode::FULL) {
+            TT_FATAL(
+                !dst.common_runtime_arg_values.get(name).has_value(),
+                "MergeProgramRunArgs: kernel '{}' common runtime arg '{}' is specified in more than one "
+                "ProgramRunArgs.",
+                kernel_name,
+                name);
+        }
+        dst.common_runtime_arg_values[name] = value;
+    }
+
+    // Per-node named RTAs (keyed by name, then node). A given (name, node) may appear in at most
+    // one input; disjoint names/nodes union together.
+    for (const auto& [name, src_per_node] : src.runtime_arg_values) {
+        auto& dst_per_node = dst.runtime_arg_values[name];
+        for (const auto& [node, value] : src_per_node) {
+            if (validation == ValidationMode::FULL) {
+                TT_FATAL(
+                    !dst_per_node.get(node).has_value(),
+                    "MergeProgramRunArgs: kernel '{}' node {} runtime arg '{}' is specified in more than one "
+                    "ProgramRunArgs.",
+                    kernel_name,
+                    node.str(),
+                    name);
+            }
+            dst_per_node[node] = value;
+        }
+    }
+
+    // CRTA arrays, as named CRTAs. (An array merges whole: it is one arg.)
+    for (const auto& [name, value] : src.common_runtime_array_arg_values) {
+        if (validation == ValidationMode::FULL) {
+            TT_FATAL(
+                !dst.common_runtime_array_arg_values.get(name).has_value(),
+                "MergeProgramRunArgs: kernel '{}' common runtime array arg '{}' is specified in more than one "
+                "ProgramRunArgs.",
+                kernel_name,
+                name);
+        }
+        dst.common_runtime_array_arg_values[name] = value;
+    }
+
+    // Per-node RTA arrays, as per-node named RTAs.
+    for (const auto& [name, src_per_node] : src.runtime_array_arg_values) {
+        auto& dst_per_node = dst.runtime_array_arg_values[name];
+        for (const auto& [node, value] : src_per_node) {
+            if (validation == ValidationMode::FULL) {
+                TT_FATAL(
+                    !dst_per_node.get(node).has_value(),
+                    "MergeProgramRunArgs: kernel '{}' node {} runtime array arg '{}' is specified in more than one "
+                    "ProgramRunArgs.",
+                    kernel_name,
+                    node.str(),
+                    name);
+            }
+            dst_per_node[node] = value;
+        }
+    }
+
+    // Positional RTA varargs (per node): cannot be merged; at most one input may supply them.
+    for (const auto& [node, vals] : src.advanced_options.runtime_varargs) {
+        if (dst.advanced_options.runtime_varargs.get(node).has_value()) {
+            if (validation == ValidationMode::FULL) {
+                TT_FATAL(
+                    false,
+                    "MergeProgramRunArgs: kernel '{}' node {} runtime varargs are specified in more than one "
+                    "ProgramRunArgs (positional varargs cannot be merged).",
+                    kernel_name,
+                    node.str());
+            }
+            continue;  // ValidationMode::SKIP: keep dst's existing varargs.
+        }
+        dst.advanced_options.runtime_varargs[node] = vals;
+    }
+
+    // Positional common varargs: at most one input may be non-empty.
+    if (!src.advanced_options.common_runtime_varargs.empty()) {
+        if (!dst.advanced_options.common_runtime_varargs.empty()) {
+            if (validation == ValidationMode::FULL) {
+                TT_FATAL(
+                    false,
+                    "MergeProgramRunArgs: kernel '{}' common runtime varargs are specified in more than one "
+                    "ProgramRunArgs (positional varargs cannot be merged).",
+                    kernel_name);
+            }
+        } else {
+            dst.advanced_options.common_runtime_varargs = src.advanced_options.common_runtime_varargs;
+        }
+    }
+}
+
+// Validation for the partial-update path Program::update_program_run_args.
+//
+// Program::update_program_run_args applies an ARBITRARY subset of a Program's ProgramRunArgs; any arg not
+// supplied retains the value installed by the most recent Program::set_program_run_args. So, unlike the full
+// ValidateProgramRunArgs, this imposes NO completeness requirement — kernels, named RTAs/CRTAs
+// (scalar and array), varargs, and tensor args may all be freely omitted. Whatever IS supplied is
+// still validated: names must be declared (no extras), target nodes must belong to the kernel, and a
+// supplied array's length or vararg section's count must match the schema.
+//
+// Resizing a tensor-backed DFB requires its backing TensorParameter in the same
+// update so the per-bank capacity check can use the new size.
+// ValidateDFBRunOverrides enforces this requirement.
+void ValidateUpdateProgramRunArgs(const Program& program, const ProgramRunArgs& params) {
+    const detail::ProgramImpl& program_impl = program.impl();
+
+    std::unordered_set<KernelSpecName> kernels_with_params;
+    for (const auto& kernel_params : params.kernel_run_args) {
+        const auto& kernel_name = kernel_params.kernel;
+        auto [it, inserted] = kernels_with_params.insert(kernel_name);
+        TT_FATAL(
+            inserted,
+            "Duplicate kernel '{}' in ProgramRunArgs.kernel_run_args. Each kernel must appear exactly once.",
+            kernel_name);
+
+        const KernelRTASchema* schema = program_impl.get_kernel_rta_schema(kernel_name.get());
+        TT_FATAL(
+            schema != nullptr,
+            "Kernel '{}' has no RTA schema registered. Was the Program created from a ProgramSpec?",
+            kernel_name);
+
+        const std::shared_ptr<Kernel> kernel = program_impl.get_kernel_by_spec_name(kernel_name.get());
+        const std::set<CoreCoord>& kernel_nodes = kernel->logical_cores();
+
+        // --- Vararg RTAs: a node's vararg section may be omitted (retaining its prior value). If
+        //     supplied, its target node must belong to the kernel and its count must match the
+        //     schema for that node. An empty section is treated as omitted (matching both the
+        //     patch step below and the common-vararg handling). ---
+        for (const auto& [node_coord, args] : kernel_runtime_varargs(kernel_params)) {
+            if (args.empty()) {
+                continue;
+            }
+            TT_FATAL(
+                kernel_nodes.contains(node_coord),
+                "Kernel '{}' is setting runtime_varargs for node {}, but the kernel does not run on that node.",
+                kernel_name,
+                node_coord.str());
+            auto it_schema = schema->num_runtime_varargs_per_node.find(node_coord);
+            const size_t expected_varargs =
+                (it_schema != schema->num_runtime_varargs_per_node.end()) ? it_schema->second : 0;
+            TT_FATAL(
+                args.size() == expected_varargs,
+                "Kernel '{}' node {} expects {} vararg runtime args, but {} were provided",
+                kernel_name,
+                node_coord.str(),
+                expected_varargs,
+                args.size());
+        }
+
+        // --- Common varargs: may be omitted (empty). If supplied, the count must match the schema. ---
+        const auto& common_varargs = kernel_common_runtime_varargs(kernel_params);
+        if (!common_varargs.empty()) {
+            TT_FATAL(
+                common_varargs.size() == schema->num_common_runtime_varargs,
+                "Kernel '{}' expects {} vararg common runtime args, but {} were provided",
+                kernel_name,
+                schema->num_common_runtime_varargs,
+                common_varargs.size());
+        }
+
+        // --- Named RTAs: any may be omitted. Supplied names must be declared (no extras) and their
+        //     target nodes must belong to the kernel. ---
+        const std::unordered_set<std::string> named_rta_name_set(
+            schema->runtime_arg_names.begin(), schema->runtime_arg_names.end());
+        for (const auto& [name, per_node] : kernel_params.runtime_arg_values) {
+            TT_FATAL(
+                named_rta_name_set.contains(name),
+                "Kernel '{}' sets named RTA '{}' which is not declared in the schema.",
+                kernel_name,
+                name);
+            for (const auto& [node, _value] : per_node) {
+                (void)_value;
+                TT_FATAL(
+                    kernel_nodes.contains(node),
+                    "Kernel '{}' is setting runtime_arg_values for node {}, but the kernel does not run on that node.",
+                    kernel_name,
+                    node.str());
+            }
+        }
+
+        // --- Named CRTAs: any may be omitted. Supplied names must be declared (no extras). ---
+        const std::unordered_set<std::string> named_crta_name_set(
+            schema->common_runtime_arg_names.begin(), schema->common_runtime_arg_names.end());
+        for (const auto& [name, _value] : kernel_params.common_runtime_arg_values) {
+            (void)_value;
+            TT_FATAL(
+                named_crta_name_set.contains(name),
+                "Kernel '{}' sets named CRTA '{}' which is not declared in the schema.",
+                kernel_name,
+                name);
+        }
+
+        // --- Array args: any may be omitted (on any node, for an RTA array). Supplied ones are validated. ---
+        ValidateSuppliedArrayArgValues(kernel_params, *schema, kernel_nodes);
+    }
+
+    ValidateDFBRunOverrides(program_impl, params, /*require_all=*/false);
+
+    // Tensor args: any TensorParameter may be omitted (its prior MeshTensor is retained); supplied
+    // ones are validated against their declared spec.
+    ValidateTensorArgs(program, params.tensor_args, /*require_all=*/false);
+
+    // GlobalSemaphore args: any may be omitted (its prior address is retained).
+    ValidateGlobalSemaphoreArgs(program, params.global_semaphore_args, /*require_all=*/false);
+
+    ValidateSRAMArenaArgs(program, params.advanced_options.sram_arena_args, /*require_all=*/false);
+
+    // PrefetcherPipe args: any may be omitted (the binding is sticky); a supplied one must name a
+    // declared parameter and match its geometry.
+    ValidatePrefetcherPipeArgs(program, params.advanced_options.prefetcher_pipe_args, /*require_all=*/false);
+}
+
+void Program::update_program_run_args(const ProgramRunArgs& params, ValidationMode validation) {
+    log_debug(tt::LogMetal, "Updating ProgramRunArgs (partial fast-path)");
+
+    tt_metal::detail::ProgramImpl& program_impl = impl();
+    // Metal 2.0 run-args API: only valid on a Program created from a ProgramSpec. (A legacy Program
+    // would also fail the initialized-check below, but this gives the accurate reason.)
+    TT_FATAL(
+        program_impl.created_from_spec(),
+        "Program::update_program_run_args requires a Metal 2.0 Program. "
+        "For a legacy Program, use SetRuntimeArgs / SetCommonRuntimeArgs.");
+    TT_FATAL(
+        program_impl.program_run_args_initialized(),
+        "Program::update_program_run_args: CRTA buffer not allocated because Program::set_program_run_args has "
+        "not been called. Call Program::set_program_run_args at least once before a partial update.");
+
+    if (validation == ValidationMode::FULL) {
+        ValidateUpdateProgramRunArgs(*this, params);
+    }
+    // Patch the supplied args in place. Omitted named args and tensor params are left untouched,
+    // retaining the value installed by the most recent Program::set_program_run_args. A supplied positional
+    // vararg section refreshes that section wholesale.
+    for (const auto& kernel_params : params.kernel_run_args) {
+        const auto& kernel_name = kernel_params.kernel;
+        std::shared_ptr<Kernel> kernel = program_impl.get_kernel_by_spec_name(kernel_name.get());
+        const KernelRTASchema* schema = program_impl.get_kernel_rta_schema(kernel_name.get());
+        TT_FATAL(schema != nullptr, "Kernel '{}' has no RTA schema registered.", kernel_name);
+
+        const size_t rta_vararg_offset = kernel->get_rta_layout().vararg_section_offset;
+
+        // ---- Per-node RTA buffer: patch supplied named RTAs at their declaration-order slot ----
+        if (!kernel_params.runtime_arg_values.empty()) {
+            const auto& rta_index = schema->runtime_arg_name_to_slot;
+            for (const auto& [name, per_node] : kernel_params.runtime_arg_values) {
+                const auto it = rta_index.find(name);
+                TT_FATAL(
+                    it != rta_index.end(),
+                    "Internal error: named RTA '{}' not in schema for kernel '{}'.",
+                    name,
+                    kernel_name);
+                for (const auto& [node, value] : per_node) {
+                    TT_FATAL(
+                        kernel->cores_with_runtime_args().contains(node),
+                        "Program::update_program_run_args: kernel '{}' has no runtime-arg buffer for node {}. Call "
+                        "Program::set_program_run_args at least once before a partial update.",
+                        kernel_name,
+                        node.str());
+                    RuntimeArgsData& rta = kernel->runtime_args_data(node);
+                    rta[it->second] = value.to_uint32();
+                }
+            }
+        }
+
+        // ---- Per-node RTA buffer: patch supplied RTA arrays at their slots (each replaced whole) ----
+        for (const auto& [name, per_node] : kernel_params.runtime_array_arg_values) {
+            const auto a = schema->runtime_array_arg_slots.find(name);
+            TT_FATAL(
+                a != schema->runtime_array_arg_slots.end(),
+                "Internal error: RTA array '{}' not in schema for kernel '{}'.",
+                name,
+                kernel_name);
+            for (const auto& [node, value] : per_node) {
+                TT_FATAL(
+                    kernel->cores_with_runtime_args().contains(node),
+                    "Program::update_program_run_args: kernel '{}' has no runtime-arg buffer for node {}. Call "
+                    "Program::set_program_run_args at least once before a partial update.",
+                    kernel_name,
+                    node.str());
+                WriteArrayArgValue(kernel->runtime_args_data(node).data(), a->second, value, kernel_name.get(), name);
+            }
+        }
+
+        // ---- Per-node RTA buffer: patch supplied varargs (positional, after the named section) ----
+        for (const auto& [node, vals] : kernel_runtime_varargs(kernel_params)) {
+            if (vals.empty()) {
+                continue;
+            }
+            TT_FATAL(
+                kernel->cores_with_runtime_args().contains(node),
+                "Program::update_program_run_args: kernel '{}' has no runtime-arg buffer for node {}. Call "
+                "Program::set_program_run_args at least once before a partial update.",
+                kernel_name,
+                node.str());
+            RuntimeArgsData& rta = kernel->runtime_args_data(node);
+            for (size_t j = 0; j < vals.size(); ++j) {
+                rta[rta_vararg_offset + j] = vals[j];
+            }
+        }
+
+        // ---- CRTA buffer: patch supplied named CRTAs, CRTA arrays + supplied common varargs ----
+        const auto& cvarargs = kernel_common_runtime_varargs(kernel_params);
+        const bool touches_crta = !kernel_params.common_runtime_arg_values.empty() ||
+                                  !kernel_params.common_runtime_array_arg_values.empty() || !cvarargs.empty();
+        if (touches_crta) {
+            TT_FATAL(
+                !kernel->common_runtime_args().empty(),
+                "Program::update_program_run_args: kernel '{}' CRTA buffer not allocated. Call "
+                "Program::set_program_run_args at least once before a partial update.",
+                kernel_name);
+            RuntimeArgsData& crta = kernel->common_runtime_args_data();
+
+            if (!kernel_params.common_runtime_arg_values.empty()) {
+                const auto& crta_index = schema->common_runtime_arg_name_to_slot;
+                for (const auto& [name, value] : kernel_params.common_runtime_arg_values) {
+                    const auto it = crta_index.find(name);
+                    TT_FATAL(
+                        it != crta_index.end(),
+                        "Internal error: named CRTA '{}' not in schema for kernel '{}'.",
+                        name,
+                        kernel_name);
+                    crta[it->second] = value.to_uint32();
+                }
+            }
+            for (const auto& [name, value] : kernel_params.common_runtime_array_arg_values) {
+                const auto a = schema->common_runtime_array_arg_slots.find(name);
+                TT_FATAL(
+                    a != schema->common_runtime_array_arg_slots.end(),
+                    "Internal error: CRTA array '{}' not in schema for kernel '{}'.",
+                    name,
+                    kernel_name);
+                WriteArrayArgValue(crta.data(), a->second, value, kernel_name.get(), name);
+            }
+            if (!cvarargs.empty()) {
+                // Common varargs live after the named CRTAs, the tensor-binding address section, and the
+                // scratchpad address section.
+                const size_t crta_vararg_base = kernel->get_crta_layout().vararg_section_offset;
+                for (size_t j = 0; j < cvarargs.size(); ++j) {
+                    crta[crta_vararg_base + j] = cvarargs[j];
+                }
+            }
+        }
+    }
+
+    // ---- DFB size overrides (stateful: an unspecified DFB retains its current size) ----
+    // Apply BEFORE re-attaching borrowed buffers below, so the borrowed per-bank fit check sees the
+    // new size. Mirrors the Program::set_program_run_args path.
+    std::vector<tt_metal::detail::ProgramImpl::DfbSizeOverride> size_overrides;
+    size_overrides.reserve(params.dfb_run_overrides.size());
+    for (const auto& dfb_params : params.dfb_run_overrides) {
+        if (!dfb_params.entry_size.has_value() && !dfb_params.num_entries.has_value()) {
+            continue;
+        }
+        size_overrides.push_back(
+            {program_impl.get_dfb_handle(*dfb_params.dfb), dfb_params.entry_size, dfb_params.num_entries});
+    }
+    program_impl.apply_dfb_size_overrides(size_overrides);
+
+    // ---- Tensor bindings: patch CRTA address slots for SUPPLIED tensors only ----
+    // (Tensors omitted from params keep their previously-patched binding slots.)
+    if (!params.tensor_args.empty()) {
+        std::unordered_map<std::string, const MeshTensor*> tensor_by_param;
+        tensor_by_param.reserve(params.tensor_args.size());
+        for (const auto& [param_name, tensor_arg] : params.tensor_args) {
+            tensor_by_param.emplace(param_name.get(), &mesh_tensor_of(tensor_arg));
+        }
+
+        for (const auto& kernel_name : program_impl.get_registered_kernel_names()) {
+            std::shared_ptr<Kernel> kernel = program_impl.get_kernel_by_spec_name(kernel_name);
+            const auto& binding_handles = kernel->tensor_binding_handles();
+            if (binding_handles.empty()) {
+                continue;
+            }
+            PatchPerNodeBindingRtas(*kernel, tensor_by_param, kernel_name, /*require_all=*/false);
+            bool any_crta_supplied = false;
+            for (const auto& handle : binding_handles) {
+                if (!handle.is_per_node && tensor_by_param.contains(handle.tensor_parameter_name)) {
+                    any_crta_supplied = true;
+                    break;
+                }
+            }
+            if (!any_crta_supplied) {
+                continue;  // none of this kernel's CRTA-resident bindings are being updated.
+            }
+            TT_FATAL(
+                !kernel->common_runtime_args().empty(),
+                "Program::update_program_run_args: kernel '{}' CRTA buffer not allocated; cannot patch tensor "
+                "bindings. Call Program::set_program_run_args at least once before a partial update.",
+                kernel_name);
+            RuntimeArgsData& crta = kernel->common_runtime_args_data();
+            for (const auto& handle : binding_handles) {
+                if (handle.is_per_node) {
+                    continue;  // Patched above.
+                }
+                const MeshTensor* tensor = FindBoundTensor(handle, tensor_by_param, /*required=*/false);
+                if (tensor == nullptr) {
+                    continue;  // Tensor omitted → binding slot retained.
+                }
+                uint32_t* dst = crta.data() + (handle.addr_crta_offset / sizeof(uint32_t));
+                EmitBindingCrtaValues(handle, *tensor, [&dst](uint32_t w) { *dst++ = w; });
+            }
+        }
+
+        // Re-attach borrowed-memory DFBs for the supplied tensors (skip omitted ones).
+        AttachBorrowedDFBBuffers(program_impl, tensor_by_param, /*require_all=*/false);
+        for (const auto& [param_name, tensor] : tensor_by_param) {
+            program_impl.set_bound_tensor_footprint(param_name, tt_metal::detail::make_bound_tensor_footprint(*tensor));
+        }
+    }
+
+    // ---- GlobalSemaphore bindings: patch CRTA address slots for SUPPLIED GlobalSemaphores only ----
+    if (!params.global_semaphore_args.empty()) {
+        for (const auto& kernel_name : program_impl.get_registered_kernel_names()) {
+            std::shared_ptr<Kernel> kernel = program_impl.get_kernel_by_spec_name(kernel_name);
+            for (const auto& handle : kernel->global_semaphore_binding_handles()) {
+                const GlobalSemaphoreParamName param_name{handle.global_semaphore_parameter_name};
+                const auto arg = params.global_semaphore_args.get(param_name);
+                if (!arg.has_value()) {
+                    continue;
+                }
+                TT_FATAL(
+                    !kernel->common_runtime_args().empty(),
+                    "Program::update_program_run_args: kernel '{}' CRTA buffer not allocated; cannot patch "
+                    "GlobalSemaphore bindings. Call Program::set_program_run_args at least once before a partial "
+                    "update.",
+                    kernel_name);
+                kernel->common_runtime_args_data()[handle.addr_crta_word] =
+                    GlobalSemaphoreAddressWord(param_name, arg->get());
+            }
+        }
+    }
+
+    // ---- PrefetcherPipe args: omitted parameters keep their bound pipe; a supplied one is bound
+    //      (no-op when it is the already-bound object) ----
+    BindPrefetcherPipeArgs(program_impl, params.advanced_options.prefetcher_pipe_args);
+
+    // Install arena addresses after DFB, tensor, and pipe checks succeed.
+    BindSRAMArenaArgs(program_impl, params.advanced_options.sram_arena_args);
+    // Only once the update succeeded: a failed update must not drop per-device values it never replaced.
+    RecordPerDeviceRunArgDrops(program_impl, params);
+}
+
+ProgramRunArgs MergeProgramRunArgs(
+    ProgramRunArgs base, std::span<const ProgramRunArgs> rest, ValidationMode validation) {
+    for (const ProgramRunArgs& other : rest) {
+        for (const auto& [name, argument] : other.advanced_options.sram_arena_args) {
+            if (validation == ValidationMode::FULL) {
+                TT_FATAL(
+                    !base.advanced_options.sram_arena_args.contains(name),
+                    "MergeProgramRunArgs: SRAMArenaParameter '{}' is specified in more than one ProgramRunArgs.",
+                    name);
+            }
+            base.advanced_options.sram_arena_args.insert({name, argument});
+        }
+
+        // Tensor args: union by TensorParameter name (disjoint).
+        for (const auto& [name, arg] : other.tensor_args) {
+            if (validation == ValidationMode::FULL) {
+                TT_FATAL(
+                    !base.tensor_args.contains(name),
+                    "MergeProgramRunArgs: TensorParameter '{}' is specified in more than one ProgramRunArgs.",
+                    name);
+            }
+            // Table::operator[] default-constructs its value; TensorArgument (a variant over a
+            // reference_wrapper) is not default-constructible, so insert the pair directly. After
+            // the disjoint check the key is absent, so insert takes effect (under ValidationMode::SKIP a
+            // collision keeps base's existing entry).
+            base.tensor_args.insert({name, arg});
+        }
+
+        // GlobalSemaphore args: union by parameter name (disjoint). Same insert-not-[] reasoning as
+        // tensor_args: reference_wrapper is not default-constructible.
+        for (const auto& [name, arg] : other.global_semaphore_args) {
+            if (validation == ValidationMode::FULL) {
+                TT_FATAL(
+                    !base.global_semaphore_args.contains(name),
+                    "MergeProgramRunArgs: GlobalSemaphoreParameter '{}' is specified in more than one ProgramRunArgs.",
+                    name);
+            }
+            base.global_semaphore_args.insert({name, arg});
+        }
+
+        // PrefetcherPipe args: union by parameter name (disjoint). Same insert-not-[] reasoning as
+        // tensor_args: reference_wrapper is not default-constructible.
+        for (const auto& [name, arg] : other.advanced_options.prefetcher_pipe_args) {
+            if (validation == ValidationMode::FULL) {
+                TT_FATAL(
+                    !base.advanced_options.prefetcher_pipe_args.contains(name),
+                    "MergeProgramRunArgs: PrefetcherPipeParameter '{}' is specified in more than one ProgramRunArgs.",
+                    name);
+            }
+            base.advanced_options.prefetcher_pipe_args.insert({name, arg});
+        }
+
+        // DFB run overrides: union by DFB name (disjoint).
+        for (const auto& dfb : other.dfb_run_overrides) {
+            if (validation == ValidationMode::FULL) {
+                for (const auto& existing : base.dfb_run_overrides) {
+                    TT_FATAL(
+                        existing.dfb != dfb.dfb,
+                        "MergeProgramRunArgs: DFB '{}' overrides are specified in more than one ProgramRunArgs.",
+                        dfb.dfb);
+                }
+            }
+            base.dfb_run_overrides.push_back(dfb);
+        }
+
+        // Kernel run args: union per kernel (a kernel may appear in multiple inputs as long as
+        // the actual args it carries are disjoint — e.g. one input carries some of the kernel's
+        // args, another input the rest).
+        for (const auto& kra : other.kernel_run_args) {
+            ProgramRunArgs::KernelRunArgs* dst = nullptr;
+            for (auto& existing : base.kernel_run_args) {
+                if (existing.kernel == kra.kernel) {
+                    dst = &existing;
+                    break;
+                }
+            }
+            if (dst == nullptr) {
+                base.kernel_run_args.push_back(kra);
+                continue;
+            }
+            MergeKernelRunArgsInto(*dst, kra, validation);
+        }
+    }
+    return base;
+}
+
+ProgramRunArgs MergeProgramRunArgs(ProgramRunArgs base, std::span<const ProgramRunArgs> rest, bool skip_validation) {
+    return MergeProgramRunArgs(std::move(base), rest, skip_validation ? ValidationMode::SKIP : ValidationMode::FULL);
+}
+
+}  // namespace tt::tt_metal

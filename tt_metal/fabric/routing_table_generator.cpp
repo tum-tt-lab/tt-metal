@@ -1,0 +1,647 @@
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include <tt-metalium/experimental/fabric/routing_table_generator.hpp>
+
+#include <enchantum/enchantum.hpp>
+#include <algorithm>
+#include <limits>
+#include <memory>
+#include <ostream>
+#include <queue>
+#include <unordered_map>
+
+#include <tt_stl/assert.hpp>
+#include <tt-logger/tt-logger.hpp>
+#include <tt-metalium/experimental/fabric/topology_mapper.hpp>
+
+#include "axis_route_topology.hpp"
+
+namespace tt::tt_fabric {
+
+RoutingTableGenerator::RoutingTableGenerator(const TopologyMapper& topology_mapper) :
+    topology_mapper_(topology_mapper) {
+    // Use IntraMeshConnectivity to size all variables
+    const auto& mesh_graph = topology_mapper_.get_mesh_graph();
+    const auto& intra_mesh_connectivity = mesh_graph.get_intra_mesh_connectivity();
+    const auto& inter_mesh_connectivity = mesh_graph.get_inter_mesh_connectivity();
+    this->intra_mesh_table_.resize(intra_mesh_connectivity.size());
+    this->inter_mesh_table_.resize(intra_mesh_connectivity.size());
+    this->exit_node_lut_.resize(intra_mesh_connectivity.size());
+    for (std::uint32_t mesh_id_val = 0; mesh_id_val < intra_mesh_connectivity.size(); mesh_id_val++) {
+        this->intra_mesh_table_[mesh_id_val].resize(intra_mesh_connectivity[mesh_id_val].size());
+        this->inter_mesh_table_[mesh_id_val].resize(intra_mesh_connectivity[mesh_id_val].size());
+        this->exit_node_lut_[mesh_id_val].resize(intra_mesh_connectivity[mesh_id_val].size());
+        for (auto& devices_in_mesh : this->intra_mesh_table_[mesh_id_val]) {
+            // intra_mesh_table[mesh_id][chip_id] holds a vector of ports to route to other chips in the mesh
+            devices_in_mesh.resize(intra_mesh_connectivity[mesh_id_val].size());
+        }
+        for (auto& devices_in_mesh : this->inter_mesh_table_[mesh_id_val]) {
+            // inter_mesh_table[mesh_id][chip_id] holds a vector of ports to route to other meshes
+            devices_in_mesh.resize(intra_mesh_connectivity.size());
+        }
+        for (auto& devices_in_mesh : this->exit_node_lut_[mesh_id_val]) {
+            // exit_node_lut_[mesh_id][chip_id] holds exit chip per destination mesh
+            devices_in_mesh.resize(intra_mesh_connectivity.size());
+        }
+    }
+    // Recover the express-link ring decomposition per mesh; null where a mesh declares none, which
+    // leaves that mesh on the base dimension-order policy. orthogonal_rings_ is the ordinary ring on the
+    // other axis, populated only for express meshes.
+    this->express_rings_.resize(intra_mesh_connectivity.size());
+    this->orthogonal_rings_.resize(intra_mesh_connectivity.size());
+    for (std::uint32_t mesh_id_val = 0; mesh_id_val < intra_mesh_connectivity.size(); mesh_id_val++) {
+        auto rings = derive_express_ring_topology(mesh_graph, MeshId{mesh_id_val});
+        if (!rings.has_value()) {
+            continue;  // no express links: the mesh keeps the base policy and needs no ring state
+        }
+        this->express_rings_[mesh_id_val] = std::make_unique<AxisRouteTopology>(std::move(*rings));
+        const int express_axis = this->express_rings_[mesh_id_val]->axis_dim;
+        auto orthogonal_rings = derive_ordinary_ring_topology(mesh_graph, MeshId{mesh_id_val}, 1 - express_axis);
+        if (orthogonal_rings.has_value()) {
+            TT_FATAL(
+                orthogonal_rings->axis_dim != express_axis,
+                "Mesh {}: orthogonal ring derived on the express axis {}",
+                mesh_id_val,
+                express_axis);
+            this->orthogonal_rings_[mesh_id_val] = std::make_unique<AxisRouteTopology>(std::move(*orthogonal_rings));
+        }
+    }
+
+    // Per-axis topologies, for EVERY mesh and BOTH axes. This is what the 2D action-map multicast
+    // encoder needs: it builds a reverse tree per axis, so a missing topology on either one silently
+    // produces an empty map rather than an error.
+    //
+    // orthogonal_rings_ above cannot serve that purpose -- it is only populated for express meshes, and only
+    // when the X dimension closes. Deriving it unconditionally is not safe either, because
+    // derive_ordinary_ring_topology() is fatal when a line on the axis lacks an ordinary edge while
+    // axis_wraps() only inspects line 0. derive_axis_topology() resolves both: it falls back to the
+    // plain line, so an axis that does not close (or does not close uniformly) still gets a usable
+    // topology instead of aborting init.
+    this->axis_topologies_.resize(intra_mesh_connectivity.size());
+    for (std::uint32_t mesh_id_val = 0; mesh_id_val < intra_mesh_connectivity.size(); mesh_id_val++) {
+        for (int axis = 0; axis < 2; axis++) {
+            this->axis_topologies_[mesh_id_val][axis] =
+                std::make_unique<AxisRouteTopology>(derive_axis_topology(mesh_graph, MeshId{mesh_id_val}, axis));
+        }
+    }
+
+    // Generate the intra mesh routing table
+    this->generate_intramesh_routing_table(intra_mesh_connectivity);
+
+    // Generate the inter mesh routing table
+    this->generate_intermesh_routing_table(inter_mesh_connectivity, intra_mesh_connectivity);
+}
+
+RoutingTableGenerator::~RoutingTableGenerator() = default;
+
+const AxisRouteTopology* RoutingTableGenerator::get_express_rings(MeshId mesh_id) const {
+    return *mesh_id < this->express_rings_.size() ? this->express_rings_[*mesh_id].get() : nullptr;
+}
+
+const AxisRouteTopology* RoutingTableGenerator::get_orthogonal_rings(MeshId mesh_id) const {
+    return *mesh_id < this->orthogonal_rings_.size() ? this->orthogonal_rings_[*mesh_id].get() : nullptr;
+}
+
+const AxisRouteTopology* RoutingTableGenerator::get_axis_topology(MeshId mesh_id, int axis) const {
+    if (*mesh_id >= this->axis_topologies_.size() || axis < 0 || axis > 1) {
+        return nullptr;
+    }
+    return this->axis_topologies_[*mesh_id][axis].get();
+}
+
+void RoutingTableGenerator::generate_intramesh_routing_table(const IntraMeshConnectivity& intra_mesh_connectivity) {
+    const auto get_shorter_direction_on_row_or_col = [&](std::uint32_t mesh_id_val,
+                                                         std::uint32_t src_chip_id,
+                                                         std::uint32_t dst_chip_id,
+                                                         RoutingDirection a,
+                                                         RoutingDirection b,
+                                                         bool prefer_b_on_tie) -> RoutingDirection {
+        // Loop through intra_mesh_connectivity starting with a or b direction and return direction that matches
+        // dst_chip_id first. On a tie, returns b if prefer_b_on_tie, else a
+        std::uint32_t curr_a = src_chip_id, curr_b = src_chip_id;
+        bool a_valid = true, b_valid = true;
+        while (a_valid or b_valid) {
+            const bool a_reaches_dst = intra_mesh_connectivity[mesh_id_val][curr_a].contains(dst_chip_id) and
+                                       intra_mesh_connectivity[mesh_id_val][curr_a].at(dst_chip_id).port_direction == a;
+            const bool b_reaches_dst = intra_mesh_connectivity[mesh_id_val][curr_b].contains(dst_chip_id) and
+                                       intra_mesh_connectivity[mesh_id_val][curr_b].at(dst_chip_id).port_direction == b;
+            if (a_reaches_dst and b_reaches_dst) {
+                return prefer_b_on_tie ? b : a;
+            }
+            if (a_reaches_dst) {
+                return a;
+            }
+            if (b_reaches_dst) {
+                return b;
+            }
+            a_valid = false;
+            b_valid = false;
+            for (const auto& [next_chip_id, edge] : intra_mesh_connectivity[mesh_id_val][curr_a]) {
+                if (edge.port_direction == a) {
+                    curr_a = next_chip_id;
+                    a_valid = true;
+                    break;
+                }
+            }
+            for (const auto& [next_chip_id, edge] : intra_mesh_connectivity[mesh_id_val][curr_b]) {
+                if (edge.port_direction == b) {
+                    curr_b = next_chip_id;
+                    b_valid = true;
+                    break;
+                }
+            }
+        }
+        TT_ASSERT(
+            false,
+            "No valid direction found for src_chip_id {} and dst_chip_id {} in mesh_id {}. "
+            "This should not happen, check the intra_mesh_connectivity.",
+            src_chip_id,
+            dst_chip_id,
+            mesh_id_val);
+        return RoutingDirection::NONE;  // This line should never be reached
+    };
+    // Split ring ties by the source's position along the axis (even -> N/E, odd -> S/W) to balance both directions.
+    // Must depend only on that position: the 2D action vectors are built from one row/column per axis.
+    const auto prefer_negative_direction_on_tie = [](std::uint32_t position_on_axis) {
+        return position_on_axis % 2 == 1;
+    };
+    const auto& mesh_graph = topology_mapper_.get_mesh_graph();
+    for (std::uint32_t mesh_id_val = 0; mesh_id_val < this->intra_mesh_table_.size(); mesh_id_val++) {
+        MeshId mesh_id{mesh_id_val};
+        for (ChipId src_chip_id = 0; src_chip_id < this->intra_mesh_table_[mesh_id_val].size(); src_chip_id++) {
+            for (ChipId dst_chip_id = 0; dst_chip_id < this->intra_mesh_table_[mesh_id_val].size(); dst_chip_id++) {
+                auto src_mesh_coord = mesh_graph.chip_to_coordinate(mesh_id, src_chip_id);
+                auto dst_mesh_coord = mesh_graph.chip_to_coordinate(mesh_id, dst_chip_id);
+                const auto route_on_axis = [&](int axis,
+                                               ChipId target_chip_id,
+                                               RoutingDirection forward,
+                                               RoutingDirection reverse) {
+                    const auto* rings = this->express_rings_[mesh_id_val].get();
+                    if (rings != nullptr && rings->axis_dim == axis) {
+                        const int next_coord = rings->next_row(
+                            static_cast<int>(src_mesh_coord[axis]), static_cast<int>(dst_mesh_coord[axis]));
+                        auto next_mesh_coord = src_mesh_coord;
+                        next_mesh_coord[axis] = static_cast<std::uint32_t>(next_coord);
+                        const auto next_chip = mesh_graph.coordinate_to_chip(mesh_id, next_mesh_coord);
+                        return intra_mesh_connectivity[mesh_id_val][src_chip_id].at(next_chip).port_direction;
+                    }
+                    return get_shorter_direction_on_row_or_col(
+                        mesh_id_val,
+                        src_chip_id,
+                        target_chip_id,
+                        forward,
+                        reverse,
+                        prefer_negative_direction_on_tie(src_mesh_coord[axis]));
+                };
+                // Preserve dimension order: dim 0 (N/S) completes before dim 1 (E/W).
+                if (src_mesh_coord[0] != dst_mesh_coord[0]) {
+                    // Move North or South
+                    MeshCoordinate target_coord_on_column(dst_mesh_coord[0], src_mesh_coord[1]);
+                    auto target_chip_id = mesh_graph.coordinate_to_chip(mesh_id, target_coord_on_column);
+                    this->intra_mesh_table_[*mesh_id][src_chip_id][dst_chip_id] = route_on_axis(
+                        0, target_chip_id, RoutingDirection::N, RoutingDirection::S);
+                    // TODO: today we are not updating the weight of the edge, should we use weight to balance
+                    //  routing traffic?
+                    //  intra_mesh_connectivity[mesh_id][src_chip_id][next_chip_id].weight += 1;
+                } else if (src_mesh_coord[1] != dst_mesh_coord[1]) {
+                    auto direction =
+                        route_on_axis(1, dst_chip_id, RoutingDirection::E, RoutingDirection::W);
+                    this->intra_mesh_table_[*mesh_id][src_chip_id][dst_chip_id] = direction;
+                    // intra_mesh_connectivity[mesh_id][src_chip_id][next_chip_id].weight += 1;
+                } else {
+                    // No movement
+                    // TODO: what value do we put for this entry? If we pack table entries to 4 bits
+                    // any number is a valid port id. Do we assume FW will never try to access table entry to itself?
+                    this->intra_mesh_table_[*mesh_id][src_chip_id][dst_chip_id] = RoutingDirection::C;
+                }
+            }
+        }
+        this->validate_express_ring_routes(mesh_id_val, intra_mesh_connectivity);
+    }
+}
+
+void RoutingTableGenerator::validate_express_ring_routes(
+    std::uint32_t mesh_id_val, const IntraMeshConnectivity& intra_mesh_connectivity) {
+    const auto* rings = this->express_rings_[mesh_id_val].get();
+    if (rings == nullptr) {
+        return;
+    }
+    const auto& mesh_graph = topology_mapper_.get_mesh_graph();
+    const MeshId mesh_id{mesh_id_val};
+    const auto& conn = intra_mesh_connectivity[mesh_id_val];
+    const auto& table = this->intra_mesh_table_[mesh_id_val];
+    const int num_chips = static_cast<int>(conn.size());
+
+    const auto row_of = [&](int chip) {
+        return static_cast<int>(mesh_graph.chip_to_coordinate(mesh_id, chip)[rings->axis_dim]);
+    };
+    const auto neighbor = [&](int chip, RoutingDirection dir) {
+        for (const auto& [peer, edge] : conn[chip]) {
+            if (edge.port_direction == dir) {
+                return static_cast<int>(peer);
+            }
+        }
+        return -1;
+    };
+    const auto hop_axis = [&](RoutingDirection dir) {
+        if (dir == RoutingDirection::N || dir == RoutingDirection::S) {
+            return 0;
+        }
+        if (dir == RoutingDirection::E || dir == RoutingDirection::W) {
+            return 1;
+        }
+        return dir == RoutingDirection::Z ? rings->axis_dim : -1;
+    };
+    // An axis hop is legal only as a ring edge, a crossover, or a leaf-run/anchor edge.
+    const auto axis_hop_permitted = [&](int from_row, int to_row) {
+        if (rings->is_leaf(from_row) || rings->is_leaf(to_row)) {
+            return true;
+        }
+        if (rings->domain_of[from_row] == rings->domain_of[to_row]) {
+            return rings->ring_distance(rings->domain_of[from_row], from_row, to_row) == 1;
+        }
+        return std::any_of(rings->crossovers.begin(), rings->crossovers.end(), [&](const auto& crossover) {
+            return (crossover.first == from_row && crossover.second == to_row) ||
+                   (crossover.first == to_row && crossover.second == from_row);
+        });
+    };
+
+    std::vector<bool> visited(num_chips, false);
+    for (int src = 0; src < num_chips; src++) {
+        for (int dst = 0; dst < num_chips; dst++) {
+            if (src == dst) {
+                continue;
+            }
+            std::fill(visited.begin(), visited.end(), false);
+            int cur = src;
+            int hops = 0;
+            int routing_phase = 0;
+            bool axis_landed = false;
+            while (cur != dst) {
+                TT_FATAL(!visited[cur], "Mesh M{} route {}->{} revisits chip {}", mesh_id_val, src, dst, cur);
+                visited[cur] = true;
+                const auto dir = table[cur][dst];
+                TT_FATAL(
+                    dir != RoutingDirection::NONE && dir != RoutingDirection::C,
+                    "Mesh M{} route {}->{} has no next hop at chip {}",
+                    mesh_id_val,
+                    src,
+                    dst,
+                    cur);
+                const int next = neighbor(cur, dir);
+                TT_FATAL(
+                    next >= 0,
+                    "Mesh M{} route {}->{} needs a neighbor at chip {} that does not exist",
+                    mesh_id_val,
+                    src,
+                    dst,
+                    cur);
+                const int current_axis = hop_axis(dir);
+                TT_FATAL(
+                    current_axis >= 0,
+                    "Mesh M{} route {}->{} has invalid direction at chip {}",
+                    mesh_id_val,
+                    src,
+                    dst,
+                    cur);
+                TT_FATAL(
+                    current_axis >= routing_phase,
+                    "Mesh M{} route {}->{} returns from dim {} to dim {}",
+                    mesh_id_val,
+                    src,
+                    dst,
+                    routing_phase,
+                    current_axis);
+                routing_phase = current_axis;
+                if (current_axis == rings->axis_dim) {
+                    TT_FATAL(
+                        !axis_landed,
+                        "Mesh M{} route {}->{} continues on the express axis after a terminal landing",
+                        mesh_id_val,
+                        src,
+                        dst);
+                    const int from_row = row_of(cur);
+                    const int to_row = row_of(next);
+                    if (cur != src) {
+                        // A leaf may be passed through only while egressing the source's own run or
+                        // ingressing the destination's -- each toward the nearer anchor, so the run is
+                        // never crossed end to end. A leaf belonging to neither run is a real detour.
+                        const bool in_src_run = rings->leaf_run_of[from_row] == rings->leaf_run_of[row_of(src)];
+                        const bool in_dst_run = rings->leaf_run_of[from_row] == rings->leaf_run_of[row_of(dst)];
+                        TT_FATAL(
+                            !rings->is_leaf(from_row) || in_src_run || in_dst_run,
+                            "Mesh M{} route {}->{} transits leaf row {}",
+                            mesh_id_val,
+                            src,
+                            dst,
+                            from_row);
+                    }
+                    TT_FATAL(
+                        axis_hop_permitted(from_row, to_row),
+                        "Mesh M{} route {}->{} uses a forbidden axis hop, row {} to {}",
+                        mesh_id_val,
+                        src,
+                        dst,
+                        from_row,
+                        to_row);
+                    axis_landed = !rings->is_leaf(from_row) && !rings->is_leaf(to_row) &&
+                                  rings->domain_of[from_row] != rings->domain_of[to_row] &&
+                                  rings->domain_of[to_row] == rings->continue_src_domain;
+                }
+                cur = next;
+                TT_FATAL(++hops <= num_chips, "Mesh M{} route {}->{} did not converge", mesh_id_val, src, dst);
+            }
+        }
+    }
+
+    // Every line along an axis must route identically, so one relation covers all of them.
+    const auto shape = mesh_graph.get_mesh_shape(mesh_id);
+    for (int dim = 0; dim < 2; dim++) {
+        const int along_len = static_cast<int>(shape[dim]);
+        const int ortho_len = static_cast<int>(shape[1 - dim]);
+        const auto chip_at = [&](int along, int ortho) {
+            const auto coord = dim == 0 ? MeshCoordinate(static_cast<std::uint32_t>(along), ortho)
+                                        : MeshCoordinate(ortho, static_cast<std::uint32_t>(along));
+            return static_cast<int>(mesh_graph.coordinate_to_chip(mesh_id, coord));
+        };
+        for (int a = 0; a < along_len; a++) {
+            for (int b = 0; b < along_len; b++) {
+                if (a == b) {
+                    continue;
+                }
+                const auto expected = table[chip_at(a, 0)][chip_at(b, 0)];
+                for (int ortho = 1; ortho < ortho_len; ortho++) {
+                    TT_FATAL(
+                        table[chip_at(a, ortho)][chip_at(b, ortho)] == expected,
+                        "Mesh M{} dim {} line {} routes {} to {} differently than line 0",
+                        mesh_id_val,
+                        dim,
+                        ortho,
+                        a,
+                        b);
+                }
+            }
+        }
+    }
+
+    // No dependency cycle may form outside the selected protected rings.
+    const auto cyclic = rings->cyclic_non_ring_hops();
+    TT_FATAL(
+        cyclic.empty(),
+        "Mesh M{} has a dependency cycle through non-ring hop {}->{} (and {} more); routing would deadlock",
+        mesh_id_val,
+        cyclic.empty() ? -1 : cyclic.front().first,
+        cyclic.empty() ? -1 : cyclic.front().second,
+        cyclic.empty() ? 0 : static_cast<int>(cyclic.size() - 1));
+}
+
+// Returns first hop to reach each destination mesh from source mesh.
+// first_hops[dst_mesh] = vector of (exit_chip_in_source_mesh, immediate_next_mesh) pairs
+// This is more memory efficient than storing full paths (exponential space complexity) since we only need the first hop.
+std::vector<std::vector<std::pair<ChipId, MeshId>>> RoutingTableGenerator::get_first_hops_to_all_meshes(
+    MeshId src, const InterMeshConnectivity& inter_mesh_connectivity) const {
+    std::uint32_t num_meshes = inter_mesh_connectivity.size();
+    std::vector<std::uint8_t> visited(num_meshes, false);
+
+    // first_hops[target_mesh_id] = vector of (exit_chip, next_mesh) pairs representing first hop options
+    std::vector<std::vector<std::pair<ChipId, MeshId>>> first_hops(num_meshes);
+
+    std::vector<std::uint32_t> dist(num_meshes, std::numeric_limits<std::uint32_t>::max());
+    dist[*src] = 0;
+
+    std::queue<MeshId> q;
+    q.push(src);
+    visited[*src] = true;
+
+    // BFS to find shortest paths
+    while (!q.empty()) {
+        MeshId current_mesh_id = q.front();
+        q.pop();
+
+        for (ChipId chip_in_mesh = 0; chip_in_mesh < inter_mesh_connectivity[*current_mesh_id].size(); chip_in_mesh++) {
+            for (const auto& [connected_mesh_id, edge] : inter_mesh_connectivity[*current_mesh_id][chip_in_mesh]) {
+                if (!visited[*connected_mesh_id]) {
+                    q.push(connected_mesh_id);
+                    visited[*connected_mesh_id] = true;
+                }
+
+                std::uint32_t new_dist = dist[*current_mesh_id] + 1;
+                if (dist[*connected_mesh_id] > new_dist) {
+                    // Found shorter path - update distance and first hops
+                    dist[*connected_mesh_id] = new_dist;
+                    if (current_mesh_id == src) {
+                        // Direct neighbor: first hop is (chip_in_source, connected_mesh)
+                        first_hops[*connected_mesh_id] = {{chip_in_mesh, connected_mesh_id}};
+                    } else {
+                        // Multi-hop: inherit first hops from intermediate mesh
+                        first_hops[*connected_mesh_id] = first_hops[*current_mesh_id];
+                    }
+                } else if (dist[*connected_mesh_id] == new_dist) {
+                    // Same distance - add alternative first hops
+                    if (current_mesh_id == src) {
+                        first_hops[*connected_mesh_id].push_back({chip_in_mesh, connected_mesh_id});
+                    } else {
+                        // Only inherit from each intermediate mesh once.
+                        // Multiple chips in the same intermediate mesh connecting to the same destination
+                        // would give identical first hops - avoid adding duplicates.
+                        // Check if we've already inherited from current_mesh by checking if its first hop
+                        // is already present in connected_mesh's first hops.
+                        bool already_inherited = false;
+                        if (!first_hops[*current_mesh_id].empty() && !first_hops[*connected_mesh_id].empty()) {
+                            const auto& hop_to_check = first_hops[*current_mesh_id][0];
+                            already_inherited = std::find(
+                                                    first_hops[*connected_mesh_id].begin(),
+                                                    first_hops[*connected_mesh_id].end(),
+                                                    hop_to_check) != first_hops[*connected_mesh_id].end();
+                        }
+                        if (!already_inherited) {
+                            for (const auto& hop : first_hops[*current_mesh_id]) {
+                                first_hops[*connected_mesh_id].push_back(hop);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return first_hops;
+}
+
+void RoutingTableGenerator::generate_intermesh_routing_table(
+    const InterMeshConnectivity& inter_mesh_connectivity, const IntraMeshConnectivity& /*intra_mesh_connectivity*/) {
+    const auto& mesh_graph = topology_mapper_.get_mesh_graph();
+
+    for (std::uint32_t src_mesh_id_val = 0; src_mesh_id_val < this->inter_mesh_table_.size(); src_mesh_id_val++) {
+        MeshId src_mesh_id{src_mesh_id_val};
+        auto first_hops = get_first_hops_to_all_meshes(src_mesh_id, inter_mesh_connectivity);
+        MeshShape mesh_shape = mesh_graph.get_mesh_shape(src_mesh_id);
+        std::uint32_t ew_size = mesh_shape[1];
+        for (ChipId src_chip_id = 0; src_chip_id < this->inter_mesh_table_[src_mesh_id_val].size(); src_chip_id++) {
+            for (std::uint32_t dst_mesh_id_val = 0; dst_mesh_id_val < this->inter_mesh_table_.size();
+                 dst_mesh_id_val++) {
+                MeshId dst_mesh_id{dst_mesh_id_val};
+                if (dst_mesh_id == src_mesh_id) {
+                    // inter mesh table entry from mesh to itself
+                    this->inter_mesh_table_[src_mesh_id_val][src_chip_id][dst_mesh_id_val] = RoutingDirection::C;
+                    this->exit_node_lut_[src_mesh_id_val][src_chip_id][dst_mesh_id_val] = src_chip_id;
+                    continue;
+                }
+                auto& candidate_first_hops = first_hops[dst_mesh_id_val];
+                std::uint32_t min_load = std::numeric_limits<std::uint32_t>::max();
+                std::uint32_t min_distance = std::numeric_limits<std::uint32_t>::max();
+                if (candidate_first_hops.empty()) {
+                    this->inter_mesh_table_[src_mesh_id_val][src_chip_id][dst_mesh_id_val] = RoutingDirection::NONE;
+                    this->exit_node_lut_[src_mesh_id_val][src_chip_id][dst_mesh_id_val] =
+                        std::numeric_limits<ChipId>::max();
+                    continue;
+                }
+                // Initialize with first candidate
+                ChipId exit_chip_id = candidate_first_hops[0].first;
+                MeshId next_mesh_id = candidate_first_hops[0].second;
+                for (const auto& hop : candidate_first_hops) {
+                    ChipId candidate_exit_chip_id = hop.first;
+                    MeshId candidate_next_mesh_id = hop.second;
+                    if (candidate_exit_chip_id == src_chip_id) {
+                        // optimization for latency, always use src chip if it is an exit chip to next mesh, regardless
+                        // of load on the edge
+                        exit_chip_id = candidate_exit_chip_id;
+                        next_mesh_id = candidate_next_mesh_id;
+                        break;
+                    }
+                    // TODO: Ideally this should take into account the shortest path through all of the meshes to get to
+                    // the target mesh This is a simple implementation that only considers the shortest path to the next
+                    // mesh
+                    std::uint32_t ew_distance = std::abs(
+                        static_cast<std::int32_t>(src_chip_id % ew_size) -
+                        static_cast<std::int32_t>(candidate_exit_chip_id % ew_size));
+                    std::uint32_t ns_distance = std::abs(
+                        static_cast<std::int32_t>(src_chip_id / ew_size) -
+                        static_cast<std::int32_t>(candidate_exit_chip_id / ew_size));
+                    std::uint32_t distance = ew_distance + ns_distance;
+                    if (distance < min_distance) {
+                        // optimization for latency, always use the shortest path to next mesh, regardless of load on
+                        // the edge
+                        exit_chip_id = candidate_exit_chip_id;
+                        next_mesh_id = candidate_next_mesh_id;
+                        min_distance = distance;
+                    } else if (distance == min_distance) {
+                        const auto& edge =
+                            inter_mesh_connectivity[*src_mesh_id][candidate_exit_chip_id].at(candidate_next_mesh_id);
+                        if (edge.weight < min_load) {
+                            min_load = edge.weight;
+                            exit_chip_id = candidate_exit_chip_id;
+                            next_mesh_id = candidate_next_mesh_id;
+                        }
+                    }
+                }
+
+                if (exit_chip_id == src_chip_id) {
+                    // If src is already exit chip, use port directions to next mesh
+                    this->inter_mesh_table_[src_mesh_id_val][src_chip_id][dst_mesh_id_val] =
+                        inter_mesh_connectivity[*src_mesh_id][src_chip_id].at(next_mesh_id).port_direction;
+                    // TODO: today we are not updating the weight of the edge, should we use weight to balance
+                    //  routing traffic?
+                    //  inter_mesh_connectivity[src_mesh_id][src_chip_id][next_mesh_id].weight += 1;
+                } else {
+                    // Use direction to exit chip from the intermesh routing table
+                    this->inter_mesh_table_[src_mesh_id_val][src_chip_id][dst_mesh_id_val] =
+                        this->intra_mesh_table_[src_mesh_id_val][src_chip_id][exit_chip_id];
+                    // Update weight for exit chip to next mesh and src chip to exit chip
+                    // inter_mesh_connectivity[src_mesh_id][exit_chip_id][next_mesh_id].weight += 1;
+                    // for (auto& edge: intra_mesh_connectivity[src_mesh_id][src_chip_id]) {
+                    //   if (edge.second.port_direction ==
+                    //   this->inter_mesh_table_[src_mesh_id][src_chip_id][dst_mesh_id]) {
+                    //       edge.second.weight += 1;
+                    //       break;
+                    //    }
+                    //  }
+                }
+                this->exit_node_lut_[src_mesh_id_val][src_chip_id][dst_mesh_id_val] = exit_chip_id;
+                mesh_to_exit_nodes_[dst_mesh_id].push_back(FabricNodeId(MeshId{src_mesh_id}, exit_chip_id));
+            }
+        }
+    }
+
+    // Deduplicate mesh_to_exit_nodes_ - many chips share the same exit chip
+    for (auto& [mesh_id, exit_nodes] : mesh_to_exit_nodes_) {
+        std::sort(exit_nodes.begin(), exit_nodes.end(), [](const FabricNodeId& a, const FabricNodeId& b) {
+            if (a.mesh_id != b.mesh_id) {
+                return *a.mesh_id < *b.mesh_id;
+            }
+            return a.chip_id < b.chip_id;
+        });
+        exit_nodes.erase(std::unique(exit_nodes.begin(), exit_nodes.end()), exit_nodes.end());
+    }
+}
+
+void RoutingTableGenerator::load_intermesh_connections(const AnnotatedIntermeshConnections& intermesh_connections) {
+    const auto& mesh_graph = topology_mapper_.get_mesh_graph();
+    const_cast<MeshGraph&>(mesh_graph).load_intermesh_connections(intermesh_connections);
+    this->generate_intermesh_routing_table(
+        mesh_graph.get_inter_mesh_connectivity(), mesh_graph.get_intra_mesh_connectivity());
+}
+
+void RoutingTableGenerator::print_routing_tables() const {
+    std::stringstream ss;
+    ss << "Routing Table Generator: IntraMesh Routing Tables" << std::endl;
+    for (std::uint32_t mesh_id_val = 0; mesh_id_val < this->intra_mesh_table_.size(); mesh_id_val++) {
+        ss << "M" << mesh_id_val << ":" << std::endl;
+        for (ChipId src_chip_id = 0; src_chip_id < this->intra_mesh_table_[mesh_id_val].size(); src_chip_id++) {
+            ss << "   D" << src_chip_id << ": ";
+            for (ChipId dst_chip_or_mesh_id = 0;
+                 dst_chip_or_mesh_id < this->intra_mesh_table_[mesh_id_val][src_chip_id].size();
+                 dst_chip_or_mesh_id++) {
+                auto direction = this->intra_mesh_table_[mesh_id_val][src_chip_id][dst_chip_or_mesh_id];
+                ss << dst_chip_or_mesh_id << "(" << enchantum::to_string(direction) << ") ";
+            }
+            ss << std::endl;
+        }
+    }
+    log_debug(tt::LogFabric, "{}", ss.str());
+    ss.str(std::string());
+    ss << "Routing Table Generator: InterMesh Routing Tables" << std::endl;
+    for (std::uint32_t mesh_id_val = 0; mesh_id_val < this->inter_mesh_table_.size(); mesh_id_val++) {
+        ss << "M" << mesh_id_val << ":" << std::endl;
+        for (ChipId src_chip_id = 0; src_chip_id < this->inter_mesh_table_[mesh_id_val].size(); src_chip_id++) {
+            ss << "   D" << src_chip_id << ": ";
+            for (ChipId dst_chip_or_mesh_id = 0;
+                 dst_chip_or_mesh_id < this->inter_mesh_table_[mesh_id_val][src_chip_id].size();
+                 dst_chip_or_mesh_id++) {
+                auto direction = this->inter_mesh_table_[mesh_id_val][src_chip_id][dst_chip_or_mesh_id];
+                ss << dst_chip_or_mesh_id << "(" << enchantum::to_string(direction) << ") ";
+            }
+            ss << std::endl;
+        }
+    }
+    log_debug(tt::LogFabric, "{}", ss.str());
+}
+
+const std::vector<FabricNodeId>& RoutingTableGenerator::get_exit_nodes_routing_to_mesh(MeshId mesh_id) const {
+    auto it = this->mesh_to_exit_nodes_.find(mesh_id);
+    if (it != this->mesh_to_exit_nodes_.end()) {
+        return it->second;
+    }
+    TT_THROW("No exit nodes found for mesh_id {}", *mesh_id);
+}
+
+FabricNodeId RoutingTableGenerator::get_exit_node_from_mesh_to_mesh(
+    MeshId src_mesh_id, ChipId src_chip_id, MeshId dst_mesh_id) const {
+    TT_FATAL(*src_mesh_id < this->exit_node_lut_.size(), "src_mesh_id out of range");
+    TT_FATAL(src_chip_id < this->exit_node_lut_[*src_mesh_id].size(), "src_chip_id out of range");
+    TT_FATAL(*dst_mesh_id < this->exit_node_lut_[*src_mesh_id][src_chip_id].size(), "dst_mesh_id out of range");
+
+    ChipId exit_chip = this->exit_node_lut_[*src_mesh_id][src_chip_id][*dst_mesh_id];
+    if (src_mesh_id == dst_mesh_id) {
+        return FabricNodeId(src_mesh_id, src_chip_id);
+    }
+    TT_FATAL(
+        exit_chip != std::numeric_limits<ChipId>::max(),
+        "No exit chip mapped from M{}D{} to M{}",
+        *src_mesh_id,
+        src_chip_id,
+        *dst_mesh_id);
+    return FabricNodeId(src_mesh_id, exit_chip);
+}
+}  // namespace tt::tt_fabric

@@ -1,0 +1,180 @@
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#if !defined(COMPILE_FOR_TRISC)
+#include "api/dataflow/noc.h"
+#endif
+#include "api/lock.h"
+#include "internal/local_mem/address_access.h"
+#include "internal/profiler/noc_debugging_metadata.hpp"
+#include "internal/profiler/noc_debugging_profiler.hpp"
+#include "internal/debug/sanitize.h"
+#include "internal/scoped_lock_cache_ops.h"
+
+/**
+ * @brief Provides a safe pointer to a structure of type T in the core's local memory
+ *
+ * Pointers are tagged with tt_l1_ptr to give the compiler latency information.
+ *
+ * Usage:
+ * - For non-volatile access with compiler optimizations: CoreLocalMem<uint32_t>
+ * - For volatile access (prevents optimization): CoreLocalMem<volatile uint32_t>
+ *
+ * Note: When using non-volatile types with NOC operations, you must ensure proper
+ * memory ordering with compiler barriers (e.g., asm volatile("" ::: "memory"))
+ * or L1 cache invalidation as needed.
+ */
+template <typename T, typename AddressType = uintptr_t>
+class CoreLocalMem {
+    friend struct local_mem::detail::AddressAccess;
+
+    using difference_type = std::ptrdiff_t;
+
+    static_assert(std::is_integral<AddressType>::value, "AddressType must be an integral type");
+    static_assert(std::is_unsigned<AddressType>::value, "AddressType must be unsigned for address representation");
+    static_assert(
+        sizeof(AddressType) >= sizeof(difference_type),
+        "AddressType must be large enough to hold difference_type for safe pointer arithmetic");
+
+public:
+    /** @brief Construct a CoreLocalMem instance from a raw address
+     *
+     * @param address The raw address of the structure in the core's local memory
+     */
+    CoreLocalMem(AddressType address) : address_(address) {}
+
+    /** @brief Construct a CoreLocalMem instance from a raw pointer
+     *
+     * @param ptr The pointer to the structure in the core's local memory
+     */
+    CoreLocalMem(T* ptr) : address_(reinterpret_cast<AddressType>(ptr)) {}
+
+    /** @brief Copy constructor
+     *
+     * @param other The other CoreLocalMem to copy from
+     */
+    CoreLocalMem(const CoreLocalMem&) = default;
+
+    /** @brief Copy assignment operator
+     *
+     * @param other The other CoreLocalMem to copy from
+     * @return A reference to the assigned CoreLocalMem
+     */
+    CoreLocalMem& operator=(const CoreLocalMem&) = default;
+
+    /** @brief Get the element at the given index
+     *
+     * @param index The index of the element to get
+     * @return Reference to the element at the given index
+     */
+    T& operator[](uint32_t index) const {
+        DEBUG_SANITIZE_L1_ADDR(address_ + index * sizeof(T), sizeof(T));
+        return unsafe_ptr()[index];
+    }
+
+    /** @brief Dereference operator to get reference to the value
+     *
+     * @return Reference to the value at the address
+     */
+    T& operator*() const {
+        DEBUG_SANITIZE_L1_ADDR(address_, sizeof(T));
+        return unsafe_ptr()[0];
+    }
+
+    /** @brief Arrow operator for struct/class member access
+     *
+     * @return Pointer to the structure in the core's local memory
+     */
+    tt_l1_ptr T* operator->() const {
+        DEBUG_SANITIZE_L1_ADDR(address_, sizeof(T));
+        return unsafe_ptr();
+    }
+
+    CoreLocalMem& operator+=(difference_type offset) {
+        address_ += offset * sizeof(T);
+        return *this;
+    }
+
+    CoreLocalMem& operator-=(difference_type offset) {
+        address_ -= offset * sizeof(T);
+        return *this;
+    }
+
+    CoreLocalMem& operator++() {
+        address_ += sizeof(T);
+        return *this;
+    }
+
+    CoreLocalMem& operator--() {
+        address_ -= sizeof(T);
+        return *this;
+    }
+
+    CoreLocalMem operator++(int) {
+        CoreLocalMem tmp = *this;
+        operator++();
+        return tmp;
+    }
+
+    CoreLocalMem operator--(int) {
+        CoreLocalMem tmp = *this;
+        operator--();
+        return tmp;
+    }
+
+    CoreLocalMem operator+(difference_type offset) const { return CoreLocalMem(address_ + offset * sizeof(T)); }
+
+    CoreLocalMem operator-(difference_type offset) const { return CoreLocalMem(address_ - offset * sizeof(T)); }
+
+    difference_type operator-(const CoreLocalMem& other) const {
+        difference_type byte_diff =
+            static_cast<difference_type>(address_) - static_cast<difference_type>(other.address_);
+        // Compiler automatically optimizes division to a shift if T is pow2
+        return byte_diff / sizeof(T);
+    }
+
+    /** @brief Lock num_elements elements, starting where this pointer points.
+     *
+     * To lock a chunk in the middle, offset the pointer: `(mem + 4).scoped_lock(8)` locks elements 4..11.
+     *
+     * @param num_elements Number of T elements to lock.
+     */
+    [[nodiscard]] auto scoped_lock(size_t num_elements) const {
+        uint32_t addr = static_cast<uint32_t>(address_);
+        uint32_t num_bytes = static_cast<uint32_t>(num_elements * sizeof(T));
+        scoped_lock_acquire_cache_ops(static_cast<uintptr_t>(addr), num_bytes);
+        RECORD_SCOPED_LOCK_EVENT(NocDebuggingEventMetadata::NocDebugEventType::MEM_LOCK, addr, num_bytes);
+        return Lock([addr, num_bytes]() {
+            scoped_lock_release_cache_ops(static_cast<uintptr_t>(addr), num_bytes);
+            RECORD_SCOPED_LOCK_EVENT(NocDebuggingEventMetadata::NocDebugEventType::MEM_UNLOCK, addr, num_bytes);
+        });
+    }
+
+    bool operator==(const CoreLocalMem& other) const { return address_ == other.address_; }
+    bool operator!=(const CoreLocalMem& other) const { return address_ != other.address_; }
+    bool operator<(const CoreLocalMem& other) const { return address_ < other.address_; }
+    bool operator<=(const CoreLocalMem& other) const { return address_ <= other.address_; }
+    bool operator>(const CoreLocalMem& other) const { return address_ > other.address_; }
+    bool operator>=(const CoreLocalMem& other) const { return address_ >= other.address_; }
+    explicit operator bool() const { return address_ != 0; }
+
+private:
+    tt_l1_ptr T* unsafe_ptr() const { return reinterpret_cast<tt_l1_ptr T*>(address_); }
+
+    AddressType address_;
+};
+
+// NoC endpoint traits (DM only): internal/local_mem/noc_traits.h. TRISC cores can use CoreLocalMem for L1 pointer
+// access, but only DM cores have NoC access.
+#if !defined(COMPILE_FOR_TRISC)
+#include "internal/local_mem/noc_traits.h"
+#ifdef ARCH_QUASAR
+#include "internal/tt-2xx/noc_zero_l1.inl"
+#else
+#include "internal/tt-1xx/noc_zero_l1.inl"
+#endif
+#include "internal/noc_zero_dram.inl"
+#endif  // !defined(COMPILE_FOR_TRISC)

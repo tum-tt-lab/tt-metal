@@ -1,0 +1,246 @@
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include "ttnn/operations/experimental/reduction/fast_reduce_nc/device/fast_reduce_nc_device_operation.hpp"
+
+#include "ttnn/device_operation.hpp"
+#include <tt-metalium/constants.hpp>
+#include "ttnn/operations/experimental/reduction/fast_reduce_nc/device/fast_reduce_nc_program_factory.hpp"
+#include "ttnn/operations/moreh/moreh_helper_functions.hpp"
+#include "ttnn/operations/reduction/reduce_op_validation.hpp"
+#include "ttnn/tensor/tensor.hpp"
+#include "ttnn/tensor/tensor_ops.hpp"
+
+namespace ttnn::experimental::prim {
+namespace {
+namespace CMAKE_UNIQUE_NAMESPACE {
+void validate_split_output(
+    const FastReduceNCDeviceOperation::operation_attributes_t& args,
+    const FastReduceNCDeviceOperation::tensor_args_t& tensor_args) {
+    const auto& input = tensor_args.input;
+    const auto& preallocated_output = tensor_args.preallocated_output;
+    if (args.split_output_width.has_value()) {
+        const auto split = args.split_output_width.value();
+        TT_FATAL(
+            input.logical_shape().rank() == 4 && args.dim >= 0 && args.dim < 2,
+            "Split reduction supports rank-4 input reduced along dim 0 or 1");
+        const auto width = input.logical_shape()[-1];
+        const auto tile_shape = input.tensor_spec().tile().get_tile_shape();
+        TT_FATAL(
+            input.layout() == Layout::TILE && tile_shape[0] == tt::constants::TILE_HEIGHT &&
+                tile_shape[1] == tt::constants::TILE_WIDTH,
+            "Split reduction requires standard TILE layout");
+        TT_FATAL(
+            input.memory_config().memory_layout() == TensorMemoryLayout::INTERLEAVED &&
+                args.output_mem_config.memory_layout() == TensorMemoryLayout::INTERLEAVED,
+            "Split reduction requires interleaved tensors");
+        TT_FATAL(!preallocated_output.has_value(), "Split reduction does not accept a preallocated output");
+        TT_FATAL(
+            width == input.padded_shape()[-1] && split > 0 && split < width && split % tt::constants::TILE_WIDTH == 0 &&
+                width % tt::constants::TILE_WIDTH == 0,
+            "Split reduction requires two nonempty tile-aligned channel regions");
+    }
+}
+}  // namespace CMAKE_UNIQUE_NAMESPACE
+}  // namespace
+
+void FastReduceNCDeviceOperation::validate_on_program_cache_miss(
+    const operation_attributes_t& args, const tensor_args_t& tensor_args) {
+    const auto& input = tensor_args.input;
+    const auto& preallocated_output = tensor_args.preallocated_output;
+
+    operations::check_tensor(
+        input, "FastReduceNC", "input", {DataType::BFLOAT16, DataType::BFLOAT8_B, DataType::FLOAT32, DataType::INT32});
+    if (preallocated_output.has_value()) {
+        operations::check_tensor(
+            preallocated_output.value(),
+            "FastReduceNC",
+            "output",
+            {DataType::BFLOAT16, DataType::BFLOAT8_B, DataType::FLOAT32, DataType::INT32});
+        TT_FATAL(
+            preallocated_output.value().logical_shape().rank() == input.logical_shape().rank(),
+            "FastReduceNC preallocated output rank {} must match input rank {}",
+            preallocated_output.value().logical_shape().rank(),
+            input.logical_shape().rank());
+    }
+
+    const bool is_int32 = input.dtype() == DataType::INT32;
+    if (is_int32 || args.use_sfpu_reduce) {
+        const auto arch = input.device()->arch();
+        TT_FATAL(
+            !args.use_sfpu_reduce || input.dtype() == DataType::FLOAT32,
+            "FastReduceNC use_sfpu_reduce requires FLOAT32 input, got {}",
+            input.dtype());
+        TT_FATAL(
+            !args.use_sfpu_reduce || arch != tt::ARCH::QUASAR,
+            "FastReduceNC accurate FLOAT32 accumulation is not supported on Quasar");
+        TT_FATAL(
+            std::get<2>(ttnn::get_compute_kernel_config_args(arch, args.compute_kernel_config)),
+            "FastReduceNC {} accumulation on the SFPU requires fp32_dest_acc_en",
+            input.dtype());
+        TT_FATAL(!args.split_output_width.has_value(), "Split reduction does not support SFPU accumulation");
+    }
+    if (is_int32) {
+        const auto output_dtype = preallocated_output.has_value() ? preallocated_output->dtype()
+                                                                  : args.output_dtype.value_or(DataType::INT32);
+        TT_FATAL(
+            output_dtype == DataType::INT32, "FastReduceNC INT32 input requires an INT32 output, got {}", output_dtype);
+        TT_FATAL(
+            args.post_mul_scaler == 1.0f,
+            "FastReduceNC INT32 input does not support post_mul_scaler, got {}",
+            args.post_mul_scaler);
+    }
+
+    CMAKE_UNIQUE_NAMESPACE::validate_split_output(args, tensor_args);
+
+    // validate input dim
+    const auto input_rank = input.logical_shape().rank();
+    TT_FATAL(input_rank > 2, "FastReduceNC input rank must be greater than 2, but has {}", input_rank);
+    // The program factory treats shape[dim] as a count of whole H*W tile planes, so H and W cannot be reduced here.
+    TT_FATAL(
+        args.dim >= 0 && args.dim <= static_cast<int32_t>(input_rank) - 3,
+        "FastReduceNC reduces only outer dims: dim must be between 0 and {}, but has {}",
+        static_cast<int32_t>(input_rank) - 3,
+        args.dim);
+    TT_FATAL(
+        input_rank <= ttnn::MAX_NUM_DIMENSIONS,
+        "FastReduceNC input rank {} exceeds maximum {}",
+        input_rank,
+        ttnn::MAX_NUM_DIMENSIONS);
+
+    ttnn::prim::ReduceOpDeviceGridValidationOptions input_grid_opts{};
+    if (args.sub_core_grids.has_value()) {
+        input_grid_opts.sub_grid_contained_in_device_grid = &args.sub_core_grids.value();
+        input_grid_opts.sub_grid_label = "sub_core_grids";
+    }
+    input_grid_opts.shard_grid_contained_in_device_grid = &input.memory_config();
+    input_grid_opts.memory_config_label = "input";
+
+    std::optional<tt::tt_metal::TensorSpec> input_spec_nd_shard = std::nullopt;
+    if (input.memory_config().nd_shard_spec().has_value()) {
+        input_spec_nd_shard = input.tensor_spec();
+    }
+    ttnn::prim::validate_reduce_op_tensor(input, "FastReduceNC", "input", &input_grid_opts, input_spec_nd_shard);
+
+    ttnn::prim::ReduceOpDeviceGridValidationOptions output_grid_opts{};
+    output_grid_opts.shard_grid_contained_in_device_grid = &args.output_mem_config;
+    output_grid_opts.memory_config_label = "output";
+    std::optional<tt::tt_metal::TensorSpec> output_spec_nd_shard = std::nullopt;
+    if (args.output_mem_config.nd_shard_spec().has_value() || args.output_mem_config.shard_spec().has_value()) {
+        output_spec_nd_shard = compute_output_specs(args, tensor_args).front();
+    }
+    ttnn::prim::validate_reduce_op_tensor(input, "FastReduceNC", "output", &output_grid_opts, output_spec_nd_shard);
+
+    if (preallocated_output.has_value()) {
+        ttnn::prim::validate_reduce_op_tensor(preallocated_output.value(), "FastReduceNC", "preallocated_output");
+    }
+}
+
+ttsl::hash::hash_t FastReduceNCDeviceOperation::compute_program_hash(
+    const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
+    // Tripwire: adding a FastReduceNCParams field must be a deliberate choice — hash it below, or
+    // exclude it like post_mul_scaler, which the compute kernels read as a runtime arg.
+    static_assert(
+        reflect::size<operation_attributes_t>() == 8,
+        "FastReduceNCParams gained or lost a field: add it to compute_program_hash or document why it is "
+        "excluded, then update this count.");
+    return ttsl::hash::hash_objects_with_default_seed(
+        ttsl::hash::type_hash<FastReduceNCDeviceOperation>,
+        operation_attributes.dim,
+        operation_attributes.output_mem_config,
+        operation_attributes.compute_kernel_config,
+        operation_attributes.sub_core_grids,
+        operation_attributes.output_dtype,
+        operation_attributes.split_output_width,
+        operation_attributes.use_sfpu_reduce,
+        tensor_args);
+}
+
+FastReduceNCDeviceOperation::spec_return_value_t FastReduceNCDeviceOperation::compute_output_specs(
+    const operation_attributes_t& args, const tensor_args_t& tensor_args) {
+    CMAKE_UNIQUE_NAMESPACE::validate_split_output(args, tensor_args);
+    if (tensor_args.preallocated_output.has_value()) {
+        return {tensor_args.preallocated_output->tensor_spec()};
+    }
+
+    const auto& input = tensor_args.input;
+    const auto& input_shape = input.padded_shape();
+
+    // keepdim=true
+    auto output_shape = input_shape;
+    // last 2-dim
+    output_shape[args.dim] = 1;
+    const auto output_dtype = args.output_dtype.value_or(input.dtype());
+    const auto layout =
+        operations::TensorLayout(output_dtype, operations::PageConfig(Layout::TILE), args.output_mem_config);
+    if (args.split_output_width.has_value()) {
+        auto right_shape = output_shape;
+        output_shape[-1] = args.split_output_width.value();
+        right_shape[-1] -= args.split_output_width.value();
+        return {tt::tt_metal::TensorSpec(output_shape, layout), tt::tt_metal::TensorSpec(right_shape, layout)};
+    }
+    return {tt::tt_metal::TensorSpec(output_shape, layout)};
+}
+
+FastReduceNCDeviceOperation::tensor_return_value_t FastReduceNCDeviceOperation::create_output_tensors(
+    const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
+    if (tensor_args.preallocated_output.has_value()) {
+        return {tensor_args.preallocated_output.value()};
+    }
+
+    tensor_return_value_t outputs;
+    for (const auto& spec : compute_output_specs(operation_attributes, tensor_args)) {
+        outputs.push_back(create_device_tensor(spec, tensor_args.input.device()));
+    }
+    return outputs;
+}
+
+}  // namespace ttnn::experimental::prim
+
+namespace ttnn::prim {
+
+Tensor fast_reduce_nc(
+    const Tensor& input,
+    const int32_t& dim,
+    const std::optional<const Tensor>& output,
+    const MemoryConfig& output_mem_config,
+    const DeviceComputeKernelConfig& compute_kernel_config,
+    const std::optional<CoreRangeSet>& sub_core_grids,
+    const std::optional<DataType>& output_dtype,
+    bool use_sfpu_reduce,
+    float post_mul_scaler) {
+    using OperationType = ttnn::experimental::prim::FastReduceNCDeviceOperation;
+
+    auto operation_attributes = OperationType::operation_attributes_t{
+        .dim = dim,
+        .output_mem_config = output_mem_config,
+        .compute_kernel_config = compute_kernel_config,
+        .sub_core_grids = sub_core_grids,
+        .output_dtype = output_dtype,
+        .use_sfpu_reduce = use_sfpu_reduce,
+        .post_mul_scaler = post_mul_scaler};
+    auto tensor_args = OperationType::tensor_args_t{.input = input, .preallocated_output = output};
+
+    return ttnn::device_operation::launch<OperationType>(operation_attributes, tensor_args).front();
+}
+
+std::vector<Tensor> fast_reduce_nc_split(
+    const Tensor& input,
+    int32_t dim,
+    uint32_t split_output_width,
+    const MemoryConfig& output_mem_config,
+    const DeviceComputeKernelConfig& compute_kernel_config) {
+    using OperationType = ttnn::experimental::prim::FastReduceNCDeviceOperation;
+    const auto attributes = OperationType::operation_attributes_t{
+        .dim = dim,
+        .output_mem_config = output_mem_config,
+        .compute_kernel_config = compute_kernel_config,
+        .sub_core_grids = std::nullopt,
+        .output_dtype = std::nullopt,
+        .split_output_width = split_output_width};
+    const auto inputs = OperationType::tensor_args_t{.input = input, .preallocated_output = std::nullopt};
+    return ttnn::device_operation::launch<OperationType>(attributes, inputs);
+}
+
+}  // namespace ttnn::prim

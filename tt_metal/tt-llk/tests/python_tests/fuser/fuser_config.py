@@ -1,0 +1,335 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
+
+import shutil
+from dataclasses import dataclass, field
+from functools import reduce
+from hashlib import sha256
+from typing import List
+
+import pandas as pd
+import pytest
+from filelock import FileLock
+from helpers.chip_architecture import ChipArchitecture
+from helpers.llk_params import PERF_RUN_TYPES_QUASAR, DestAccumulation, PerfRunType
+from helpers.logger import logger
+from helpers.perf.core import PerfReport
+from helpers.perf.schema import LOOP_FACTOR_COLUMN, MARKER, TEST_NAME_COLUMN
+from helpers.profiler import Profiler, ProfilerData
+from helpers.test_config import (
+    BuildMode,
+    CoverageBuild,
+    ProfilerBuild,
+    StimuliMode,
+    TestConfig,
+)
+from ttexalens.tt_exalens_lib import read_words_from_device
+
+from .fpu_node import FpuNode
+from .l1_operation import L1Operation
+from .operand import OperandRegistry
+from .pipeline_plan import plan_pipeline
+from .sentinel import FuserSentinel
+from .sfpu_node import SfpuNode
+
+
+@dataclass
+class GlobalConfig:
+    test_name: str = "fused_test"
+    architecture: ChipArchitecture = None
+    dest_acc: DestAccumulation = DestAccumulation.No
+    regenerate_cpp: bool = False
+    profiler_enabled: bool = False
+    perf_run_type: PerfRunType = None
+    loop_factor: int = 16
+    quasar_use_dvalid: bool = False
+    quasar_unpack_to_dest: bool = field(default=False, init=False)
+    skip_for_perf: bool = False
+    sentinel: FuserSentinel = field(default_factory=FuserSentinel)
+
+    @property
+    def skip_unpack_init(self) -> bool:
+        return self.perf_run_type in (
+            PerfRunType.PACK_ISOLATE,
+            PerfRunType.MATH_ISOLATE,
+        )
+
+    @property
+    def uses_unpack_to_dest_sync(self) -> bool:
+        return self.quasar_unpack_to_dest and not self.skip_unpack_init
+
+    @property
+    def uses_unpack_to_dest_pack_sync(self) -> bool:
+        return self.uses_unpack_to_dest_sync and not self.skip_sync
+
+    @property
+    def skip_math_init(self) -> bool:
+        return self.perf_run_type in (
+            PerfRunType.UNPACK_ISOLATE,
+            PerfRunType.PACK_ISOLATE,
+        )
+
+    @property
+    def skip_sync(self) -> bool:
+        return self.perf_run_type in (
+            PerfRunType.MATH_ISOLATE,
+            PerfRunType.UNPACK_ISOLATE,
+            PerfRunType.PACK_ISOLATE,
+        )
+
+
+class FuserConfig(TestConfig):
+    pipeline: List[L1Operation]
+    global_config: GlobalConfig
+    operand_registry: OperandRegistry
+
+    def __init__(
+        self,
+        pipeline: List[L1Operation],
+        global_config: GlobalConfig,
+        operand_registry: OperandRegistry,
+    ):
+        super().__init__(test_name="", skip_build_header=True)
+
+        self.pipeline = pipeline
+        self.global_config = global_config
+        self.operand_registry = operand_registry
+        self._kernel_sources = None
+
+        if self.global_config.architecture is None:
+            self.global_config.architecture = self.CHIP_ARCH
+        self._configure_unpack_to_dest_sync()
+        self.pipeline_plans = [
+            plan_pipeline(
+                operation,
+                self.global_config.dest_acc.value,
+                unpack_to_dest_sync=self.global_config.quasar_unpack_to_dest,
+            )
+            for operation in self.pipeline
+        ]
+        self._validate_pack_sfpu_formats()
+
+    def _configure_unpack_to_dest_sync(self) -> None:
+        config = self.global_config
+        config.quasar_unpack_to_dest = (
+            config.architecture == ChipArchitecture.QUASAR
+            and any(
+                isinstance(node, FpuNode) and node.unpack_to_dest.value
+                for operation in self.pipeline
+                for node in operation.math_nodes
+            )
+        )
+        if not config.quasar_unpack_to_dest:
+            return
+        if config.quasar_use_dvalid:
+            raise ValueError("Quasar unpack_to_dest requires quasar_use_dvalid: false")
+        if len({operation.dest_sync for operation in self.pipeline}) != 1:
+            raise ValueError(
+                "Quasar unpack_to_dest requires a consistent dest_sync across the pipeline"
+            )
+
+    def _validate_pack_sfpu_formats(self):
+        config = self.global_config
+        if config.dest_acc.value or not any(
+            isinstance(node, SfpuNode) for op in self.pipeline for node in op.pack_nodes
+        ):
+            return
+        formats = set()
+        for op, blocks in zip(self.pipeline, self.pipeline_plans):
+            config.sentinel.prepare_operation(config, op, blocks)
+            output_format = op._get_pack_nodes()[0].output.data_format
+            for node in op.math_nodes:
+                if isinstance(node, FpuNode) and node.src_a is not None:
+                    formats.add(
+                        config.sentinel._infer_node_formats(
+                            config, node, output_format, op
+                        )[4]
+                    )
+            for node in op.pack_nodes:
+                if isinstance(node, SfpuNode):
+                    formats.add(config.sentinel._dest_source_format(config, op, node))
+        if len(formats) > 1:
+            raise ValueError(
+                "pack-thread SFPU requires a stable math format throughout a 16-bit Dst pipeline"
+            )
+
+    def generate_variant_hash(self):
+        NON_COMPILATION_ARGUMENTS = [
+            "run_configs",
+            "variant_id",
+            "runtime_arguments_struct",
+            "runtime_format",
+            "passed_templates",
+            "passed_runtimes",
+            "current_run_type",
+            "temp_elfs",
+            "pipeline",
+            "pipeline_plans",
+            "global_config",
+            "operand_registry",
+            "_kernel_sources",
+            # Host-side determinism-check opt-out; does not affect the compiled kernel.
+            "expected_nondeterministic",
+        ]
+
+        temp_str = [
+            str(value)
+            for field_name, value in self.__dict__.items()
+            if field_name not in NON_COMPILATION_ARGUMENTS
+        ]
+
+        self.variant_id = sha256(str(" | ".join(temp_str)).encode()).hexdigest()
+
+    def generate_and_build_test(self):
+        from .kernel_generator import FusedKernelGenerator
+
+        code_generator = FusedKernelGenerator(self)
+        self._kernel_sources = code_generator.write_kernel(self.test_name)
+        self.build_elfs()
+
+    def _compile_kernel_part(self, name, compile_command, source):
+        if (
+            self.global_config.architecture != ChipArchitecture.QUASAR
+            or not self._kernel_sources
+            or not self.skip_build_header
+            or self.coverage_build == CoverageBuild.Yes
+            or "-save-temps=obj" in self.OPTIONS_ALL
+        ):
+            return super()._compile_kernel_part(name, compile_command, source)
+
+        variant_dir = self.ARTEFACTS_DIR / self.test_name / self.variant_id
+        options = [arg for arg in compile_command[:-2] if arg != f"-I{variant_dir}"]
+        kernel = self._kernel_sources[name]
+        source_include = self._kernel_source_include()
+        expanded_source = source.replace(source_include, kernel)
+        key = sha256(repr((options, expanded_source)).encode()).hexdigest()
+        cache_dir = self.ARTEFACTS_DIR / "fused-kernels" / key
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cached_elf = cache_dir / "kernel.elf"
+        done = cache_dir / ".build_complete"
+
+        with FileLock(cache_dir / "build.lock"):
+            if not done.exists():
+                kernel_path = cache_dir / "kernel.cpp"
+                kernel_path.write_text(kernel)
+                cached_source = source.replace(
+                    source_include, f'#include "{kernel_path}"\n'
+                )
+                super()._compile_kernel_part(
+                    name,
+                    [*options, "-o", str(cached_elf)],
+                    cached_source,
+                )
+                done.touch()
+
+        shutil.copyfile(cached_elf, compile_command[-1])
+
+    def run_perf_test(
+        self, run_type: PerfRunType, run_count: int = 2, *, session_id: str
+    ):
+        """Build or measure one perf mode and join its results into the session report."""
+
+        from .kernel_generator import FUSED_TESTS_DIR
+
+        if self.global_config.skip_for_perf:
+            pytest.skip(f"'{self.global_config.test_name}' opts out of perf runs")
+
+        self.global_config.profiler_enabled = True
+        self.profiler_build = ProfilerBuild.Yes
+
+        self.global_config.perf_run_type = run_type
+        self.global_config.sentinel = FuserSentinel()
+        self.test_name = (
+            FUSED_TESTS_DIR / f"{self.global_config.test_name}_{run_type.name}.cpp"
+        )
+        self.generate_variant_hash()
+        self.operand_registry.allocate_l1_addresses()
+
+        if self.BUILD_MODE in [BuildMode.PRODUCE, BuildMode.DEFAULT]:
+            self.generate_and_build_test()
+        if self.BUILD_MODE == BuildMode.PRODUCE:
+            return
+
+        logger.info("Running perf test for run type: {}", run_type.name)
+        runs = []
+        for run_index in range(run_count):
+            self.run_elf_files()
+            self.wait_for_tensix_operations_finished()
+
+            meta = Profiler._get_meta(self.test_name, self.variant_id)
+            buffer_data = [
+                read_words_from_device(
+                    self.TENSIX_LOCATION,
+                    addr,
+                    word_count=self.THREAD_PERFORMANCE_DATA_BUFFER_LENGTH,
+                )
+                for addr in self.THREAD_PERFORMANCE_DATA_BUFFER
+            ]
+            profiler_data = Profiler._parse_buffers(buffer_data, meta)
+            profiler_data.df["run_index"] = run_index
+            runs.append(profiler_data)
+
+        result = Profiler.STATS_FUNCTION[run_type](ProfilerData.concat(runs))
+        test_name = self.global_config.test_name
+        case_key = sha256(test_name.encode()).hexdigest()
+        parts_dir = self.PERF_DATA_DIR / "fuser" / session_id / case_key
+        parts_dir.mkdir(parents=True, exist_ok=True)
+        parts = [parts_dir / f"{mode.name}.csv" for mode in PERF_RUN_TYPES_QUASAR[0]]
+        report_lock = FileLock(parts_dir / "report.lock")
+
+        with report_lock:
+            result.to_csv(parts_dir / f"{run_type.name}.csv", index=False)
+            if not all(path.exists() for path in parts):
+                return
+            all_results = [
+                pd.read_csv(path, float_precision="round_trip") for path in parts
+            ]
+
+        results = reduce(
+            lambda left, right: pd.merge(
+                left, right, on=MARKER, how="outer", validate="1:1"
+            ),
+            all_results,
+        )
+        results[TEST_NAME_COLUMN] = test_name
+        results[LOOP_FACTOR_COLUMN] = self.global_config.loop_factor
+        perf_report = PerfReport()
+        perf_report.append(results)
+        logger.info("Perf results:\n{}", results)
+
+        # A stable shard name keeps the output independent of worker scheduling.
+        csv_prefix = f"{test_name.replace('/', '_')}_fused_test"
+        with report_lock:
+            perf_report.dump_csv(f"{csv_prefix}.master.csv")
+            perf_report.post_process()
+            perf_report.dump_csv(f"{csv_prefix}.master.post.csv")
+
+    def run_regular_test(self):
+        """Run functional test: generate, build, write inputs to L1, execute kernel, read outputs and verify against golden."""
+
+        from .golden_check import GoldenCheck
+        from .kernel_generator import FUSED_TESTS_DIR
+
+        if self.STIMULI_MODE == StimuliMode.GENERATE_ONLY:
+            pytest.skip(self.SKIP_JUST_FOR_STIMULI_MARKER)
+
+        self.test_name = FUSED_TESTS_DIR / f"{self.global_config.test_name}.cpp"
+
+        self.generate_variant_hash()
+
+        self.operand_registry.allocate_l1_addresses()
+
+        if self.BUILD_MODE in [BuildMode.PRODUCE, BuildMode.DEFAULT]:
+            self.generate_and_build_test()
+
+        if self.BUILD_MODE == BuildMode.PRODUCE:
+            pytest.skip(self.SKIP_JUST_FOR_COMPILE_MARKER)
+
+        self.operand_registry.write_inputs_to_l1(self.TENSIX_LOCATION)
+
+        self.run_elf_files()
+        self.wait_for_tensix_operations_finished()
+        self.operand_registry.read_outputs_from_l1(self.TENSIX_LOCATION)
+        golden = GoldenCheck()
+        assert golden.check_pipeline(self)

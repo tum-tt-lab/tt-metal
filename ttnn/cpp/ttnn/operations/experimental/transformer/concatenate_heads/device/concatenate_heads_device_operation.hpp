@@ -1,0 +1,51 @@
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <functional>
+#include <optional>
+#include <variant>
+
+#include "ttnn/tensor/tensor.hpp"
+#include "ttnn/device_operation.hpp"
+#include "ttnn/metal_v2_artifacts.hpp"
+
+#include "concatenate_heads_device_operation_types.hpp"
+
+namespace ttnn::experimental::prim {
+
+struct ConcatenateHeadsDeviceOperation {
+    using operation_attributes_t = ConcatenateHeadsParams;
+    using tensor_args_t = ConcatenateHeadsInputs;
+    using spec_return_value_t = tt::tt_metal::TensorSpec;
+    using tensor_return_value_t = Tensor;
+
+    struct ConcatenateHeadsProgramFactory {
+        // The input and output buffer addresses are the only per-dispatch state; the core grid and
+        // every per-core tile id derive from the input's padded shape, which the program hash covers.
+        // Declaring both tensors as bindings is therefore the whole cache-hit refresh.
+        static ttnn::device_operation::ProgramArtifacts create_program_artifacts(
+            const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args, Tensor& output);
+    };
+    using program_factory_t = std::variant<ConcatenateHeadsProgramFactory>;
+
+    static void validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t&);
+
+    static spec_return_value_t compute_output_specs(const operation_attributes_t&, const tensor_args_t&);
+
+    static tensor_return_value_t create_output_tensors(const operation_attributes_t& args, const tensor_args_t&);
+};
+
+}  // namespace ttnn::experimental::prim
+
+namespace ttnn::prim {
+
+ttnn::experimental::prim::ConcatenateHeadsDeviceOperation::tensor_return_value_t concatenate_heads(
+    const ttnn::Tensor& input_tensor,
+    const CoreCoord& compute_with_storage_grid_size,
+    const std::optional<MemoryConfig>& memory_config,
+    const std::optional<ttnn::Tensor>& preallocated_output);
+
+}  // namespace ttnn::prim

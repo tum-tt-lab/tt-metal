@@ -1,0 +1,448 @@
+# SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+# SPDX-License-Identifier: Apache-2.0
+
+from typing import List
+
+import pytest
+import torch
+from helpers.constraints import (
+    is_valid_data_format_conversion,
+    is_valid_quasar_dest_mode_conversion,
+)
+from helpers.data_format_inference import infer_data_formats, unpacks_to_dest
+from helpers.format_config import DataFormat, FormatConfig, InputOutputFormat
+from helpers.golden_generators import (
+    DataCopyGolden,
+    PackGolden,
+    get_golden_generator,
+    quantize_mx_tensor_chunked,
+    saturate_integer,
+)
+from helpers.llk_params import (
+    BlocksCalculationAlgorithm,
+    DestAccumulation,
+    PackerReluType,
+    PerfRunType,
+)
+from helpers.param_config import (
+    flat_axes,
+    generate_dest_depth_input_dimensions,
+    generate_perf_input_dimensions,
+    generate_reduced_input_dimensions,
+    get_num_blocks_and_num_tiles_in_block,
+    input_output_formats,
+    parametrize,
+    quasar_dest_sync_modes,
+    runtime,
+    select_perf_tile_sizes,
+)
+from helpers.perf.core import create_test_or_perf_config
+from helpers.stimuli_config import StimuliConfig
+from helpers.stimuli_generator import (  # generate_stimuli_w_tile_dimensions
+    generate_stimuli,
+)
+from helpers.test_config import BootMode
+from helpers.test_variant_parameters import (
+    DEST_SYNC,
+    LOOP_FACTOR,
+    NUM_BLOCKS,
+    NUM_FACES,
+    NUM_FACES_C_DIM,
+    NUM_FACES_R_DIM,
+    NUM_TILES_IN_BLOCK,
+    RELU_CONFIG,
+    RELU_TYPE,
+    TEST_FACE_DIMS,
+    TILE_COUNT,
+    generate_input_dim,
+)
+from helpers.tile_constants import (
+    MX_SUPPORTED_TILE_SIZES,
+    SUPPORTED_TILE_SIZES,
+    is_mx_unsupported_tile_dims,
+)
+from helpers.tile_shape import construct_tile_shape
+from helpers.utils import passed_test, result_tensor
+
+
+def generate_qsr_pack_combinations(
+    formats_list: List[FormatConfig],
+    *,
+    is_perf=False,
+):
+    """
+    Generate pack combinations for Quasar pack tests.
+
+    Args:
+        formats_list: List of input/output format pairs
+        is_perf: Restrict combinations to SyncHalf, MOP-class tile sizes, and
+            dest-full perf input dimensions for performance measurements.
+
+    Returns:
+        List of (format, dest_acc, dest_sync, input_dimensions, relu_type,
+        tile_dimensions) tuples.
+    """
+
+    def get_dest_acc_modes(in_fmt):
+        """Determine valid dest register modes depending on the input format."""
+        # Having Int16 in src registers and Int32 in the dest register is not supported
+        if in_fmt == DataFormat.Int16:
+            return (DestAccumulation.No,)
+        if in_fmt.is_32_bit():
+            return (DestAccumulation.Yes,)
+        return (DestAccumulation.No, DestAccumulation.Yes)
+
+    all_relu_types = [
+        PackerReluType.NoRelu,
+        PackerReluType.ZeroRelu,
+        PackerReluType.MinThresholdRelu,
+        PackerReluType.MaxThresholdRelu,
+    ]
+
+    dest_sync_modes = quasar_dest_sync_modes(is_perf=is_perf)
+
+    combinations = []
+    for fmt in formats_list:
+        in_fmt, out_fmt = fmt.input_format, fmt.output_format
+
+        if not is_valid_data_format_conversion(fmt):
+            continue
+
+        # Threshold ReLU modes are not supported for integer pack_src formats
+        # (mirroring the pytest.skip guard in the test body), and the packer
+        # passes Int16 through with no ReLU of any kind applied.
+        if in_fmt == DataFormat.Int16:
+            relu_types = [PackerReluType.NoRelu]
+        elif in_fmt.is_integer():
+            relu_types = [PackerReluType.NoRelu, PackerReluType.ZeroRelu]
+        else:
+            relu_types = all_relu_types
+        for dest_acc in get_dest_acc_modes(in_fmt):
+            if is_valid_quasar_dest_mode_conversion(in_fmt, out_fmt, dest_acc):
+                tile_sizes = (
+                    select_perf_tile_sizes(SUPPORTED_TILE_SIZES)
+                    if is_perf
+                    else SUPPORTED_TILE_SIZES
+                )
+                for dest_sync in dest_sync_modes:
+                    for tile_dims in tile_sizes:
+                        if is_mx_unsupported_tile_dims(in_fmt, out_fmt, tile_dims):
+                            continue
+                        # Unpack-to-dest (required for 32-bit formats) does not support tiny tiles.
+                        if (
+                            unpacks_to_dest(in_fmt, dest_acc)
+                            and tile_dims not in MX_SUPPORTED_TILE_SIZES
+                        ):
+                            continue
+                        tile_shape = construct_tile_shape(tile_dims)
+                        dimensions_list = (
+                            generate_perf_input_dimensions(
+                                dest_acc, dest_sync, tile_shape
+                            )
+                            if is_perf
+                            else generate_reduced_input_dimensions(
+                                dest_acc, dest_sync=dest_sync, tile_shape=tile_shape
+                            )
+                        )
+                        for dimensions in dimensions_list:
+                            for relu_type in relu_types:
+                                combinations.append(
+                                    (
+                                        fmt,
+                                        dest_acc,
+                                        dest_sync,
+                                        runtime(dimensions),
+                                        runtime(relu_type),
+                                        runtime(tile_dims),
+                                    )
+                                )
+
+    return combinations
+
+
+PACK_FORMATS = input_output_formats(
+    [
+        DataFormat.Float16_b,
+        DataFormat.Float32,
+        DataFormat.Int32,
+        DataFormat.Int8,
+        DataFormat.UInt8,
+        DataFormat.Int16,
+        DataFormat.Int4,
+        DataFormat.UInt4,
+        DataFormat.MxFp8R,
+        DataFormat.MxFp8P,
+        DataFormat.MxFp4,
+        DataFormat.MxInt8,
+        DataFormat.MxInt4,
+        DataFormat.MxInt2,
+    ]
+)
+# Column names of the tuples ``generate_qsr_pack_combinations`` returns.
+PACK_FLAT_NAMES = (
+    "formats",
+    "dest_acc",
+    "dest_sync",
+    "input_dimensions",
+    "relu_type",
+    "tile_dimensions",
+)
+ALL_PACK_COMBINATIONS = generate_qsr_pack_combinations(PACK_FORMATS)
+PERF_PACK_COMBINATIONS = generate_qsr_pack_combinations(PACK_FORMATS, is_perf=True)
+
+# 4 and 8 full Dest sections per run. Float32 takes the unpack-to-Dest path, Float16_b the FPU one.
+PACK_DEST_DEPTH_COMBINATIONS = [
+    (
+        fmt,
+        dest_acc,
+        dest_sync,
+        runtime(dimensions),
+        runtime(PackerReluType.NoRelu),
+        runtime((32, 32)),
+    )
+    for fmt, dest_acc_modes in (
+        (
+            InputOutputFormat(DataFormat.Float16_b, DataFormat.Float16_b),
+            (DestAccumulation.No, DestAccumulation.Yes),
+        ),
+        (
+            InputOutputFormat(DataFormat.Float32, DataFormat.Float32),
+            (DestAccumulation.Yes,),
+        ),
+    )
+    for dest_acc in dest_acc_modes
+    for dest_sync in quasar_dest_sync_modes()
+    for dimensions in generate_dest_depth_input_dimensions(dest_acc, dest_sync)
+]
+
+
+@pytest.mark.quasar
+@parametrize(
+    **flat_axes(PACK_FLAT_NAMES, ALL_PACK_COMBINATIONS),
+    run_types=[[PerfRunType.L1_TO_L1]],
+    loop_factor=[1],
+)
+def test_pack_quasar(
+    formats,
+    dest_acc,
+    dest_sync,
+    input_dimensions,
+    relu_type,
+    tile_dimensions,
+    run_types,
+    loop_factor,
+    boot_mode=BootMode.DEFAULT,
+    *,
+    is_perf=False,
+    perf_report=None,
+):
+    tile_shape = construct_tile_shape(tile_dimensions)
+
+    src_A, tile_cnt_A, src_B, _ = generate_stimuli(
+        stimuli_format_A=formats.input_format,
+        input_dimensions_A=input_dimensions,
+        stimuli_format_B=formats.input_format,
+        input_dimensions_B=input_dimensions,
+        tile_dimensions=tile_dimensions,
+    )
+
+    num_faces = tile_shape.total_num_faces()
+
+    num_blocks, tiles_in_block = get_num_blocks_and_num_tiles_in_block(
+        dest_sync,
+        dest_acc,
+        formats,
+        input_dimensions,
+        tile_dimensions,
+        BlocksCalculationAlgorithm.Standard,
+    )
+
+    # Same method as test_pack.py for original ReLu testing and threshold tolerance issue
+    unpack_to_dest = unpacks_to_dest(formats.input_format, dest_acc)
+    data_formats = infer_data_formats(
+        input_format=formats.input_format,
+        output_format=formats.output_format,
+        is_fp32_dest_acc_en=dest_acc,
+        unpacking_to_dest=unpack_to_dest,
+    )
+
+    relu_config = PackGolden.generate_relu_config(
+        relu_type,
+        relu_threshold=0.0,
+        intermediate_format=data_formats.pack_src,
+    )
+
+    if not is_perf:
+        # HW flow with relu: unpack input -> dest -> apply relu in pack_src
+        # space -> pack to output (one MX quantization, block scale derived at pack
+        # time from post-relu values). DataCopyGolden, given an MX output format,
+        # does a pre-relu MxInt4 quantization that HW doesn't do. That extra
+        # quantization can shift values across the relu threshold, producing
+        # divergence from HW that grows with threshold-relu (most visible for
+        # MxFp4 -> MxInt4 + MaxThresholdRelu). For MX outputs we route through
+        # pack_src instead and apply the single output MX quantization ourselves
+        # after relu. Signed integer -> UInt8 outputs also route through pack_src and
+        # apply the UInt8 conversion after relu, which runs before the packer format
+        # conversion.
+
+        generate_golden = get_golden_generator(DataCopyGolden)
+        signed_integer_to_uint8 = (
+            formats.output_format == DataFormat.UInt8
+            and data_formats.pack_src in (DataFormat.Int8, DataFormat.Int32)
+        )
+        datacopy_out_format = (
+            data_formats.pack_src
+            if formats.output_format.is_mx_format() or signed_integer_to_uint8
+            else formats.output_format
+        )
+        golden_tensor = generate_golden(
+            src_A,
+            datacopy_out_format,
+            num_faces=num_faces,
+            face_r_dim=tile_shape.face_r_dim,
+            input_dimensions=input_dimensions,
+            input_format=formats.input_format,
+            tile_shape=tile_shape,
+        )
+
+        # THCON_PACKER<n>_RELU_THRESHOLD has to be a +ve number, so use the mean magnitude
+        tensor_average = (
+            torch.mean(torch.abs(golden_tensor)).item()
+            if not formats.output_format.is_integer()
+            else 0.0
+        )
+
+        relu_config = PackGolden.generate_relu_config(
+            relu_type,
+            relu_threshold=tensor_average,
+            intermediate_format=data_formats.pack_src,
+        )
+
+        golden_tensor = PackGolden.apply_relu(
+            golden_tensor,
+            relu_config,
+            data_formats.pack_src,
+        )
+
+        if signed_integer_to_uint8:
+            golden_tensor = saturate_integer(golden_tensor, formats.output_format)
+
+    if is_perf and perf_report is None:
+        raise ValueError("perf_report must be provided when is_perf=True")
+
+    test_config_kwargs = {
+        "test_name": "sources/quasar/pack_quasar_test.cpp",
+        "formats": formats,
+        "templates": [
+            DEST_SYNC(dest_sync),
+            RELU_TYPE(relu_type),
+        ],
+        "runtimes": [
+            TEST_FACE_DIMS(tile_shape.face_r_dim),
+            NUM_FACES(num_faces),
+            TILE_COUNT(tile_cnt_A),
+            NUM_BLOCKS(num_blocks),
+            NUM_TILES_IN_BLOCK(tiles_in_block),
+            RELU_CONFIG(relu_config),
+            NUM_FACES_R_DIM(tile_shape.num_faces_r_dim),
+            NUM_FACES_C_DIM(tile_shape.num_faces_c_dim),
+            LOOP_FACTOR(loop_factor),
+            generate_input_dim(
+                input_dimensions, input_dimensions, tile_dimensions=tile_dimensions
+            ),
+        ],
+        "variant_stimuli": StimuliConfig(
+            src_A,
+            formats.input_format,
+            src_B,
+            formats.input_format,
+            formats.output_format,
+            tile_count_A=tile_cnt_A,
+            tile_count_B=tile_cnt_A,
+            tile_count_res=tile_cnt_A,
+            num_faces=num_faces,
+            face_r_dim=tile_shape.face_r_dim,
+            tile_dimensions=tile_dimensions,
+            use_dense_tile_dimensions=True,
+        ),
+        "unpack_to_dest": unpack_to_dest,
+        "dest_acc": dest_acc,
+    }
+
+    # Single output MX quantization, after relu — matches HW's pack-time
+    # block-scale derivation from post-relu values.
+    if not is_perf and formats.output_format.is_mx_format():
+        golden_tensor = quantize_mx_tensor_chunked(
+            golden_tensor.to(torch.bfloat16), formats.output_format
+        )
+
+    configuration = create_test_or_perf_config(
+        is_perf=is_perf,
+        run_types=run_types,
+        test_config_kwargs=test_config_kwargs,
+        boot_mode=boot_mode,
+    )
+    if is_perf:
+        configuration.run(perf_report)
+        return
+
+    res_from_L1 = configuration.run().result
+
+    res_tensor = result_tensor(res_from_L1, formats.output_format, golden_tensor)
+
+    test_passed = passed_test(
+        golden_tensor,
+        res_tensor,
+        formats.output_format,
+        print_errors=False,
+        tile_shape=tile_shape,
+    )
+
+    # Same method as test_pack.py for original ReLu testing and threshold tolerance issue
+    # Could be adjusted to have Golden model HW behaviour for pack ReLu activation which applies ReLu on datum format in dst and then converts to output format
+    # Check issue/request: https://github.com/tenstorrent/tt-llk/issues/1391
+    if (
+        not test_passed
+        and relu_type
+        in [
+            PackerReluType.MinThresholdRelu,
+            PackerReluType.MaxThresholdRelu,
+        ]
+        and PackGolden.is_relu_threshold_tolerance_issue(
+            golden_tensor,
+            res_tensor,
+            relu_config,
+            data_formats.pack_src,
+            # MxInt4's lattice step is 0.25 * block_scale, so values that
+            # disagree across a threshold can sit ~0.5 apart while still both
+            # being "near the threshold" relative to the format's resolution.
+            # The default rtol/atol of 0.01 is calibrated for finer-precision
+            # formats (Bfp8_b etc.) and misses these legitimate near-threshold
+            # flips for MxInt4. Use the format's tolerance entries.
+            **(
+                {"atol": 0.5, "rtol": 0.35}
+                if formats.output_format == DataFormat.MxInt4
+                else {}
+            ),
+        )
+    ):
+        test_passed = True
+
+    assert test_passed, "Assert against golden failed"
+
+
+@pytest.mark.quasar
+@parametrize(**flat_axes(PACK_FLAT_NAMES, PACK_DEST_DEPTH_COMBINATIONS))
+def test_pack_dest_depth_quasar(
+    formats, dest_acc, dest_sync, input_dimensions, relu_type, tile_dimensions
+):
+    test_pack_quasar(
+        formats,
+        dest_acc,
+        dest_sync,
+        input_dimensions,
+        relu_type,
+        tile_dimensions,
+        [PerfRunType.L1_TO_L1],
+        1,
+    )

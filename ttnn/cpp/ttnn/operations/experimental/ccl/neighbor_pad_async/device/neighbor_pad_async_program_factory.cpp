@@ -1,0 +1,1020 @@
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include "neighbor_pad_async_program_factory.hpp"
+
+#include "ttnn/operations/ccl/ccl_common.hpp"
+#include "ttnn/operations/ccl/shared_with_host/hetergeneous_data_structs.hpp"
+#include "ttnn/operations/ccl/ccl_host_datastructures.hpp"
+#include "ttnn/operations/ccl/common/types/ccl_types_args_emitters.hpp"
+#include "ttnn/operations/ccl/common/host/ccl_command_stream_builders.hpp"
+#include "ttnn/operations/ccl/common/uops/command_lowering.hpp"
+#include "ttnn/operations/ccl/common/host/ccl_worker_builder.hpp"
+#include "ttnn/operations/ccl/common/host/command_backend_runtime_args_overrider.hpp"
+
+#include <tt-metalium/core_coord.hpp>
+#include <tt-metalium/buffer.hpp>
+#include <tt-metalium/experimental/fabric/fabric.hpp>
+#include <tt-metalium/work_split.hpp>
+#include <tt-metalium/host_api.hpp>
+#include <tt-metalium/tensor_accessor_args.hpp>
+#include <tt-metalium/program_descriptors.hpp>
+#include <tt-metalium/workload_descriptor.hpp>
+#include <tt-metalium/distributed.hpp>
+#include <algorithm>
+#include <optional>
+#include <ranges>
+#include <sstream>
+#include <type_traits>
+
+using namespace tt::tt_metal;
+
+namespace ttnn::experimental::prim {
+
+namespace {
+
+// Unconditional kernel push indices. Local-copy and W-fabric kernels follow these when present.
+constexpr uint32_t k_h_reader_kernel_id = 0;
+constexpr uint32_t k_h_writer_kernel_id = 1;
+
+void emplace_u32_runtime_args(KernelDescriptor& kernel, const CoreCoord& core, const std::vector<uint32_t>& args) {
+    KernelDescriptor::RTArgList list;
+    list.append(args);
+    kernel.emplace_runtime_args(core, list);
+}
+
+struct NeighborPadKernelPresence {
+    bool has_local_copy = false;
+    bool has_w_fabric = false;
+};
+
+// Same link-cap and residual-core predicate as build_program_descriptor_at; independent of mesh coordinate.
+NeighborPadKernelPresence neighbor_pad_kernel_presence(
+    const NeighborPadAsyncParams& operation_attributes, const Tensor& input_tensor) {
+    auto* mesh_device = input_tensor.device();
+    const auto& input_tensor_shape = input_tensor.padded_shape();
+
+    uint32_t num_sticks_per_halo_dim = 1;
+    for (size_t d = operation_attributes.dim + 1; d < input_tensor_shape.size() - 1; d++) {
+        num_sticks_per_halo_dim *= input_tensor_shape[d];
+    }
+    uint32_t outer_dim_size = 1;
+    for (size_t d = 0; d < operation_attributes.dim; d++) {
+        outer_dim_size *= input_tensor_shape[d];
+    }
+
+    const bool is_2d = operation_attributes.pad_dim2.has_value();
+    auto compute_grid_size = mesh_device->compute_with_storage_grid_size();
+    uint32_t num_links = operation_attributes.num_links;
+    uint32_t pad2_num_links = operation_attributes.pad2_num_links;
+    uint32_t total_fabric_cores = (num_links * 2) + (is_2d ? pad2_num_links * 2 : 0);
+    if (total_fabric_cores > compute_grid_size.x) {
+        uint32_t max_total = compute_grid_size.x;
+        uint32_t h_cores = num_links * 2;
+        if (is_2d) {
+            uint32_t available_for_w = (max_total > h_cores) ? (max_total - h_cores) : 0;
+            pad2_num_links = available_for_w / 2;
+            if (pad2_num_links == 0) {
+                pad2_num_links = 1;
+                num_links = (max_total - 2) / 2;
+            }
+        } else {
+            num_links = max_total / 2;
+        }
+    }
+
+    const uint32_t num_h_fabric_cores = num_links * 2;
+    const uint32_t num_w_fabric_cores = is_2d ? (pad2_num_links * 2) : 0;
+    CoreCoord core_grid(num_h_fabric_cores, 1);
+    const CoreRangeSet worker_core_ranges = std::get<1>(
+        (operation_attributes.dim > 0) ? split_work_to_cores(core_grid, outer_dim_size * 2)
+                                       : split_work_to_cores(core_grid, num_sticks_per_halo_dim * 2));
+
+    CoreRangeSet fabric_cores = worker_core_ranges;
+    if (is_2d) {
+        CoreRangeSet w_fabric_core_range(
+            CoreRange({num_h_fabric_cores, 0}, {num_h_fabric_cores + num_w_fabric_cores - 1, 0}));
+        fabric_cores = fabric_cores.merge(w_fabric_core_range);
+    }
+    CoreRangeSet all_cores(CoreRange({0, 0}, {compute_grid_size.x - 1, compute_grid_size.y - 1}));
+    const bool has_local_copy = !all_cores.subtract(fabric_cores).empty();
+    return NeighborPadKernelPresence{.has_local_copy = has_local_copy, .has_w_fabric = is_2d};
+}
+
+ProgramDescriptor build_program_descriptor_at(
+    const NeighborPadAsyncParams& operation_attributes,
+    const ttnn::MeshCoordinate& mesh_coordinate,
+    const NeighborPadAsyncInputs& tensor_args,
+    Tensor& tensor_return_value);
+
+}  // namespace
+
+tt::tt_metal::WorkloadDescriptor NeighborPadAsyncMeshWorkloadFactory::create_workload_descriptor(
+    const NeighborPadAsyncParams& operation_attributes,
+    const NeighborPadAsyncInputs& tensor_args,
+    Tensor& tensor_return_value,
+    const ttnn::MeshCoordinateRangeSet& tensor_coords) {
+    tt::tt_metal::WorkloadDescriptor workload_descriptor;
+
+    // Synchronize all devices before dispatching neighbor_pad programs.
+    // This ensures all previous fabric-initiated writes (from prior ops) have completed.
+    auto* mesh_device = tensor_args.input_tensor.device();
+    tt::tt_metal::distributed::Synchronize(*mesh_device, std::nullopt, {});
+
+    // Create programs for each coordinate in tensor_coords
+    for (const auto& mesh_coord_range : tensor_coords.ranges()) {
+        for (const auto& mesh_coord : mesh_coord_range) {
+            workload_descriptor.programs.push_back(
+                {ttnn::MeshCoordinateRange(mesh_coord),
+                 build_program_descriptor_at(operation_attributes, mesh_coord, tensor_args, tensor_return_value)});
+        }
+    }
+
+    return workload_descriptor;
+}
+
+void NeighborPadAsyncMeshWorkloadFactory::override_runtime_arguments(
+    tt::tt_metal::Program& program,
+    const NeighborPadAsyncParams& operation_attributes,
+    const NeighborPadAsyncInputs& tensor_args,
+    Tensor& /*tensor_return_value*/,
+    const std::optional<ttnn::MeshCoordinate>& /*coord*/) {
+    const uint32_t h_sem_addr = static_cast<uint32_t>(operation_attributes.h_neighbor_semaphore.address());
+    const uint32_t barrier_sem_addr = static_cast<uint32_t>(operation_attributes.barrier_semaphore.address());
+
+    // All addresses are uniform across cores → use Common Runtime Args (multicast, no per-core loops).
+    // Buffer slots are CommonBufferBindings. Only caller semaphore addresses are rewritten here.
+    auto& hr = GetCommonRuntimeArgs(program, k_h_reader_kernel_id);
+    hr[2] = h_sem_addr;
+
+    auto& hw = GetCommonRuntimeArgs(program, k_h_writer_kernel_id);
+    hw[2] = h_sem_addr;
+    hw[3] = barrier_sem_addr;
+
+    // 1D padding has only the H kernels, so their semaphore slots are the whole refresh.
+    if (!operation_attributes.pad_dim2.has_value()) {
+        return;
+    }
+
+    const uint32_t w_sem_addr = static_cast<uint32_t>(operation_attributes.w_neighbor_semaphore.address());
+    const NeighborPadKernelPresence presence =
+        neighbor_pad_kernel_presence(operation_attributes, tensor_args.input_tensor);
+
+    // Local reader/writer, when present, sit at indices 2 and 3. They have no semaphore CRTAs.
+    uint32_t kernel_index = k_h_writer_kernel_id + 1;
+    if (presence.has_local_copy) {
+        // lw[2..] are static shape params — no changing addresses in local writer CRTAs
+        kernel_index += 2;
+    }
+
+    if (presence.has_w_fabric) {
+        const uint32_t w_reader_kernel_id = kernel_index++;
+        const uint32_t w_writer_kernel_id = kernel_index++;
+
+        auto& wr = GetCommonRuntimeArgs(program, w_reader_kernel_id);
+        wr[1] = barrier_sem_addr;
+        wr[2] = w_sem_addr;
+
+        auto& ww = GetCommonRuntimeArgs(program, w_writer_kernel_id);
+        ww[2] = w_sem_addr;
+        // Use h_neighbor_semaphore (not barrier_semaphore) — W reader on same core uses
+        // barrier_semaphore for H-halo barrier, so they must use different addresses.
+        ww[3] = h_sem_addr;
+    }
+}
+
+// Fused 2D NeighborPad Algorithm (single op, two phases):
+//
+// Input: [B,T,H,W,C] fractured across 2D mesh (H across rows, W across columns)
+// Output: [B,T,H+2pH,W+2pW,C]
+//
+// Phase 0 — Startup barrier (multicast sync across all devices):
+//   H fabric writers multicast barrier with all H-axis devices (same column).
+//   W fabric writers multicast barrier with all W-axis devices (same row).
+//   Together these transitively synchronize all devices, ensuring the previous
+//   dispatch has completed before any new fabric data is sent.
+//
+// Phase 1 — Interior copy + H halo exchange (all ~120 cores active):
+//   Local copy cores: read input sticks → write to output DRAM at (h+pH, w+pW) offset.
+//   H fabric writer (BRISC): self-pad zeros/replicate to output DRAM for H pad rows,
+//     send H boundary data to neighbor via fabric.
+//   H fabric reader (NCRISC): receive H halo from fabric → L1 → output DRAM.
+//   All Phase 1 cores (local copy writers, H fabric writers, and H fabric readers)
+//     signal Phase 2 barrier on completion.
+//
+// Phase 2 — W halo exchange (2–8 W fabric cores, i.e. 2 × pad2_num_links):
+//   W reader: waits on Phase 2 barrier, then reads W boundary sticks from output DRAM
+//     (safe because Phase 1 calls noc_async_write_barrier() before signaling the barrier).
+//     Sends to neighbor via fabric or self-pads. Receives from neighbor → L1 → CB.
+//   W writer: pops from CB, writes self-pad and incoming W padding to output DRAM,
+//     sends W boundary data to neighbor via fabric.
+namespace {
+
+ProgramDescriptor build_program_descriptor_at(
+    const NeighborPadAsyncParams& operation_attributes,
+    const ttnn::MeshCoordinate& mesh_coordinate,
+    const NeighborPadAsyncInputs& tensor_args,
+    Tensor& tensor_return_value) {
+    ProgramDescriptor desc;
+    auto* mesh_device = tensor_args.input_tensor.device();
+
+    // Use MeshCoordinates to find forward and backward devices
+    // This is safe on bigmesh where remote devices might not exist on this rank
+    uint32_t device_index = ::ttnn::ccl::get_linearized_index_from_physical_coord(
+        tensor_args.input_tensor, mesh_coordinate, operation_attributes.cluster_axis);
+
+    std::optional<MeshCoordinate> forward_coord = ::ttnn::ccl::get_physical_neighbor_from_physical_coord(
+        tensor_args.input_tensor, mesh_coordinate, 1, ttnn::ccl::Topology::Linear, operation_attributes.cluster_axis);
+
+    std::optional<MeshCoordinate> backward_coord = ::ttnn::ccl::get_physical_neighbor_from_physical_coord(
+        tensor_args.input_tensor, mesh_coordinate, -1, ttnn::ccl::Topology::Linear, operation_attributes.cluster_axis);
+
+    // Tensor Info
+    const auto& input_tensor_shape = tensor_args.input_tensor.padded_shape();
+    const auto& output_tensor_shape = tensor_return_value.padded_shape();
+    Buffer* input_buffer = tensor_args.input_tensor.buffer();
+    Buffer* output_buffer = tensor_return_value.buffer();
+
+    // Get OP Config, topology config
+    // Use the buffer's aligned page size (architecture-specific: 32B on WH, 64B on BH).
+    // The interleaved address generator spaces pages at aligned_page_size intervals,
+    // so NOC transfers must use this size to avoid sub-minimum or misaligned reads.
+    const uint32_t page_size = static_cast<uint32_t>(input_buffer->aligned_page_size());
+    uint32_t num_sticks_per_halo_dim = 1;
+    for (size_t d = operation_attributes.dim + 1; d < input_tensor_shape.size() - 1; d++) {
+        num_sticks_per_halo_dim *= input_tensor_shape[d];
+    }
+    uint32_t input_halo_dim_size = input_tensor_shape[operation_attributes.dim];
+    uint32_t output_halo_dim_size = output_tensor_shape[operation_attributes.dim];
+    uint32_t outer_dim_size = 1;
+    for (size_t d = 0; d < operation_attributes.dim; d++) {
+        outer_dim_size *= input_tensor_shape[d];
+    }
+
+    bool is_first_device = true;
+    bool is_last_device = true;
+    uint32_t forward_device_offset = 0;
+    uint32_t backward_device_offset = 0;
+
+    // Determine first/last device from physical neighbor availability along the primary axis.
+    is_first_device = !backward_coord.has_value();
+    is_last_device = !forward_coord.has_value();
+    if (!is_first_device) {
+        backward_device_offset = 1;
+    }
+    if (!is_last_device) {
+        forward_device_offset = 1;
+    }
+
+    log_trace(
+        tt::LogOp,
+        "NeighborPad H-fabric: mesh_coord=({},{}), device_index={}, src_node_id={}, "
+        "fwd_offset={}, bwd_offset={}, is_first={}, is_last={}, cluster_axis={}",
+        mesh_coordinate[0],
+        mesh_coordinate[1],
+        device_index,
+        mesh_device->get_fabric_node_id(mesh_coordinate),
+        forward_device_offset,
+        backward_device_offset,
+        is_first_device,
+        is_last_device,
+        operation_attributes.cluster_axis);
+    if (forward_coord.has_value()) {
+        log_trace(
+            tt::LogOp,
+            "  forward_coord=({},{}), fwd_node_id={}",
+            (*forward_coord)[0],
+            (*forward_coord)[1],
+            mesh_device->get_fabric_node_id(forward_coord.value()));
+    }
+    if (backward_coord.has_value()) {
+        log_trace(
+            tt::LogOp,
+            "  backward_coord=({},{}), bwd_node_id={}",
+            (*backward_coord)[0],
+            (*backward_coord)[1],
+            mesh_device->get_fabric_node_id(backward_coord.value()));
+    }
+
+    bool is_padding_zeros = operation_attributes.padding_mode == "zeros";
+    const bool is_2d = operation_attributes.pad_dim2.has_value();
+
+    // For 2D padding: compute secondary dimension metrics
+    uint32_t output_num_sticks_per_halo_dim = num_sticks_per_halo_dim;  // default: same as input
+    uint32_t writer_stick_start_id = 0;
+    uint32_t writer_num_sticks_to_read = num_sticks_per_halo_dim;
+    if (is_2d) {
+        // The output has extra W padding, so its row width is wider
+        output_num_sticks_per_halo_dim =
+            num_sticks_per_halo_dim + operation_attributes.pad2_left + operation_attributes.pad2_right;
+        writer_stick_start_id = operation_attributes.pad2_left;
+    }
+
+    const uint32_t t_front_pad = operation_attributes.t_front_pad;
+    // Offset (in sticks) added to all output write addresses so input data lands at T>=t_front_pad
+    const uint32_t t_front_pad_stick_offset = t_front_pad * output_halo_dim_size * output_num_sticks_per_halo_dim;
+
+    // Get worker cores
+    constexpr uint32_t MAX_PAD2_NUM_LINKS = 4;  // kernel arrays sized for pad2_num_links * 2 = 8 targets
+
+    // Cap num_links and pad2_num_links so total fabric cores fit within the device compute grid width.
+    // WH has 8x8 logical grid vs BH's 14x10, so large link counts can exceed the grid.
+    auto compute_grid_size = mesh_device->compute_with_storage_grid_size();
+    uint32_t num_links = operation_attributes.num_links;
+    uint32_t pad2_num_links = operation_attributes.pad2_num_links;
+    uint32_t total_fabric_cores = (num_links * 2) + (is_2d ? pad2_num_links * 2 : 0);
+    if (total_fabric_cores > compute_grid_size.x) {
+        // Reduce pad2_num_links first (W-fabric), then num_links (H-fabric) if still too many
+        uint32_t max_total = compute_grid_size.x;
+        uint32_t h_cores = num_links * 2;
+        if (is_2d) {
+            uint32_t available_for_w = (max_total > h_cores) ? (max_total - h_cores) : 0;
+            pad2_num_links = available_for_w / 2;
+            if (pad2_num_links == 0) {
+                // H-fabric alone exceeds grid, reduce num_links too
+                pad2_num_links = 1;
+                num_links = (max_total - 2) / 2;  // reserve 2 cores for 1 W link
+            }
+        } else {
+            num_links = max_total / 2;
+        }
+        log_warning(
+            tt::LogOp,
+            "neighbor_pad_async: Capped num_links from {} to {} and pad2_num_links from {} to {} "
+            "to fit device compute grid width {}",
+            operation_attributes.num_links,
+            num_links,
+            operation_attributes.pad2_num_links,
+            pad2_num_links,
+            compute_grid_size.x);
+    }
+
+    uint32_t num_h_fabric_cores = num_links * 2;
+    uint32_t num_w_fabric_cores = is_2d ? (pad2_num_links * 2) : 0;
+    TT_FATAL(
+        pad2_num_links <= MAX_PAD2_NUM_LINKS,
+        "pad2_num_links ({}) exceeds maximum supported ({}). Kernel Phase 2 signal target arrays are sized for {}.",
+        pad2_num_links,
+        MAX_PAD2_NUM_LINKS,
+        MAX_PAD2_NUM_LINKS * 2);
+    CoreCoord core_grid(num_h_fabric_cores, 1);
+    auto [num_cores, worker_core_ranges, core_group_1, core_group_2, dims_per_core_group_1, dims_per_core_group_2] =
+        (operation_attributes.dim > 0) ? split_work_to_cores(core_grid, outer_dim_size * 2)
+                                       : split_work_to_cores(core_grid, num_sticks_per_halo_dim * 2);
+
+    // L1 Scratch CB Creation
+    uint32_t l1_scratch_cb_page_size_bytes = page_size;
+
+    uint32_t num_sticks_to_write_per_packet = 1;
+    uint32_t cb_num_pages = 2 * num_sticks_to_write_per_packet;  // double buffering
+    tt::DataFormat df = datatype_to_dataformat_converter(tensor_args.input_tensor.dtype());
+
+    // CBs for transferring data between reader and writer
+    uint32_t sender_cb_index = tt::CB::c_in0;
+    CBDescriptor sender_cb{
+        .total_size = cb_num_pages * l1_scratch_cb_page_size_bytes,
+        .core_ranges = worker_core_ranges,
+        .format_descriptors = {{CBFormatDescriptor{
+            .buffer_index = static_cast<uint8_t>(sender_cb_index),
+            .data_format = df,
+            .page_size = l1_scratch_cb_page_size_bytes}}},
+    };
+    desc.cbs.push_back(sender_cb);
+
+    // L1 receive buffer for 2D padding: fabric-delivered H halo corner sticks arrive here.
+    // Corners-only optimization: only W-boundary sticks (pad2_left + pad2_right per row) go
+    // to L1; non-corner sticks go directly to neighbor DRAM via fabric.
+    // Buffer must hold ALL outer_dims' corner sticks (no per-outer_dim reuse) because the
+    // fabric pipeline can deliver data for outer_dim N+1 before the reader finishes
+    // copying outer_dim N.
+    uint32_t recv_cb_index = tt::CB::c_in1;
+    uint32_t corner_sticks_per_row =
+        is_2d ? std::min(operation_attributes.pad2_left + operation_attributes.pad2_right, num_sticks_per_halo_dim) : 0;
+    if (is_2d) {
+        uint32_t max_padding = std::max(operation_attributes.padding_left, operation_attributes.padding_right);
+        uint32_t max_outer_dims_per_core = dims_per_core_group_1;
+        uint32_t recv_total_sticks = max_outer_dims_per_core * max_padding * corner_sticks_per_row;
+        uint32_t recv_buf_size = recv_total_sticks * page_size;
+        if (recv_buf_size > 0) {
+            desc.cbs.push_back(CBDescriptor{
+                .total_size = recv_buf_size,
+                .core_ranges = worker_core_ranges,
+                .format_descriptors = {{CBFormatDescriptor{
+                    .buffer_index = static_cast<uint8_t>(recv_cb_index), .data_format = df, .page_size = page_size}}},
+            });
+        }
+    }
+
+    // Phase 2 W-axis setup (for 2D padding)
+    std::vector<CoreCoord> w_fabric_logical_cores;
+    std::vector<CoreCoord> w_fabric_virtual_cores;
+    CoreRangeSet w_fabric_core_range;
+    bool is_first_w_device = true;
+    bool is_last_w_device = true;
+    uint32_t w_forward_device_offset = 0;
+    uint32_t w_backward_device_offset = 0;
+    std::optional<MeshCoordinate> w_forward_coord;
+    std::optional<MeshCoordinate> w_backward_coord;
+    uint32_t w_rows_per_link = 0;
+    uint32_t w_extra_rows = 0;
+    uint32_t w_t_total = 0;
+
+    if (is_2d) {
+        // W-axis device topology
+        w_forward_coord = ::ttnn::ccl::get_physical_neighbor_from_physical_coord(
+            tensor_args.input_tensor,
+            mesh_coordinate,
+            1,
+            ttnn::ccl::Topology::Linear,
+            operation_attributes.pad2_cluster_axis);
+        w_backward_coord = ::ttnn::ccl::get_physical_neighbor_from_physical_coord(
+            tensor_args.input_tensor,
+            mesh_coordinate,
+            -1,
+            ttnn::ccl::Topology::Linear,
+            operation_attributes.pad2_cluster_axis);
+
+        is_first_w_device = !w_backward_coord.has_value();
+        is_last_w_device = !w_forward_coord.has_value();
+        // W neighbors are physically adjacent (same row, adjacent columns) = 1 physical hop.
+        // The fabric chain chip_id difference can be much larger (e.g., 4 on a 4x8 mesh),
+        // but the EDM routing uses physical hops along the selected direction, NOT chain hops.
+        // Using the chain distance would cause packets to overshoot the target.
+        if (w_forward_coord.has_value()) {
+            w_forward_device_offset = 1;
+        }
+        if (w_backward_coord.has_value()) {
+            w_backward_device_offset = 1;
+        }
+
+        log_trace(
+            tt::LogOp,
+            "NeighborPad W-fabric: mesh_coord=({},{}), "
+            "w_fwd_offset={}, w_bwd_offset={}, is_first_w={}, is_last_w={}",
+            mesh_coordinate[0],
+            mesh_coordinate[1],
+            w_forward_device_offset,
+            w_backward_device_offset,
+            is_first_w_device,
+            is_last_w_device);
+
+        // W fabric core coordinates (placed after H fabric cores in first row)
+        w_fabric_logical_cores.reserve(num_w_fabric_cores);
+        w_fabric_virtual_cores.reserve(num_w_fabric_cores);
+        for (uint32_t i = 0; i < num_w_fabric_cores; i++) {
+            CoreCoord wc = {num_h_fabric_cores + i, 0};
+            w_fabric_logical_cores.push_back(wc);
+            w_fabric_virtual_cores.push_back(mesh_device->worker_core_from_logical_core(wc));
+        }
+        w_fabric_core_range =
+            CoreRangeSet(CoreRange({num_h_fabric_cores, 0}, {num_h_fabric_cores + num_w_fabric_cores - 1, 0}));
+
+        // W link distribution: T-batch-aligned (each link handles complete T batches).
+        // This simplifies per-row type detection in kernels (no partial-T-batch edge cases).
+
+        // CB and recv buffer on W fabric cores
+        sender_cb.core_ranges = w_fabric_core_range;
+        desc.cbs.push_back(sender_cb);
+
+        // W recv: no L1 recv buffer needed. The W writer sends padding sticks directly to
+        // the neighbor's output DRAM (same pattern as 1D H). The W reader just waits for
+        // the completion semaphore. DRAM write ordering is guaranteed by synchronize_device()
+        // before the next op dispatch.
+        w_t_total = outer_dim_size + t_front_pad;
+        w_rows_per_link = w_t_total / pad2_num_links;  // reused as t_per_link
+        w_extra_rows = w_t_total % pad2_num_links;     // reused as t_extra
+    }
+
+    // Compute H fabric unicast route configuration (for compile-time args)
+    auto [h_unicast_forward_args, h_unicast_backward_args] =
+        ::ttnn::ccl::get_forward_backward_line_unicast_configuration(
+            mesh_coordinate, forward_coord, backward_coord, mesh_device);
+
+    // Compute H fabric multicast barrier route configuration
+    auto [num_targets_forward, num_targets_backward] = ::ttnn::ccl::get_forward_backward_line_mcast_distance(
+        operation_attributes.ring_size, device_index, operation_attributes.topology, false);
+    auto [h_mcast_forward_args, h_mcast_backward_args] = ::ttnn::ccl::get_forward_backward_line_mcast_configuration(
+        mesh_coordinate, forward_coord, backward_coord, num_targets_forward, num_targets_backward, mesh_device);
+
+    // KERNEL CREATION — Consolidated: 6 kernels per device
+    // Each logical role (H reader, H writer, local reader, local writer, W reader, W writer)
+    // uses a single kernel on a CoreRangeSet. Per-core variation (direction, routing) is
+    // handled via runtime args instead of separate compile-time-arg kernels.
+    uint32_t num_directions = 2;
+
+    // Create consolidated H fabric reader kernel (uniform compile args across all H cores)
+    std::vector<uint32_t> h_reader_compile_args = {
+        sender_cb_index,   // cb_output_id
+        is_padding_zeros,  // is_padding_zeros
+        page_size};        // stick_size
+    TensorAccessorArgs(*input_buffer).append_to(h_reader_compile_args);
+    h_reader_compile_args.push_back(is_2d ? 1 : 0);              // use_l1_intermediate
+    h_reader_compile_args.push_back(is_2d ? recv_cb_index : 0);  // recv_cb_id
+    KernelDescriptor h_reader_kernel;
+    h_reader_kernel.kernel_source =
+        "ttnn/cpp/ttnn/operations/experimental/ccl/neighbor_pad_async/device/kernels/"
+        "minimal_default_reader.cpp";
+    h_reader_kernel.core_ranges = worker_core_ranges;
+    h_reader_kernel.compile_time_args = std::move(h_reader_compile_args);
+    h_reader_kernel.config = ReaderConfigDescriptor{};
+    {
+        KernelDescriptor::RTArgList h_reader_crta;
+        h_reader_crta.push_back(input_buffer);
+        h_reader_crta.push_back(output_buffer);
+        h_reader_crta.push_back(  // smuggled-rta-ok: caller GlobalSemaphore, re-applied in override_runtime_arguments
+            static_cast<uint32_t>(operation_attributes.h_neighbor_semaphore.address()));
+        h_reader_kernel.emplace_common_runtime_args(h_reader_crta);
+    }
+
+    // Create consolidated H fabric writer kernel (uniform compile args across all H cores)
+    std::vector<uint32_t> h_writer_compile_args = {
+        sender_cb_index,   // cb_output_id
+        is_padding_zeros,  // is_padding_zeros
+        page_size};        // stick_size
+    TensorAccessorArgs(*output_buffer).append_to(h_writer_compile_args);
+    h_writer_compile_args.push_back(is_2d ? 1 : 0);                   // use_l1_intermediate
+    h_writer_compile_args.push_back(is_2d ? recv_cb_index : 0);       // recv_cb_id
+    h_writer_compile_args.push_back(is_2d ? 1 : 0);                   // handle_incoming_writes
+    h_writer_compile_args.push_back(0);                               // is_w_fabric_writer (false for H)
+    h_writer_compile_args.push_back(operation_attributes.ring_size);  // ring_size
+    KernelDescriptor h_writer_kernel;
+    h_writer_kernel.kernel_source =
+        "ttnn/cpp/ttnn/operations/experimental/ccl/neighbor_pad_async/device/kernels/"
+        "minimal_default_writer.cpp";
+    h_writer_kernel.core_ranges = worker_core_ranges;
+    h_writer_kernel.compile_time_args = std::move(h_writer_compile_args);
+    h_writer_kernel.config = WriterConfigDescriptor{};
+    {
+        KernelDescriptor::RTArgList h_writer_crta;
+        h_writer_crta.push_back(input_buffer);
+        h_writer_crta.push_back(output_buffer);
+        h_writer_crta.push_back(  // smuggled-rta-ok: caller GlobalSemaphore, re-applied in override_runtime_arguments
+            static_cast<uint32_t>(operation_attributes.h_neighbor_semaphore.address()));
+        h_writer_crta.push_back(  // smuggled-rta-ok: caller GlobalSemaphore, re-applied in override_runtime_arguments
+            static_cast<uint32_t>(operation_attributes.barrier_semaphore.address()));
+        h_writer_kernel.emplace_common_runtime_args(h_writer_crta);
+    }
+
+    // Set per-core runtime args for H fabric cores
+    uint32_t link_offset_start_id = 0;
+    uint32_t writer_link_offset_start_id = 0;  // separate offset for writer (uses output row width)
+    for (uint32_t link = 0; link < num_links; link++) {
+        uint32_t link_dims_to_read = 0;
+
+        // direction 0 means pad left (top), 1 means pad right (bottom)
+        for (uint32_t direction = 0; direction < num_directions; direction++) {
+            CoreCoord core = {link * num_directions + direction, 0};
+            CoreCoord opposite_core = {(link * num_directions) + (1 - direction), 0};
+            CoreCoord virtual_core = mesh_device->worker_core_from_logical_core(core);
+            CoreCoord virtual_opposite_core = mesh_device->worker_core_from_logical_core(opposite_core);
+            if (core_group_1.contains(core)) {
+                link_dims_to_read = dims_per_core_group_1;
+            } else {
+                link_dims_to_read = dims_per_core_group_2;
+            }
+
+            // Reader runtime args (addresses in CRTAs, not here)
+            std::vector<uint32_t> reader_rt_args = {
+                (operation_attributes.dim > 0) ? link_offset_start_id * input_halo_dim_size
+                                               : outer_dim_size - 1,                  // outer_dim_offset_start_id
+                (operation_attributes.dim == 0) ? link_offset_start_id : 0,           // stick_start_id
+                input_halo_dim_size,                                                  // input_halo_dim_size
+                (operation_attributes.dim > 0) ? link_dims_to_read : outer_dim_size,  // outer_dim_size
+                direction ? operation_attributes.padding_right : operation_attributes.padding_left,  // padding
+                (operation_attributes.dim == 0) ? link_dims_to_read : num_sticks_per_halo_dim,  // num_sticks_to_read
+                num_sticks_per_halo_dim,  // num_sticks_per_halo_dim
+                corner_sticks_per_row};   // num_l1_recv_sticks_per_row (corners-only for 2D)
+            // Per-core direction args (moved from compile-time for kernel consolidation)
+            reader_rt_args.push_back(direction ? is_last_device : is_first_device);  // is_first_chip
+            reader_rt_args.push_back(direction ? is_first_device : is_last_device);  // is_last_chip
+            reader_rt_args.push_back(direction);                                     // direction
+            emplace_u32_runtime_args(h_reader_kernel, core, reader_rt_args);
+
+            // For 2D case, H fabric writer uses output row width and W offset
+            uint32_t h_writer_num_sticks_per_halo_dim =
+                is_2d ? output_num_sticks_per_halo_dim : num_sticks_per_halo_dim;
+            uint32_t h_writer_stick_start =
+                (operation_attributes.dim == 0) ? link_offset_start_id : writer_stick_start_id;
+            uint32_t h_writer_num_sticks_to_read =
+                (operation_attributes.dim == 0) ? link_dims_to_read : writer_num_sticks_to_read;
+
+            // Writer runtime args (addresses in CRTAs, not here)
+            std::vector<uint32_t> writer_rt_args = {
+                (operation_attributes.dim > 0)
+                    ? writer_link_offset_start_id * output_halo_dim_size + t_front_pad_stick_offset
+                    : outer_dim_size - 1,                                             // outer_dim_offset_start_id
+                h_writer_stick_start,                                                 // stick_start_id
+                input_halo_dim_size,                                                  // input_halo_dim_size
+                output_halo_dim_size,                                                 // output_halo_dim_size
+                (operation_attributes.dim > 0) ? link_dims_to_read : outer_dim_size,  // outer_dim_size
+                direction ? operation_attributes.padding_right : operation_attributes.padding_left,  // padding
+                operation_attributes.padding_left,                                                   // padding left
+                h_writer_num_sticks_to_read,       // num_sticks_to_read
+                h_writer_num_sticks_per_halo_dim,  // num_sticks_per_halo_dim
+                virtual_core.x,                    // neighbor_sem_noc0_x
+                virtual_core.y,                    // neighbor_sem_noc0_y
+                true,                              // use_barrier_semaphore
+                virtual_opposite_core.x,           // barrier_sem_noc0_x
+                virtual_opposite_core.y};          // barrier_sem_noc0_y
+            // Phase 2 signal targets (W fabric reader cores for 2D padding)
+            // Max targets = pad2_num_links * 2 directions (up to 8 W fabric cores)
+            // sem_addr omitted — kernel reads barrier_sem from CRTA[3]
+            constexpr uint32_t MAX_PHASE2_SIGNAL_TARGETS = 8;
+            writer_rt_args.push_back(is_2d ? num_w_fabric_cores : 0);
+            for (uint32_t s = 0; s < MAX_PHASE2_SIGNAL_TARGETS; s++) {
+                if (is_2d && s < num_w_fabric_cores) {
+                    writer_rt_args.push_back(w_fabric_virtual_cores[s].x);
+                    writer_rt_args.push_back(w_fabric_virtual_cores[s].y);
+                } else {
+                    writer_rt_args.push_back(0);
+                    writer_rt_args.push_back(0);
+                }
+            }
+            // Per-core direction and routing args (moved from compile-time for kernel consolidation)
+            writer_rt_args.push_back(direction ? is_last_device : is_first_device);  // is_first_chip
+            writer_rt_args.push_back(direction ? is_first_device : is_last_device);  // is_last_chip
+            writer_rt_args.push_back(direction);                                     // direction
+            // Unicast route args: select forward or backward based on direction
+            const auto& h_unicast_args = direction ? h_unicast_backward_args : h_unicast_forward_args;
+            writer_rt_args.insert(writer_rt_args.end(), h_unicast_args.begin(), h_unicast_args.end());
+            // Barrier multicast route info (6 args) for full-mesh startup barrier
+            const auto& h_mcast_args = direction ? h_mcast_backward_args : h_mcast_forward_args;
+            writer_rt_args.insert(writer_rt_args.end(), h_mcast_args.begin(), h_mcast_args.end());
+            // Fabric connection args
+            if (direction) {
+                writer_rt_args.push_back(false);
+                writer_rt_args.push_back(backward_coord.has_value());
+                if (backward_coord.has_value()) {
+                    const auto src_fabric_node_id = mesh_device->get_fabric_node_id(mesh_coordinate);
+                    const auto dst_fabric_node_id = mesh_device->get_fabric_node_id(backward_coord.value());
+                    tt::tt_fabric::append_fabric_connection_rt_args<ProgramDescriptor>(
+                        *mesh_device, src_fabric_node_id, dst_fabric_node_id, link, desc, core, writer_rt_args);
+                }
+            } else {
+                writer_rt_args.push_back(forward_coord.has_value());
+
+                if (forward_coord.has_value()) {
+                    const auto src_fabric_node_id = mesh_device->get_fabric_node_id(mesh_coordinate);
+                    const auto dst_fabric_node_id = mesh_device->get_fabric_node_id(forward_coord.value());
+                    tt::tt_fabric::append_fabric_connection_rt_args<ProgramDescriptor>(
+                        *mesh_device, src_fabric_node_id, dst_fabric_node_id, link, desc, core, writer_rt_args);
+                }
+                writer_rt_args.push_back(false);
+            }
+            emplace_u32_runtime_args(h_writer_kernel, core, writer_rt_args);
+        }
+        if (operation_attributes.dim > 0) {
+            link_offset_start_id += (link_dims_to_read * num_sticks_per_halo_dim);
+            // Writer offset uses output row width (wider for 2D due to W padding)
+            writer_link_offset_start_id += (link_dims_to_read * output_num_sticks_per_halo_dim);
+        } else {
+            link_offset_start_id += link_dims_to_read;
+            writer_link_offset_start_id += link_dims_to_read;
+        }
+    }
+
+    // Push order: H reader (0), H writer (1), then optional local pair, then optional W pair.
+    desc.kernels.push_back(std::move(h_reader_kernel));
+    desc.kernels.push_back(std::move(h_writer_kernel));
+    uint32_t kernel_index = k_h_writer_kernel_id + 1;
+
+    // Local copy workers on cores not used by fabric: AllCores - FabricCores
+    std::vector<CoreCoord> local_copy_core_coords;
+    bool has_local_copy = false;
+    {
+        CoreRangeSet all_cores(CoreRange({0, 0}, {compute_grid_size.x - 1, compute_grid_size.y - 1}));
+        CoreRangeSet fabric_cores = worker_core_ranges;
+        if (is_2d) {
+            fabric_cores = fabric_cores.merge(w_fabric_core_range);
+        }
+        CoreRangeSet local_copy_cores = all_cores.subtract(fabric_cores);
+
+        if (!local_copy_cores.empty()) {
+            has_local_copy = true;
+            // CB on all local-copy cores
+            sender_cb.core_ranges = local_copy_cores;
+            desc.cbs.push_back(sender_cb);
+
+            // Create consolidated local copy reader kernel (uniform compile args)
+            std::vector<uint32_t> local_reader_compile_args = {sender_cb_index, page_size};
+            TensorAccessorArgs(*input_buffer).append_to(local_reader_compile_args);
+            KernelDescriptor local_reader_kernel;
+            local_reader_kernel.kernel_source =
+                "ttnn/cpp/ttnn/operations/experimental/ccl/neighbor_pad_async/device/kernels/local_copy_reader.cpp";
+            local_reader_kernel.core_ranges = local_copy_cores;
+            local_reader_kernel.compile_time_args = std::move(local_reader_compile_args);
+            local_reader_kernel.config = ReaderConfigDescriptor{};
+            {
+                KernelDescriptor::RTArgList local_reader_crta;
+                local_reader_crta.push_back(input_buffer);   // CRTA[0]
+                local_reader_crta.push_back(output_buffer);  // CRTA[1] (unused by reader, reserved for consistency)
+                local_reader_crta.push_back(0u);             // CRTA[2]: stick_start_id (always 0)
+                local_reader_crta.push_back(input_halo_dim_size);      // CRTA[3]
+                local_reader_crta.push_back(num_sticks_per_halo_dim);  // CRTA[4]: num_sticks_to_read
+                local_reader_crta.push_back(num_sticks_per_halo_dim);  // CRTA[5]: num_sticks_per_halo_dim
+                local_reader_kernel.emplace_common_runtime_args(local_reader_crta);
+            }
+
+            // Create consolidated local copy writer kernel (uniform compile args)
+            std::vector<uint32_t> local_writer_compile_args = {sender_cb_index, page_size};
+            TensorAccessorArgs(*output_buffer).append_to(local_writer_compile_args);
+            KernelDescriptor local_writer_kernel;
+            local_writer_kernel.kernel_source =
+                "ttnn/cpp/ttnn/operations/experimental/ccl/neighbor_pad_async/device/kernels/local_copy_writer.cpp";
+            local_writer_kernel.core_ranges = local_copy_cores;
+            local_writer_kernel.compile_time_args = std::move(local_writer_compile_args);
+            local_writer_kernel.config = WriterConfigDescriptor{};
+            // Local writer CRTAs: addresses + shape/config params (no Phase 2 signal targets).
+            // device_h_offset = device_index * input_halo_dim_size (starting global index for this device's shard)
+            uint32_t mask_device_h_offset =
+                (operation_attributes.logical_h > 0) ? (device_index * input_halo_dim_size) : 0u;
+            {
+                KernelDescriptor::RTArgList local_writer_crta;
+                local_writer_crta.push_back(input_buffer);                       // CRTA[0] (unused by writer, reserved)
+                local_writer_crta.push_back(output_buffer);                      // CRTA[1]
+                local_writer_crta.push_back(writer_stick_start_id);              // CRTA[2]
+                local_writer_crta.push_back(input_halo_dim_size);                // CRTA[3]
+                local_writer_crta.push_back(output_halo_dim_size);               // CRTA[4]
+                local_writer_crta.push_back(operation_attributes.padding_left);  // CRTA[5]
+                local_writer_crta.push_back(writer_num_sticks_to_read);          // CRTA[6]
+                local_writer_crta.push_back(output_num_sticks_per_halo_dim);     // CRTA[7]
+                local_writer_crta.push_back(operation_attributes.logical_h);     // CRTA[8]
+                local_writer_crta.push_back(mask_device_h_offset);               // CRTA[9]
+                local_writer_crta.push_back(t_front_pad_stick_offset);           // CRTA[10]
+                local_writer_kernel.emplace_common_runtime_args(local_writer_crta);
+            }
+
+            // Distribute work evenly across local-copy cores and set per-core runtime args
+            std::vector<CoreCoord> local_cores = corerange_to_cores(local_copy_cores, std::nullopt, /*row_wise=*/true);
+            const uint32_t num_local_cores = local_cores.size();
+            const uint32_t total_units =
+                (operation_attributes.dim > 0) ? (outer_dim_size * input_halo_dim_size) : input_halo_dim_size;
+            const uint32_t base = (num_local_cores == 0) ? 0 : (total_units / num_local_cores);
+            const uint32_t rem = (num_local_cores == 0) ? 0 : (total_units % num_local_cores);
+
+            // Phase A: distribute T-front zero-fill sticks across local cores
+            const uint32_t a_base = (num_local_cores > 0) ? (t_front_pad_stick_offset / num_local_cores) : 0;
+            const uint32_t a_rem = (num_local_cores > 0) ? (t_front_pad_stick_offset % num_local_cores) : 0;
+            uint32_t a_offset = 0;
+
+            uint32_t unit_offset = 0;
+            local_copy_core_coords.reserve(num_local_cores);
+            for (uint32_t i = 0; i < num_local_cores; ++i) {
+                const uint32_t units_for_core = base + (i < rem ? 1u : 0u);
+                const uint32_t a_count = a_base + (i < a_rem ? 1u : 0u);
+
+                const CoreCoord& logical_core = local_cores[i];
+
+                // Per-core unique args: work distribution for Phase B (copy) and Phase A (zero-fill).
+                // These MUST be set for every core the kernels are placed on -- including cores with no
+                // work -- otherwise a no-work core reuses stale runtime args from a prior program and
+                // reads/writes garbage. Set args first, then skip bookkeeping for no-work cores.
+                local_reader_kernel.emplace_runtime_args(logical_core, {unit_offset, units_for_core});
+                local_writer_kernel.emplace_runtime_args(
+                    logical_core, {unit_offset, units_for_core, a_offset, a_count});
+
+                if (units_for_core == 0 && a_count == 0) {
+                    continue;
+                }
+                local_copy_core_coords.push_back(logical_core);
+
+                unit_offset += units_for_core;
+                a_offset += a_count;
+            }
+            desc.kernels.push_back(std::move(local_reader_kernel));
+            desc.kernels.push_back(std::move(local_writer_kernel));
+            kernel_index += 2;
+        }
+    }
+
+    // Phase 2: W fabric kernel creation (for 2D padding)
+    if (is_2d) {
+        // H fabric writers signal the barrier after writing H halo to output DRAM.
+        // Local copy writers no longer signal (W reader reads interior rows from INPUT, not OUTPUT).
+        uint32_t barrier_count = num_h_fabric_cores;
+        log_trace(
+            tt::LogOp,
+            "NeighborPad3Phase: barrier_count={} (h_writers only), "
+            "is_first_h={}, is_last_h={}, is_first_w={}, is_last_w={}, "
+            "output_row_width={}, num_interior_sticks={}, pad2_left={}",
+            barrier_count,
+            is_first_device,
+            is_last_device,
+            is_first_w_device,
+            is_last_w_device,
+            output_num_sticks_per_halo_dim,
+            num_sticks_per_halo_dim,
+            operation_attributes.pad2_left);
+
+        // W-axis startup barrier: compute ring size, device index, and multicast routes.
+        // W writers use this barrier to synchronize with all W-axis devices (same row),
+        // ensuring the previous dispatch has completed before sending new fabric data.
+        const auto& mesh_view_w = mesh_device->get_view();
+        uint32_t w_ring_size =
+            (operation_attributes.pad2_cluster_axis.value() == 0) ? mesh_view_w.num_rows() : mesh_view_w.num_cols();
+        uint32_t w_device_index = ::ttnn::ccl::get_linearized_index_from_physical_coord(
+            tensor_args.input_tensor, mesh_coordinate, operation_attributes.pad2_cluster_axis);
+        auto [w_num_targets_forward, w_num_targets_backward] = ::ttnn::ccl::get_forward_backward_line_mcast_distance(
+            w_ring_size, w_device_index, operation_attributes.topology, false);
+        auto [w_mcast_forward_args, w_mcast_backward_args] = ::ttnn::ccl::get_forward_backward_line_mcast_configuration(
+            mesh_coordinate,
+            w_forward_coord,
+            w_backward_coord,
+            w_num_targets_forward,
+            w_num_targets_backward,
+            mesh_device);
+
+        // Create consolidated W fabric reader kernel (uniform compile args across all W cores)
+        std::vector<uint32_t> w_reader_compile_args = {
+            sender_cb_index,   // cb_output_id
+            is_padding_zeros,  // is_padding_zeros
+            page_size};        // stick_size
+        TensorAccessorArgs(*output_buffer).append_to(w_reader_compile_args);
+        TensorAccessorArgs(*input_buffer).append_to(w_reader_compile_args);
+        KernelDescriptor w_reader_kernel;
+        w_reader_kernel.kernel_source =
+            "ttnn/cpp/ttnn/operations/experimental/ccl/neighbor_pad_async/device/kernels/"
+            "phase2_w_reader.cpp";
+        w_reader_kernel.core_ranges = w_fabric_core_range;
+        w_reader_kernel.compile_time_args = std::move(w_reader_compile_args);
+        w_reader_kernel.config = ReaderConfigDescriptor{};
+        {
+            KernelDescriptor::RTArgList crta;
+            crta.push_back(output_buffer);
+            crta.push_back(  // smuggled-rta-ok: caller GlobalSemaphore, re-applied in override_runtime_arguments
+                static_cast<uint32_t>(operation_attributes.barrier_semaphore.address()));
+            crta.push_back(  // smuggled-rta-ok: caller GlobalSemaphore, re-applied in override_runtime_arguments
+                static_cast<uint32_t>(operation_attributes.w_neighbor_semaphore.address()));
+            crta.push_back(input_buffer);
+            w_reader_kernel.emplace_common_runtime_args(crta);
+        }
+
+        // Create consolidated W fabric writer kernel (uniform compile args across all W cores)
+        std::vector<uint32_t> w_writer_compile_args = {
+            sender_cb_index,   // cb_output_id
+            is_padding_zeros,  // is_padding_zeros
+            page_size};        // stick_size
+        TensorAccessorArgs(*output_buffer).append_to(w_writer_compile_args);
+        w_writer_compile_args.push_back(0);            // use_l1_intermediate (direct-to-DRAM for W)
+        w_writer_compile_args.push_back(0);            // recv_cb_id (unused)
+        w_writer_compile_args.push_back(0);            // handle_incoming_writes (data goes direct to DRAM)
+        w_writer_compile_args.push_back(1);            // is_w_fabric_writer (W writer: true)
+        w_writer_compile_args.push_back(w_ring_size);  // ring_size
+        KernelDescriptor w_writer_kernel;
+        w_writer_kernel.kernel_source =
+            "ttnn/cpp/ttnn/operations/experimental/ccl/neighbor_pad_async/device/kernels/"
+            "minimal_default_writer.cpp";
+        w_writer_kernel.core_ranges = w_fabric_core_range;
+        w_writer_kernel.compile_time_args = std::move(w_writer_compile_args);
+        w_writer_kernel.config = WriterConfigDescriptor{};
+        {
+            KernelDescriptor::RTArgList crta;
+            crta.push_back(output_buffer);
+            crta.push_back(output_buffer);
+            crta.push_back(  // smuggled-rta-ok: caller GlobalSemaphore, re-applied in override_runtime_arguments
+                static_cast<uint32_t>(operation_attributes.w_neighbor_semaphore.address()));
+            // Use h_neighbor_semaphore (not barrier_semaphore) for W startup barrier:
+            // W reader (NCRISC) on the same core uses barrier_semaphore for Phase 2 barrier.
+            crta.push_back(  // smuggled-rta-ok: caller GlobalSemaphore, re-applied in override_runtime_arguments
+                static_cast<uint32_t>(operation_attributes.h_neighbor_semaphore.address()));
+            w_writer_kernel.emplace_common_runtime_args(crta);
+        }
+
+        // Set per-core runtime args for W fabric cores
+        // w_rows_per_link/w_extra_rows now hold T batches per link (T-batch-aligned distribution).
+        for (uint32_t w_link = 0; w_link < pad2_num_links; w_link++) {
+            uint32_t w_t_start = (w_link * w_rows_per_link) + std::min(w_link, w_extra_rows);
+            uint32_t w_t_count = w_rows_per_link + (w_link < w_extra_rows ? 1 : 0);
+            log_trace(
+                tt::LogOp,
+                "NeighborPad3Phase W-link {}: t_start={}, t_count={} (of {} T batches)",
+                w_link,
+                w_t_start,
+                w_t_count,
+                w_t_total);
+
+            for (uint32_t w_direction = 0; w_direction < 2; w_direction++) {
+                uint32_t w_core_idx = (w_link * 2) + w_direction;
+                CoreCoord w_core = w_fabric_logical_cores[w_core_idx];
+                CoreCoord w_virtual_core = w_fabric_virtual_cores[w_core_idx];
+
+                // W reader runtime args (addresses in CRTAs, not here)
+                // Phase 1: reads interior rows from INPUT; Phase 2: reads H-pad rows from OUTPUT.
+                // logical_h/device_h_offset mirror the same masking applied in local_copy_writer:
+                // rows at global H index >= logical_h must be zeroed in the W exchange too.
+                uint32_t w_reader_device_h_offset =
+                    (operation_attributes.logical_h > 0) ? (device_index * input_halo_dim_size) : 0u;
+                std::vector<uint32_t> w_reader_rt_args = {
+                    w_t_count,  // t_count: T batches for this link
+                    w_t_start,  // t_start: starting T batch (includes t_front_pad offset)
+                    w_direction ? operation_attributes.pad2_right : operation_attributes.pad2_left,  // padding
+                    barrier_count,
+                    output_num_sticks_per_halo_dim,                      // output_row_width (W')
+                    operation_attributes.pad2_left,                      // pad2_left
+                    num_sticks_per_halo_dim,                             // num_interior_sticks (W_in)
+                    w_direction ? is_last_w_device : is_first_w_device,  // is_first_chip
+                    w_direction ? is_first_w_device : is_last_w_device,  // is_last_chip
+                    w_direction,                                         // direction
+                    operation_attributes.padding_left,                   // h_pad_top
+                    input_halo_dim_size,                                 // h_in
+                    operation_attributes.padding_right,                  // h_pad_bot
+                    t_front_pad,                                         // t_front_pad
+                    operation_attributes.logical_h,                      // logical_h (0 = no masking)
+                    w_reader_device_h_offset};                           // device_h_offset = device_index * h_in
+                emplace_u32_runtime_args(w_reader_kernel, w_core, w_reader_rt_args);
+
+                // W writer runtime args (addresses in CRTAs, not here)
+                // outer_dim_offset_start_id is unused for W writer two-pass path but kept for
+                // arg index compatibility with the H writer path in the same kernel binary.
+                std::vector<uint32_t> w_writer_rt_args = {
+                    0,                                 // outer_dim_offset_start_id (unused by W two-pass)
+                    0,                                 // stick_start_id
+                    input_halo_dim_size,               // input_halo_dim_size (unused by W writer)
+                    output_num_sticks_per_halo_dim,    // output_halo_dim_size = W'
+                    w_t_count * output_halo_dim_size,  // outer_dim_size (unused by W two-pass, kept for compat)
+                    w_direction ? operation_attributes.pad2_right : operation_attributes.pad2_left,  // padding
+                    operation_attributes.pad2_left,                                                  // padding_left
+                    1,                 // num_sticks_to_read
+                    1,                 // num_sticks_per_halo_dim
+                    w_virtual_core.x,  // neighbor_sem_noc0_x
+                    w_virtual_core.y,  // neighbor_sem_noc0_y
+                    true,              // use_barrier_semaphore (W-axis startup barrier)
+                    w_fabric_virtual_cores[(w_link * 2) + (1 - w_direction)].x,   // barrier_sem_noc0_x (opp dir)
+                    w_fabric_virtual_cores[(w_link * 2) + (1 - w_direction)].y};  // barrier_sem_noc0_y
+                // No Phase 2 signal targets (W writers don't signal further)
+                constexpr uint32_t MAX_PHASE2_SIGNAL_TARGETS = 8;
+                w_writer_rt_args.push_back(0);
+                for (uint32_t s = 0; s < MAX_PHASE2_SIGNAL_TARGETS * 2; s++) {
+                    w_writer_rt_args.push_back(0);
+                }
+                // Per-core direction and routing args
+                w_writer_rt_args.push_back(w_direction ? is_last_w_device : is_first_w_device);  // is_first_chip
+                w_writer_rt_args.push_back(w_direction ? is_first_w_device : is_last_w_device);  // is_last_chip
+                w_writer_rt_args.push_back(w_direction);                                         // direction
+                // W fabric unicast route args: manually constructed with actual hop distances
+                uint32_t w_device_offset = w_direction ? w_backward_device_offset : w_forward_device_offset;
+                w_writer_rt_args.push_back(0);                // dst_mesh_id (unused for 1D)
+                w_writer_rt_args.push_back(w_device_offset);  // distance_in_hops
+                // W barrier multicast route info (6 args)
+                const auto& w_mcast_args = w_direction ? w_mcast_backward_args : w_mcast_forward_args;
+                w_writer_rt_args.insert(w_writer_rt_args.end(), w_mcast_args.begin(), w_mcast_args.end());
+                // Fabric connection args
+                if (w_direction) {
+                    w_writer_rt_args.push_back(false);
+                    w_writer_rt_args.push_back(w_backward_coord.has_value());
+                    if (w_backward_coord.has_value()) {
+                        const auto src_fabric_node_id = mesh_device->get_fabric_node_id(mesh_coordinate);
+                        const auto dst_fabric_node_id = mesh_device->get_fabric_node_id(w_backward_coord.value());
+                        tt::tt_fabric::append_fabric_connection_rt_args<ProgramDescriptor>(
+                            *mesh_device,
+                            src_fabric_node_id,
+                            dst_fabric_node_id,
+                            w_link,
+                            desc,
+                            w_core,
+                            w_writer_rt_args);
+                    }
+                } else {
+                    w_writer_rt_args.push_back(w_forward_coord.has_value());
+                    if (w_forward_coord.has_value()) {
+                        const auto src_fabric_node_id = mesh_device->get_fabric_node_id(mesh_coordinate);
+                        const auto dst_fabric_node_id = mesh_device->get_fabric_node_id(w_forward_coord.value());
+                        tt::tt_fabric::append_fabric_connection_rt_args<ProgramDescriptor>(
+                            *mesh_device,
+                            src_fabric_node_id,
+                            dst_fabric_node_id,
+                            w_link,
+                            desc,
+                            w_core,
+                            w_writer_rt_args);
+                    }
+                    w_writer_rt_args.push_back(false);
+                }
+                // W writer two-pass args (appended after fabric connection args, read by kernel)
+                w_writer_rt_args.push_back(w_t_start);                           // w2_t_start
+                w_writer_rt_args.push_back(w_t_count);                           // w2_t_count
+                w_writer_rt_args.push_back(operation_attributes.padding_left);   // w2_h_pad_top
+                w_writer_rt_args.push_back(input_halo_dim_size);                 // w2_h_in
+                w_writer_rt_args.push_back(operation_attributes.padding_right);  // w2_h_pad_bot
+                w_writer_rt_args.push_back(output_halo_dim_size);                // w2_h_out
+                emplace_u32_runtime_args(w_writer_kernel, w_core, w_writer_rt_args);
+            }
+        }
+        desc.kernels.push_back(std::move(w_reader_kernel));
+        desc.kernels.push_back(std::move(w_writer_kernel));
+        kernel_index += 2;
+    }
+
+    const NeighborPadKernelPresence presence =
+        neighbor_pad_kernel_presence(operation_attributes, tensor_args.input_tensor);
+    TT_FATAL(
+        presence.has_local_copy == has_local_copy && presence.has_w_fabric == is_2d &&
+            desc.kernels.size() == kernel_index,
+        "neighbor_pad kernel presence diverged from the program descriptor");
+    return desc;
+}
+
+}  // namespace
+
+}  // namespace ttnn::experimental::prim

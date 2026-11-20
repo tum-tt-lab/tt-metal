@@ -1,0 +1,916 @@
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include <cmath>
+#include <limits>
+#include <type_traits>
+#include <utility>
+#include "ttnn/operations/experimental/quasar/binary/binary.hpp"
+#include "ttnn/operations/experimental/quasar/binary_ng/device/binary_ng_device_operation.hpp"
+#include "ttnn/operations/eltwise/unary/unary.hpp"
+#include "ttnn/types.hpp"
+#include <tt-metalium/bfloat16.hpp>
+#include <tt-metalium/hal.hpp>
+#include "ttnn/operations/experimental/quasar/binary/binary_composite.hpp"
+#include "ttnn/operations/eltwise/ternary/ternary.hpp"
+#include "ttnn/operations/copy/typecast/typecast.hpp"
+#include <tt-metalium/tensor/tensor_types.hpp>
+#include "ttnn/operations/eltwise/unary/unary_composite.hpp"
+#include "ttnn/operations/data_movement/pad/pad.hpp"
+#include "ttnn/operations/matmul/matmul.hpp"
+#include "ttnn/operations/creation/creation.hpp"
+#include "ttnn/operations/experimental/quasar/reshape_view/reshape.hpp"
+#include "ttnn/operations/experimental/quasar/to_layout/to_layout_op.hpp"
+#include <variant>
+#include <tt-metalium/sub_device_types.hpp>
+
+namespace ttnn::operations::experimental::quasar::binary {
+
+using namespace operations;
+
+namespace q = ttnn::operations::experimental::quasar::binary;
+
+// nextafter
+Tensor nextafter(const Tensor& input_a, const Tensor& input_b, const std::optional<MemoryConfig>& output_mem_config) {
+    const float eps = tt::tt_metal::hal::get_eps();
+    Tensor result(input_a);
+    {
+        Tensor eps_gt(input_a);
+        {
+            eps_gt = ttnn::where(
+                q::gt(input_a, input_b, std::nullopt, output_mem_config),
+                q::add(input_a, eps, std::nullopt, output_mem_config),
+                input_a);
+        }
+        result = ttnn::where(
+            q::lt(input_a, input_b, std::nullopt, output_mem_config),
+            q::subtract(input_a, eps, std::nullopt, output_mem_config),
+            eps_gt);
+    }
+    return result;
+}
+
+Tensor minimum(
+    const Tensor& input_tensor_a,
+    const Tensor& input_tensor_b,
+    const std::optional<const DataType>& /*output_dtype*/,
+    const std::optional<MemoryConfig>& memory_config,
+    const std::optional<Tensor>& optional_output_tensor,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> post_activations,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> lhs_activations,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> rhs_activations) {
+    return ttnn::operations::experimental::quasar::binary::detail::invoke_binary_ng(
+        input_tensor_a,
+        input_tensor_b,
+        binary::BinaryOpType::MINIMUM,
+        std::nullopt,
+        memory_config,
+        optional_output_tensor,
+        post_activations,
+        lhs_activations,
+        rhs_activations);
+}
+
+Tensor minimum(
+    const Tensor& input_a,
+    unary::ScalarVariant value,
+    const std::optional<const DataType>& /*output_dtype*/,
+    const std::optional<MemoryConfig>& memory_config,
+    const std::optional<Tensor>& optional_output_tensor,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> /*post_activations*/,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> /*lhs_activations*/,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> /*rhs_activations*/) {
+    return std::visit(
+        [&](auto input_b) {
+            return ttnn::operations::unary::detail::unary_impl(
+                input_a,
+                {unary::EltwiseUnaryWithParam{unary::UnaryOpType::MINIMUM, (input_b)}},
+                memory_config,
+                optional_output_tensor);
+        },
+        value);
+}
+
+Tensor maximum(
+    const Tensor& input_tensor_a,
+    const Tensor& input_tensor_b,
+    const std::optional<const DataType>& /*output_dtype*/,
+    const std::optional<MemoryConfig>& memory_config,
+    const std::optional<Tensor>& optional_output_tensor,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> post_activations,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> lhs_activations,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> rhs_activations) {
+    return ttnn::operations::experimental::quasar::binary::detail::invoke_binary_ng(
+        input_tensor_a,
+        input_tensor_b,
+        binary::BinaryOpType::MAXIMUM,
+        std::nullopt,
+        memory_config,
+        optional_output_tensor,
+        post_activations,
+        lhs_activations,
+        rhs_activations);
+}
+
+Tensor maximum(
+    const Tensor& input_a,
+    unary::ScalarVariant value,
+    const std::optional<const DataType>& /*output_dtype*/,
+    const std::optional<MemoryConfig>& memory_config,
+    const std::optional<Tensor>& optional_output_tensor,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> /*post_activations*/,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> /*lhs_activations*/,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> /*rhs_activations*/) {
+    return std::visit(
+        [&](auto input_b) {
+            return ttnn::operations::unary::detail::unary_impl(
+                input_a,
+                {unary::EltwiseUnaryWithParam{unary::UnaryOpType::MAXIMUM, (input_b)}},
+                memory_config,
+                optional_output_tensor);
+        },
+        value);
+}
+
+Tensor atan2(const Tensor& input_b, const Tensor& input_a, const std::optional<MemoryConfig>& output_mem_config) {
+    return ttnn::operations::experimental::quasar::binary::detail::invoke_binary_ng(
+        input_b,
+        input_a,
+        binary::BinaryOpType::ATAN2,
+        std::nullopt,
+        output_mem_config,
+        std::nullopt,
+        {},
+        {},
+        {},
+        std::nullopt);
+}
+
+Tensor div(
+    const Tensor& input,
+    unary::ScalarVariant value,
+    bool fast_and_approximate_mode,
+    const std::optional<std::string>& rounding_mode,
+    const std::optional<const DataType>& output_dtype,
+    const std::optional<MemoryConfig>& output_mem_config,
+    const std::optional<Tensor>& output_tensor,
+    ttsl::Span<const ttnn::operations::unary::EltwiseUnaryWithParam> post_activations,
+    ttsl::Span<const ttnn::operations::unary::EltwiseUnaryWithParam> lhs_activations,
+    ttsl::Span<const ttnn::operations::unary::EltwiseUnaryWithParam> rhs_activations,
+    const std::optional<CoreRangeSet>& sub_core_grids,
+    const std::optional<tt::tt_metal::SubDeviceId>& sub_device_id) {
+    const bool is_int32 = input.dtype() == DataType::INT32;
+
+    if (is_int32) {
+        TT_FATAL(
+            !fast_and_approximate_mode,
+            "Integer Division does not support fast_and_approximate_mode=true {}",
+            fast_and_approximate_mode);
+        // fast_and_approximate_mode is not supported for integer division yet.
+
+        if (rounding_mode == "floor") {
+            return ttnn::operations::experimental::quasar::binary::detail::invoke_binary_ng(
+                input,
+                value,
+                binary::BinaryOpType::DIV_FLOOR,
+                output_dtype,
+                output_mem_config,
+                output_tensor,
+                post_activations,
+                lhs_activations,
+                rhs_activations,
+                /*fast_and_approximate_mode=*/std::nullopt,
+                sub_core_grids,
+                sub_device_id);
+        }
+        if (rounding_mode == "trunc") {
+            return ttnn::operations::experimental::quasar::binary::detail::invoke_binary_ng(
+                input,
+                value,
+                binary::BinaryOpType::DIV_TRUNC,
+                output_dtype,
+                output_mem_config,
+                output_tensor,
+                post_activations,
+                lhs_activations,
+                rhs_activations,
+                /*fast_and_approximate_mode=*/std::nullopt,
+                sub_core_grids,
+                sub_device_id);
+        }
+        // rounding_mode = None
+        TT_FATAL(
+            (!output_dtype.has_value() || output_dtype == DataType::FLOAT32),
+            "Incorrect output_dtype value for Integer Division(rounding_mode=None) ; valid input values are None or "
+            "ttnn.float32");
+        return ttnn::operations::experimental::quasar::binary::detail::invoke_binary_ng(
+            input,
+            value,
+            binary::BinaryOpType::DIV,
+            output_dtype,
+            output_mem_config,
+            output_tensor,
+            post_activations,
+            lhs_activations,
+            rhs_activations,
+            std::nullopt,  // fast_and_approximate_mode
+            sub_core_grids,
+            sub_device_id);
+    }
+
+    // Non-int32 inputs: with rounding_mode=None, use DIV directly; with "trunc"/"floor",
+    // compute the float divide then apply trunc/floor rounding.
+    if (!rounding_mode.has_value()) {
+        return ttnn::operations::experimental::quasar::binary::detail::invoke_binary_ng(
+            input,
+            value,
+            binary::BinaryOpType::DIV,
+            output_dtype,
+            output_mem_config,
+            output_tensor,
+            post_activations,
+            lhs_activations,
+            rhs_activations,
+            fast_and_approximate_mode,
+            sub_core_grids,
+            sub_device_id);
+    }
+
+    TT_FATAL(
+        (rounding_mode == "trunc" || rounding_mode == "floor"),
+        "Incorrect rounding mode (expected None, 'trunc', or 'floor')");
+
+    // Workaround for a known bfloat16 fast_and_approximate divide bug (issue #43209):
+    // 0/0 returns 0 instead of NaN, and sign-of-zero is lost. The pre-legacy-removal
+    // path used a float32 typecast as a safety guard; we restore the same invariant by
+    // suppressing fast_and_approximate on bfloat16 inside the rounding-mode branch.
+    // The rounding_mode=None case is documented via the existing test skip in
+    // tests/ttnn/unit_tests/operations/eltwise/test_binary_fp32.py. Remove this
+    // workaround when #43209 is fixed.
+    const bool suppress_fap = fast_and_approximate_mode && input.dtype() == DataType::BFLOAT16;
+    const bool effective_fap = suppress_fap ? false : fast_and_approximate_mode;
+
+    // A preallocated output pins the result dtype exactly like an explicit dtype does, so the two
+    // have to agree before either can decide how the quotient is rounded.
+    TT_FATAL(
+        !output_dtype.has_value() || !output_tensor.has_value() || *output_dtype == output_tensor->dtype(),
+        "If both output dtype and output tensor are provided, their dtypes should match");
+    const std::optional<const DataType> requested_dtype =
+        output_tensor.has_value() ? std::optional<const DataType>{output_tensor->dtype()} : output_dtype;
+
+    // The quotient has to stay in floating point until it is rounded: narrowing it to an integer
+    // dtype first truncates toward zero, which would turn floor(-3.5) into -3 instead of -4. An
+    // integer destination is therefore filled by a typecast after the rounding step.
+    const bool cast_after_rounding = requested_dtype.has_value() && !tt::tt_metal::is_floating_point(*requested_dtype);
+    const std::optional<const DataType> quotient_dtype =
+        cast_after_rounding ? std::optional<const DataType>{} : output_dtype;
+    const std::optional<Tensor> quotient_output = cast_after_rounding ? std::optional<Tensor>{} : output_tensor;
+
+    std::optional<Tensor> divided = q::divide(
+        input,
+        value,
+        quotient_dtype,
+        output_mem_config,
+        quotient_output,
+        post_activations,
+        lhs_activations,
+        rhs_activations,
+        effective_fap,
+        sub_core_grids,
+        sub_device_id);
+
+    Tensor rounded = (rounding_mode == "trunc")
+                         ? ttnn::trunc(divided.value(), output_mem_config, quotient_output, sub_core_grids)
+                         : ttnn::floor(divided.value(), output_mem_config, quotient_output, sub_core_grids);
+    if (!cast_after_rounding) {
+        return rounded;
+    }
+    return ttnn::typecast(rounded, *requested_dtype, output_mem_config, output_tensor, sub_core_grids);
+}
+
+Tensor div(
+    const Tensor& input_a,
+    const Tensor& input_b,
+    bool fast_and_approximate_mode,
+    const std::optional<std::string>& rounding_mode,
+    const std::optional<const DataType>& output_dtype,
+    const std::optional<MemoryConfig>& output_mem_config,
+    const std::optional<Tensor>& output_tensor,
+    ttsl::Span<const ttnn::operations::unary::EltwiseUnaryWithParam> post_activations,
+    ttsl::Span<const ttnn::operations::unary::EltwiseUnaryWithParam> lhs_activations,
+    ttsl::Span<const ttnn::operations::unary::EltwiseUnaryWithParam> rhs_activations,
+    const std::optional<CoreRangeSet>& sub_core_grids,
+    const std::optional<tt::tt_metal::SubDeviceId>& sub_device_id) {
+    DataType input_dtype = input_a.dtype();
+    const bool is_int32 = input_dtype == DataType::INT32 && input_b.dtype() == DataType::INT32;
+
+    if (is_int32) {
+        TT_FATAL(
+            !fast_and_approximate_mode,
+            "Integer Division does not support fast_and_approximate_mode=true {}",
+            fast_and_approximate_mode);
+        // fast_and_approximate_mode is not supported for integer division yet.
+
+        if (rounding_mode == "floor") {
+            return ttnn::operations::experimental::quasar::binary::detail::invoke_binary_ng(
+                input_a,
+                input_b,
+                binary::BinaryOpType::DIV_FLOOR,
+                output_dtype,
+                output_mem_config,
+                output_tensor,
+                post_activations,
+                lhs_activations,
+                rhs_activations,
+                /*fast_and_approximate_mode=*/std::nullopt,
+                sub_core_grids,
+                sub_device_id);
+        }
+        if (rounding_mode == "trunc") {
+            return ttnn::operations::experimental::quasar::binary::detail::invoke_binary_ng(
+                input_a,
+                input_b,
+                binary::BinaryOpType::DIV_TRUNC,
+                output_dtype,
+                output_mem_config,
+                output_tensor,
+                post_activations,
+                lhs_activations,
+                rhs_activations,
+                /*fast_and_approximate_mode=*/std::nullopt,
+                sub_core_grids,
+                sub_device_id);
+        }
+        // rounding_mode = None
+        TT_FATAL(
+            (!output_dtype.has_value() || output_dtype == DataType::FLOAT32),
+            "Incorrect output_dtype value for Integer Division(rounding_mode=None) ; valid input values are None or "
+            "ttnn.float32");
+        return ttnn::operations::experimental::quasar::binary::detail::invoke_binary_ng(
+            input_a,
+            input_b,
+            binary::BinaryOpType::DIV,
+            output_dtype,
+            output_mem_config,
+            output_tensor,
+            post_activations,
+            lhs_activations,
+            rhs_activations,
+            std::nullopt,  // fast_and_approximate_mode
+            sub_core_grids,
+            sub_device_id);
+    }
+
+    // Non-int32 inputs: with rounding_mode=None, use DIV directly; with "trunc"/"floor",
+    // compute the float divide then apply trunc/floor rounding.
+    if (!rounding_mode.has_value()) {
+        return ttnn::operations::experimental::quasar::binary::detail::invoke_binary_ng(
+            input_a,
+            input_b,
+            binary::BinaryOpType::DIV,
+            output_dtype,
+            output_mem_config,
+            output_tensor,
+            post_activations,
+            lhs_activations,
+            rhs_activations,
+            fast_and_approximate_mode,
+            sub_core_grids,
+            sub_device_id);
+    }
+
+    TT_FATAL(
+        (rounding_mode == "trunc" || rounding_mode == "floor"),
+        "Incorrect rounding mode (expected None, 'trunc', or 'floor')");
+
+    // Workaround for a known bfloat16 fast_and_approximate divide bug (issue #43209):
+    // 0/0 returns 0 instead of NaN, and sign-of-zero is lost. The pre-legacy-removal
+    // path used a float32 typecast as a safety guard; we restore the same invariant by
+    // suppressing fast_and_approximate on bfloat16 inside the rounding-mode branch.
+    // The rounding_mode=None case is documented via the existing test skip in
+    // tests/ttnn/unit_tests/operations/eltwise/test_binary_fp32.py. Remove this
+    // workaround when #43209 is fixed.
+    const bool suppress_fap = fast_and_approximate_mode && input_dtype == DataType::BFLOAT16;
+    const bool effective_fap = suppress_fap ? false : fast_and_approximate_mode;
+
+    // A preallocated output pins the result dtype exactly like an explicit dtype does, so the two
+    // have to agree before either can decide how the quotient is rounded.
+    TT_FATAL(
+        !output_dtype.has_value() || !output_tensor.has_value() || *output_dtype == output_tensor->dtype(),
+        "If both output dtype and output tensor are provided, their dtypes should match");
+    const std::optional<const DataType> requested_dtype =
+        output_tensor.has_value() ? std::optional<const DataType>{output_tensor->dtype()} : output_dtype;
+
+    // The quotient has to stay in floating point until it is rounded: narrowing it to an integer
+    // dtype first truncates toward zero, which would turn floor(-3.5) into -3 instead of -4. An
+    // integer destination is therefore filled by a typecast after the rounding step.
+    const bool cast_after_rounding = requested_dtype.has_value() && !tt::tt_metal::is_floating_point(*requested_dtype);
+    const std::optional<const DataType> quotient_dtype =
+        cast_after_rounding ? std::optional<const DataType>{} : output_dtype;
+    const std::optional<Tensor> quotient_output = cast_after_rounding ? std::optional<Tensor>{} : output_tensor;
+
+    std::optional<Tensor> divided = q::divide(
+        input_a,
+        input_b,
+        quotient_dtype,
+        output_mem_config,
+        quotient_output,
+        post_activations,
+        lhs_activations,
+        rhs_activations,
+        effective_fap,
+        sub_core_grids,
+        sub_device_id);
+
+    Tensor rounded = (rounding_mode == "trunc")
+                         ? ttnn::trunc(divided.value(), output_mem_config, quotient_output, sub_core_grids)
+                         : ttnn::floor(divided.value(), output_mem_config, quotient_output, sub_core_grids);
+    if (!cast_after_rounding) {
+        return rounded;
+    }
+    return ttnn::typecast(rounded, *requested_dtype, output_mem_config, output_tensor, sub_core_grids);
+}
+
+Tensor div_no_nan(
+    const Tensor& input_a, unary::ScalarVariant value, const std::optional<MemoryConfig>& output_mem_config) {
+    float value_f = std::visit([](auto v) -> float { return static_cast<float>(v); }, value);
+    if (value_f == 0) {
+        return ttnn::zeros_like(input_a, std::nullopt, std::nullopt, std::nullopt, output_mem_config);
+    }
+    return q::multiply(input_a, (1.0f / value_f), std::nullopt, output_mem_config);
+}
+
+Tensor div_no_nan(const Tensor& input_a, const Tensor& input_b, const std::optional<MemoryConfig>& output_mem_config) {
+    if (input_a.dtype() == DataType::FLOAT32 && input_b.dtype() == DataType::FLOAT32) {
+        // Not using SFPU div op here since inf/nan handling is not required
+        Tensor div_result = q::multiply(input_a, ttnn::reciprocal(input_b), std::nullopt, output_mem_config);
+        return ttnn::where(ttnn::eqz(input_b, output_mem_config), 0.0f, div_result);
+    }
+    Tensor div_result = q::divide(input_a, input_b, std::nullopt, output_mem_config);
+    return ttnn::where(ttnn::eqz(input_b, output_mem_config), 0.0f, div_result);
+}
+
+Tensor prelu(const Tensor& input, unary::ScalarVariant weight, const std::optional<MemoryConfig>& output_mem_config) {
+    float weight_f = std::visit([](auto v) -> float { return static_cast<float>(v); }, weight);
+    return ttnn::prelu_sfpu(input, weight_f, output_mem_config);
+}
+
+Tensor prelu(
+    const Tensor& input, const std::array<float, 1>& weight, const std::optional<MemoryConfig>& output_mem_config) {
+    float scalar_weight = weight[0];
+    return ttnn::prelu_sfpu(input, scalar_weight, output_mem_config);
+}
+
+Tensor prelu(const Tensor& input_a, const Tensor& input_b, const std::optional<MemoryConfig>& output_mem_config) {
+    const auto& s_a = input_a.logical_shape();
+    const auto volume = input_b.logical_volume();
+    TT_FATAL(
+        s_a[1] == volume,
+        "Mismatch of parameter numbers and input channel size. Found parameter numbers = {} and channel size = {}.",
+        volume,
+        s_a[1]);
+    Tensor b = input_b;
+    if (s_a.rank() > 2) {
+        ttsl::SmallVector<uint32_t> reshape(s_a.rank(), 1);
+        reshape[1] = s_a[1];
+        b = ttnn::operations::experimental::quasar::reshape(input_b, ttnn::Shape(reshape));
+    }
+
+    Tensor result = ttnn::where(ttnn::ltz(input_a, output_mem_config), q::multiply(input_a, b), input_a);
+    return result;
+}
+
+// REMAINDER result = input − (other * floor(input/other))
+Tensor remainder(
+    const Tensor& input_a,
+    const Tensor& input_b,
+    const std::optional<const DataType>& output_dtype,
+    const std::optional<MemoryConfig>& output_mem_config,
+    const std::optional<Tensor>& output_tensor,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> post_activations,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> lhs_activations,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> rhs_activations,
+    const std::optional<CoreRangeSet>& sub_core_grids,
+    const std::optional<tt::tt_metal::SubDeviceId>& sub_device_id) {
+    return ttnn::operations::experimental::quasar::binary::detail::invoke_binary_ng(
+        input_a,
+        input_b,
+        binary::BinaryOpType::REMAINDER,
+        output_dtype,
+        output_mem_config,
+        output_tensor,
+        post_activations,
+        lhs_activations,
+        rhs_activations,
+        std::nullopt,
+        sub_core_grids,
+        sub_device_id);
+}
+
+Tensor remainder(
+    const Tensor& input,
+    unary::ScalarVariant scalar,
+    const std::optional<const DataType>& output_dtype,
+    const std::optional<MemoryConfig>& output_mem_config,
+    const std::optional<Tensor>& output_tensor,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> post_activations,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> lhs_activations,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> rhs_activations,
+    const std::optional<CoreRangeSet>& sub_core_grids,
+    const std::optional<tt::tt_metal::SubDeviceId>& sub_device_id) {
+    // binary_ng packs the scalar with a static_cast to the INT32 input dtype, which is exact only for a finite
+    // integer in range. 2^31 is written as a float because INT32_MAX is not representable as one.
+    if (input.dtype() == DataType::INT32 && std::holds_alternative<float>(scalar)) {
+        const float value = std::get<float>(scalar);
+        TT_FATAL(
+            std::isfinite(value) && std::trunc(value) == value && value >= -2147483648.0f && value < 2147483648.0f,
+            "remainder: INT32 input needs a finite integral scalar within the INT32 range, got {}",
+            value);
+    }
+    if (input.dtype() == DataType::INT32 && std::holds_alternative<uint32_t>(scalar)) {
+        TT_FATAL(
+            std::get<uint32_t>(scalar) <= static_cast<uint32_t>(std::numeric_limits<int32_t>::max()),
+            "remainder: INT32 input needs a finite integral scalar within the INT32 range, got {}",
+            std::get<uint32_t>(scalar));
+    }
+    // The unary SFPU fast path takes none of these arguments and does not support INT32.
+    if (input.dtype() != DataType::INT32 && !output_dtype.has_value() && !sub_device_id.has_value() &&
+        post_activations.empty() && lhs_activations.empty() && rhs_activations.empty()) {
+        float scalar_f = std::visit([](auto v) -> float { return static_cast<float>(v); }, scalar);
+        return ttnn::unary_remainder(input, scalar_f, output_mem_config, output_tensor, sub_core_grids);
+    }
+    return ttnn::operations::experimental::quasar::binary::detail::invoke_binary_ng(
+        input,
+        scalar,
+        binary::BinaryOpType::REMAINDER,
+        output_dtype,
+        output_mem_config,
+        output_tensor,
+        post_activations,
+        lhs_activations,
+        rhs_activations,
+        std::nullopt,
+        sub_core_grids,
+        sub_device_id);
+}
+
+// FMOD result = input − (other * trunc(input/other))
+Tensor fmod(
+    const Tensor& input_a,
+    const Tensor& input_b,
+    const std::optional<MemoryConfig>& output_mem_config,
+    const std::optional<CoreRangeSet>& sub_core_grids,
+    const std::optional<tt::tt_metal::SubDeviceId>& sub_device_id) {
+    return ttnn::operations::experimental::quasar::binary::detail::invoke_binary_ng(
+        input_a,
+        input_b,
+        binary::BinaryOpType::FMOD,
+        std::nullopt,
+        output_mem_config,
+        std::nullopt,
+        {},
+        {},
+        {},
+        std::nullopt,
+        sub_core_grids,
+        sub_device_id);
+}
+
+Tensor fmod(
+    const Tensor& input,
+    unary::ScalarVariant scalar,
+    const std::optional<MemoryConfig>& output_mem_config,
+    const std::optional<CoreRangeSet>& /*sub_core_grids*/,
+    const std::optional<tt::tt_metal::SubDeviceId>& /*sub_device_id*/) {
+    float scalar_f = std::visit([](auto v) -> float { return static_cast<float>(v); }, scalar);
+    return ttnn::unary_fmod(input, scalar_f, output_mem_config);
+}
+
+Tensor floor_div(
+    const Tensor& input_a, unary::ScalarVariant value, const std::optional<MemoryConfig>& output_mem_config) {
+    float value_f = std::visit([](auto v) -> float { return static_cast<float>(v); }, value);
+    if (value_f == 0) {
+        float t_inf = std::numeric_limits<float>::infinity();
+        float t_nan = std::nanf("");
+        return ttnn::where(
+            ttnn::eqz(input_a, output_mem_config),
+            t_nan,
+            q::multiply(ttnn::sign(input_a, output_mem_config), t_inf, std::nullopt, output_mem_config));
+    }
+    Tensor temp = q::multiply(input_a, (1.0f / value_f), std::nullopt, output_mem_config);
+    return ttnn::floor(temp);
+}
+
+Tensor floor_div(const Tensor& input_a, const Tensor& input_b, const std::optional<MemoryConfig>& output_mem_config) {
+    Tensor temp = div(input_a, input_b, false, std::nullopt, std::nullopt, output_mem_config);
+    Tensor result = div(input_a, input_b, false, "floor", std::nullopt, output_mem_config);
+    // floor(nan, inf, -inf) = nan, inf, -inf
+    return ttnn::where(
+        q::logical_or(
+            q::eq(temp, std::nanf("")),
+            q::logical_or(
+                q::eq(temp, std::numeric_limits<float>::infinity()),
+                q::eq(temp, -std::numeric_limits<float>::infinity()))),
+        temp,
+        result);
+}
+
+/**
+ * outer product = matrix multiply when a = [1,1,N,1] and b = [1,1,1,M]
+ * and result is of size [1,1,N,M].
+ * - implementation supports any 1D "squeezable tensor" at input operands
+ *   by running reshape.
+ */
+Tensor outer(const Tensor& input_a, const Tensor& input_b, const std::optional<MemoryConfig>& output_mem_config) {
+    TT_FATAL(
+        input_a.logical_shape().rank() >= 1 && input_b.logical_shape().rank() >= 1,
+        "outer: inputs must be at least 1D, but got shapes {} and {}",
+        input_a.logical_shape(),
+        input_b.logical_shape());
+    const ttnn::Shape& s_a = input_a.logical_shape();
+    const ttnn::Shape& s_b = input_b.logical_shape();
+    // Inputs of any rank are vectors as long as at most one dimension differs from 1.
+    auto is_vector = [](const ttnn::Shape& s) {
+        uint32_t non_ones = 0;
+        for (int idx = 0; idx < static_cast<int>(s.rank()); idx++) {
+            non_ones += static_cast<uint32_t>(s[idx] != 1);
+        }
+        return non_ones <= 1;
+    };
+    TT_FATAL(is_vector(s_a), "outer: all but one dimension of input_a must be 1, got shape {}", s_a);
+    TT_FATAL(is_vector(s_b), "outer: all but one dimension of input_b must be 1, got shape {}", s_b);
+
+    const bool skip_reshape_a = s_a.rank() == 4 && s_a[0] == 1 && s_a[1] == 1 && s_a[3] == 1;
+    const bool skip_reshape_b = s_b.rank() == 4 && s_b[0] == 1 && s_b[1] == 1 && s_b[2] == 1;
+
+    Tensor a_slim = input_a;
+    Tensor b_slim = input_b;
+
+    if (!skip_reshape_a) {
+        const auto a_volume = static_cast<uint32_t>(input_a.logical_volume());
+        a_slim = ttnn::operations::experimental::quasar::reshape(
+            input_a, ttnn::Shape{std::array<uint32_t, 4>{1, 1, a_volume, 1}});
+    }
+    if (!skip_reshape_b) {
+        const auto b_volume = static_cast<uint32_t>(input_b.logical_volume());
+        b_slim = ttnn::operations::experimental::quasar::reshape(
+            input_b, ttnn::Shape{std::array<uint32_t, 4>{1, 1, 1, b_volume}});
+    }
+    a_slim = ttnn::operations::experimental::quasar::to_layout(a_slim, ttnn::TILE_LAYOUT);
+    b_slim = ttnn::operations::experimental::quasar::to_layout(b_slim, ttnn::TILE_LAYOUT);
+
+    // Take the device from the operand that is already on one, not from the process-wide default
+    // device: that default is a raw pointer nothing clears when the device it names is closed.
+    auto* device = a_slim.device() != nullptr ? a_slim.device() : b_slim.device();
+    if (device != nullptr) {
+        if (a_slim.storage_type() != ttnn::StorageType::DEVICE) {
+            a_slim = a_slim.to_device(device);
+        }
+        if (b_slim.storage_type() != ttnn::StorageType::DEVICE) {
+            b_slim = b_slim.to_device(device);
+        }
+    }
+
+    return ttnn::matmul(a_slim, b_slim, /*transpose_a=*/false, /*transpose_b=*/false, output_mem_config);
+}
+
+Tensor polyval(
+    const Tensor& input_a, const std::vector<float>& coeffs, const std::optional<MemoryConfig>& output_mem_config) {
+    TT_FATAL(!coeffs.empty(), "polyval requires at least one coefficient");
+    if (coeffs.size() == 1) {
+        return ttnn::full_like(input_a, coeffs[0], std::nullopt, std::nullopt, std::nullopt, output_mem_config);
+    }
+    Tensor result = q::multiply(input_a, coeffs[0], std::nullopt, output_mem_config);
+    for (size_t idx = 1; idx < coeffs.size() - 1; idx++) {
+        result = q::add(result, coeffs[idx], std::nullopt, output_mem_config);
+        result = q::multiply(input_a, result, std::nullopt, output_mem_config);
+    }
+    Tensor final_tensor = q::add(result, coeffs.back(), std::nullopt, output_mem_config);
+    return final_tensor;
+}
+
+Tensor gcd(
+    const Tensor& input_tensor_a,
+    const Tensor& input_tensor_b,
+    const std::optional<const DataType>& /*output_dtype*/,
+    const std::optional<MemoryConfig>& memory_config,
+    const std::optional<Tensor>& optional_output_tensor,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> post_activations,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> lhs_activations,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> rhs_activations) {
+    return ttnn::operations::experimental::quasar::binary::detail::invoke_binary_ng(
+        input_tensor_a,
+        input_tensor_b,
+        binary::BinaryOpType::GCD,
+        std::nullopt,
+        memory_config,
+        optional_output_tensor,
+        post_activations,
+        lhs_activations,
+        rhs_activations);
+}
+
+Tensor lcm(
+    const Tensor& input_tensor_a,
+    const Tensor& input_tensor_b,
+    const std::optional<const DataType>& /*output_dtype*/,
+    const std::optional<MemoryConfig>& memory_config,
+    const std::optional<Tensor>& optional_output_tensor,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> post_activations,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> lhs_activations,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> rhs_activations) {
+    return ttnn::operations::experimental::quasar::binary::detail::invoke_binary_ng(
+        input_tensor_a,
+        input_tensor_b,
+        binary::BinaryOpType::LCM,
+        std::nullopt,
+        memory_config,
+        optional_output_tensor,
+        post_activations,
+        lhs_activations,
+        rhs_activations);
+}
+
+// power - floating point exponent
+Tensor pow(
+    const Tensor& input_a,
+    float exponent,
+    const std::optional<MemoryConfig>& output_mem_config,
+    const std::optional<Tensor>& output_tensor) {
+    float exponent_floor = std::floor(exponent);
+    if (static_cast<int32_t>(exponent_floor) == exponent) {
+        int32_t exp = exponent;
+        return pow(input_a, exp, output_mem_config, output_tensor);
+    }
+    return ttnn::power(input_a, exponent, output_mem_config, output_tensor);
+}
+
+// power - integer exponent
+Tensor pow(
+    const Tensor& input,
+    int32_t exponent,
+    const std::optional<MemoryConfig>& output_mem_config,
+    const std::optional<Tensor>& output_tensor) {
+    // For exponents 0, 1, 2, 3: use iterative approach
+    if (exponent == 0 || exponent == 1 || exponent == 2 || exponent == 3) {
+        uint32_t exp = exponent;
+        return ttnn::power_iterative(input, exp, output_mem_config, output_tensor);
+    }
+    return ttnn::power(input, unary::ScalarVariant(exponent), output_mem_config, output_tensor);
+}
+
+// power - tensor exponent
+Tensor pow(
+    const Tensor& input,
+    const Tensor& exponent,
+    const std::optional<const DataType>& /*dtype*/,
+    const std::optional<ttnn::MemoryConfig>& memory_config,
+    const std::optional<Tensor>& optional_output_tensor,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> post_activations,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> lhs_activations,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> rhs_activations) {
+    return ttnn::operations::experimental::quasar::binary::detail::invoke_binary_ng(
+        input,
+        exponent,
+        binary::BinaryOpType::POWER,
+        std::nullopt,
+        memory_config,
+        optional_output_tensor,
+        post_activations,
+        lhs_activations,
+        rhs_activations);
+}
+
+// power - scalar input, tensor exponent
+Tensor pow(
+    float input_a,
+    const Tensor& exponent,
+    const std::optional<const DataType>& /*dtype*/,
+    const std::optional<ttnn::MemoryConfig>& memory_config,
+    const std::optional<Tensor>& optional_output_tensor,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> post_activations,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> lhs_activations,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> rhs_activations) {
+    // As per binary infra, first input is always a tensor but this support needed for pytorch2 tracing
+    // https://github.com/tenstorrent/pytorch2.0_ttnn/blob/main/docs/operations/aten.pow.Scalar.md
+
+    Tensor input = ttnn::full_like(exponent, input_a);
+    return pow(
+        input,
+        exponent,
+        std::nullopt,
+        memory_config,
+        optional_output_tensor,
+        post_activations,
+        lhs_activations,
+        rhs_activations);
+}
+
+Tensor rsub(
+    const Tensor& input_tensor_a,
+    const Tensor& input_tensor_b,
+    const std::optional<const DataType>& output_dtype,
+    const std::optional<MemoryConfig>& memory_config,
+    const std::optional<Tensor>& optional_output_tensor,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> post_activations,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> lhs_activations,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> rhs_activations) {
+    return ttnn::operations::experimental::quasar::binary::detail::invoke_binary_ng(
+        input_tensor_a,
+        input_tensor_b,
+        binary::BinaryOpType::RSUB,
+        output_dtype,
+        memory_config,
+        optional_output_tensor,
+        post_activations,
+        lhs_activations,
+        rhs_activations);
+}
+
+Tensor rsub(
+    const Tensor& input_tensor_a,
+    unary::ScalarVariant input_b,
+    const std::optional<const DataType>& output_dtype,
+    const std::optional<MemoryConfig>& memory_config,
+    const std::optional<Tensor>& optional_output_tensor,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> post_activations,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> lhs_activations,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> rhs_activations) {
+    return ttnn::operations::experimental::quasar::binary::detail::invoke_binary_ng(
+        input_tensor_a,
+        input_b,
+        binary::BinaryOpType::RSUB,
+        output_dtype,
+        memory_config,
+        optional_output_tensor,
+        post_activations,
+        lhs_activations,
+        rhs_activations);
+}
+
+Tensor bias_gelu(
+    const Tensor& input_tensor_a_arg,
+    const Tensor& input_tensor_b_arg,
+    const std::optional<const DataType>& output_dtype,
+    const std::optional<MemoryConfig>& memory_config,
+    const std::optional<Tensor>& optional_output_tensor,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> post_activations,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> lhs_activations,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> rhs_activations,
+    const std::optional<CoreRangeSet>& sub_core_grids,
+    const std::optional<tt::tt_metal::SubDeviceId>& sub_device_id,
+    const std::optional<bool>& fast_and_approximate_mode) {
+    return ttnn::operations::experimental::quasar::binary::detail::invoke_binary_ng(
+        input_tensor_a_arg,
+        input_tensor_b_arg,
+        binary::BinaryOpType::BIAS_GELU,
+        output_dtype,
+        memory_config,
+        optional_output_tensor,
+        post_activations,
+        lhs_activations,
+        rhs_activations,
+        fast_and_approximate_mode.value_or(false),
+        sub_core_grids,
+        sub_device_id);
+}
+
+Tensor bias_gelu(
+    const Tensor& input_tensor_a,
+    unary::ScalarVariant bias,
+    const std::optional<const DataType>& /*dtype*/,
+    const std::optional<ttnn::MemoryConfig>& memory_config,
+    const std::optional<Tensor>& optional_output_tensor,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> /*post_activations*/,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> /*lhs_activations*/,
+    ttsl::Span<const unary::EltwiseUnaryWithParam> /*rhs_activations*/,
+    const std::optional<CoreRangeSet>& sub_core_grids,
+    const std::optional<tt::tt_metal::SubDeviceId>& sub_device_id,
+    const std::optional<bool>& fast_and_approximate_mode) {
+    // Resolve sub_device_id to sub_core_grids so both add and gelu use the same core restriction
+    auto resolved_sub_core_grids = sub_core_grids;
+    if (sub_device_id.has_value()) {
+        TT_FATAL(!sub_core_grids.has_value(), "Cannot specify both sub_core_grids and sub_device_id");
+        auto* device = input_tensor_a.device();
+        resolved_sub_core_grids =
+            device->worker_cores(tt::tt_metal::HalProgrammableCoreType::TENSIX, sub_device_id.value());
+    }
+    return ttnn::gelu(
+        q::add(
+            input_tensor_a,
+            bias,
+            std::nullopt,
+            memory_config,
+            optional_output_tensor,
+            {},
+            {},
+            {},
+            resolved_sub_core_grids),
+        fast_and_approximate_mode.value_or(false),
+        memory_config,
+        optional_output_tensor,
+        resolved_sub_core_grids);
+}
+
+}  // namespace ttnn::operations::experimental::quasar::binary

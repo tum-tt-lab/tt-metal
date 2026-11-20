@@ -1,0 +1,420 @@
+# TT-Train Configuration Guide
+
+This directory contains YAML configuration files for training transformer models with TT-Metal. This README explains all valid parameters for each configuration type based on the actual implementation.
+
+## Configuration Types
+
+There are four main configuration types:
+- **Training Config**: Training hyperparameters and optimization settings
+- **Device Config**: Device mesh and distributed training setup; *this is expected to be in the same file as the training config*
+- **Model Config**: Model type and architecture configuration
+- **MultiHost Config**: Multi-process execution and pipeline parallelism settings
+
+## Training Configuration (`training_config`)
+
+Training hyperparameters and optimization settings.
+
+### Core Training Parameters
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `project_name` | str | "tt_train_nano_gpt" | Project name for tracking |
+| `seed` | int | 5489 | Random seed for reproducibility |
+| `model_save_interval` | int | 500 | Save model every N steps |
+| `batch_size` | int | 4 | Batch size for training |
+| `num_epochs` | int | 0 | Epoch cap; 0 = uncapped. One epoch is one pass over the corpus tokens: `ceil(num_epochs * corpus_tokens / (batch_size * gradient_accumulation_steps * seq_len))` optimizer steps. A run stops at whichever of `num_epochs`/`max_steps` comes first |
+| `max_steps` | int | 5000 | Step cap; 0 = uncapped. At least one of `max_steps`/`num_epochs` must be set |
+| `gradient_accumulation_steps` | int | 1 | Number of steps to accumulate gradients |
+| `model_config` | str | "" | Path to model configuration file |
+| `data_path` | str | "DATA_FOLDER/shakespeare.txt" | Path to training data |
+| `scheduler_type` | str | "identity" | Learning rate scheduler ("identity", "warmup_linear") |
+| `tokenizer_type` | str | "char" | Tokenizer type ("char" or "bpe") |
+
+An epoch is one pass over the corpus's *tokens* — `corpus_tokens / (global_batch * seq_len)` steps.
+
+Most configs run under both `examples/train/train.py` and the C++ `examples/nano_gpt` runner.
+
+### LR Schedule Parameters
+Apply to `scheduler_type: warmup_linear`, and to `train.py` only — the C++ `nano_gpt` runner hardcodes
+the equivalent of the defaults below and ignores overrides.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `warmup_ratio` | float | 0.1 | Warmup length as a fraction of the schedule |
+| `warmup_steps` | int | unset | Absolute warmup length; overrides `warmup_ratio`. Omit to use the ratio; set to 0 for no warmup |
+| `min_lr_ratio` | float | 0.01 | Final LR as a fraction of the peak LR |
+| `lr_schedule_steps` | int | 0 | Steps the LR curve is shaped over; 0 = the run length. Set larger than `max_steps` to run only a prefix of a longer curve |
+
+### Optimizer
+
+Optimizer is configured inline under `training_config.optimizer`. See [Optimizer Configuration](#optimizer-configuration) below for all available types and parameters.
+
+### Gradient Clipping Parameters
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `use_clip_grad_norm` | bool | false | Enable gradient norm clipping |
+| `clip_grad_norm_max_norm` | float | 1.0 | Maximum gradient norm for clipping |
+
+### Precision Parameters
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `precision.master_dtype` | str | unset | Dtype trainable parameters (the master weights) are stored in: `"bfloat16"` or `"float32"`. `"float32"` gives fp32 master weights with fused `AdamW`; forward and backward still run in bf16. Not PyTorch FSDP2's `param_dtype`, which is the compute dtype. See [fp32 master weights](../docs/MIXED_PRECISION.md#fp32-master-weights). Unset keeps the model's dtype (bf16) |
+| `precision.reduce_dtype` | str | unset | Dtype gradients are summed in when they are averaged across devices: `"float32"` sums in fp32 and writes the mean in the gradient's dtype; `"bfloat16"` and unset keep the bf16 sum. See [Gradient reduction in fp32](../docs/MIXED_PRECISION.md#gradient-reduction-in-fp32) |
+
+Any other key under `precision`, or a `precision` that isn't a map, stops the run with an error. GRPO, and `SFTTrainer` given an optimizer dict, don't apply `precision` yet: they keep the model's dtype and the bf16 sum. In 2- and 3-tier training, the aggregators sum the workers' gradients in bf16 whatever `reduce_dtype` says.
+
+### Example
+```yaml
+training_config:
+  project_name: "my_training_project"
+  model_type: "llama"
+  seed: 5489
+  batch_size: 8
+  gradient_accumulation_steps: 8
+  max_steps: 5000
+  optimizer:
+    type: AdamW
+    lr: 0.0003
+    beta1: 0.9
+    beta2: 0.999
+    epsilon: 1.0e-8
+    weight_decay: 0.01
+    amsgrad: false
+    stochastic_rounding: false
+  use_clip_grad_norm: false
+  clip_grad_norm_max_norm: 1.0
+  model_config: "configs/model_configs/tinyllama.yaml"
+  data_path: "data/my_dataset.txt"
+  scheduler_type: "warmup_linear"
+  tokenizer_type: "bpe"
+```
+
+## Device Configuration (`device_config`)
+
+Device mesh and distributed training configuration.
+
+### Device Mesh Parameters
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `mesh_shape` | [int, int] | [1, 1] | Device mesh shape [rows, cols] |
+| `device_ids` | [int] | [] | Specific device IDs to use |
+
+### Distributed Training Parameters
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `enable_ddp` | bool | false | Enable Distributed Data Parallelism |
+| `enable_tp` | bool | false | Enable Tensor Parallelism |
+
+### Constraints
+- DDP and TP can be combined on a 2D mesh (e.g. `mesh_shape: [4, 8]` with `enable_ddp: true` and `enable_tp: true`)
+- For DDP: batch_size must be divisible by number of DDP devices
+- For TP: vocab_size is automatically rounded up to be divisible by (num_devices * 32)
+
+### Device Mesh Shapes
+- Single-device (N150, P150): [1, 1]
+- Dual-device (N300, P300): [1, 2]
+- LoudBox: [1, 8]
+- Single Galaxy: [1, 32]
+
+### Example
+```yaml
+device_config:
+  enable_tp: true
+  mesh_shape: [1, 32]
+  device_ids: []
+```
+
+## Model Configuration (`model_config`)
+
+Model type and architecture configuration loaded from separate files.
+
+### Model Parameters
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `model_type` | str | "gpt2" | Model architecture ("gpt2" or "llama") |
+| `model_path` | str | "" | Path to saved model parameters (as HF SafeTensors) |
+| `runner_type` | str | "default" | Type of model runner (`default` or `memory_efficient`)|
+| `num_heads` | int | 6 | Number of attention heads |
+| `embedding_dim` | int | 384 | Embedding/hidden dimension |
+| `dropout_prob` | float | 0.2 | Dropout probability |
+| `num_blocks` | int | 6 | Number of transformer blocks |
+| `vocab_size` | int | 96 | Vocabulary size |
+| `max_sequence_length` | int | 128 | Maximum sequence length |
+| `weight_tying` | any | false | Weight tying configuration |
+
+### LLaMA-Specific Parameters
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `intermediate_dim` | int | null | Feed-forward intermediate dimension |
+| `theta` | float | null | RoPE theta parameter |
+| `num_groups` | int | 3 | Number of groups for grouped attention |
+| `embedding_placement` | str | "replicated" | Token-embedding TP placement (only under TP): `replicated` (sharding off), `vocab_parallel`, or `feature_parallel`. Overridable on the CLI via `--embedding-placement`. |
+
+### RoPE Scaling (`rope_scaling`)
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `scaling_factor` | float | null | Scaling factor for RoPE |
+| `high_freq_factor` | float | null | High frequency scaling factor |
+| `low_freq_factor` | float | null | Low frequency scaling factor |
+| `original_context_length` | int | null | Original context length for scaling |
+
+### Example
+```yaml
+transformer_config:
+  model_type: "llama"
+  model_path: "saved_models/my_model.safetensors"
+  num_heads: 32
+  embedding_dim: 2048
+  num_blocks: 22
+  vocab_size: 32000
+  max_sequence_length: 2048
+  intermediate_dim: 5632
+  theta: 10000.0
+  rope_scaling:
+    scaling_factor: 1.0
+    high_freq_factor: 4.0
+    low_freq_factor: 1.0
+    original_context_length: 8192
+
+# Additional transformer-specific configuration follows...
+```
+
+## MultiHost Configuration (`multihost_config`)
+
+Multi-process execution and pipeline parallelism settings.
+
+### Core MultiHost Parameters
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `enabled` | bool | false | Enable multihost execution |
+| `num_workers` | int | 0 | Number of worker processes |
+| `socket_type` | str | "mpi" | Communication backend ("mpi" or "fabric") |
+
+### Pipeline Parallel Configuration (`pipeline_parallel_config`)
+Optional configuration for pipeline parallelism:
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `num_blocks` | int | Total number of pipeline blocks |
+| `blocks_per_rank` | dict | Mapping of rank ID to number of blocks |
+
+### Training Mode Effects
+- **Three-tier training**: When `enabled=true` and no pipeline_parallel_config
+- **Pipeline parallel**: When `enabled=true` and pipeline_parallel_config is provided
+- **Standard training**: When `enabled=false`
+
+### Constraints
+- Gradient clipping is not supported with multihost training
+- Model save/load is handled differently in multihost mode
+- Seeds are automatically adjusted per rank
+
+### Example
+```yaml
+multihost_config:
+  enabled: true
+  num_workers: 4
+  socket_type: "fabric"
+  pipeline_parallel_config:
+    num_blocks: 24
+    blocks_per_rank:
+      0: 6
+      1: 6
+      2: 6
+      3: 6
+```
+
+## Command Line Options
+
+The main executable accepts these command line arguments:
+
+| Option | Short | Description | Default |
+|--------|-------|-------------|---------|
+| `--config` | `-c` | Training config file path | `$TT_METAL_HOME/tt-train/configs/training_configs/training_shakespeare_nanogpt.yaml` |
+| `--multihost` | | Multihost config file path | "" (optional) |
+| `--name` | `-n` | Run name | "" |
+| `--add_time_to_name` | `-t` | Add timestamp to run name | true |
+| `--save_and_exit` | `-s` | Save model and exit (msgpack path) | "" |
+| `--safetensors` | | Load model from safetensors path | "" |
+
+## File Organization
+
+```
+tt-train/configs/
+├── training_configs/          # Training configuration files
+├── model_configs/            # Model architecture configurations
+├── multihost_configs/        # MultiHost execution configurations (if separated)
+└── README.md                 # This file
+```
+
+## Optimizer Configuration
+
+The optimizer is configured inline under `training_config.optimizer`.
+
+### Available Optimizer Types
+
+| Type | Description |
+|------|-------------|
+| `AdamW` | Fused AdamW, a single custom kernel per step (default, recommended). Its state takes the parameters' dtype: bf16, or fp32 with `precision.master_dtype: float32` for fp32 master weights (use when bf16 accumulation causes training instability). Supports stochastic rounding for bf16 parameters. |
+| `MorehAdamW` | AdamW via `ttnn::moreh_adamw` — uses the Moreh team's kernel implementation. |
+| `AdamWComposite` | AdamW built from individual TTNN ops (no custom kernel). Supports Kahan summation. |
+| `SGD` | Fused SGD — bf16 state, single custom kernel per step (default, recommended). |
+| `SGDComposite` | SGD built from individual TTNN ops (no custom kernel). |
+| `NoOp` | No-op optimizer (no parameter updates). |
+
+### AdamW Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `type` | str | — | Optimizer type (e.g. `"AdamW"`, `"MorehAdamW"`) |
+| `lr` | float | 3e-4 | Learning rate |
+| `beta1` | float | 0.9 | Exponential decay rate for first moment |
+| `beta2` | float | 0.999 | Exponential decay rate for second moment |
+| `epsilon` | float | 1e-8 | Numerical stability constant |
+| `weight_decay` | float | 1e-2 | Weight decay coefficient |
+| `amsgrad` | bool | false | Use AMSGrad variant |
+| `stochastic_rounding` | bool | false | Enable stochastic rounding (AdamW only) |
+| `param_groups` | list[dict] | [] | Parameter groups, see [Param groups](#param-groups) |
+| `kahan_summation` | bool | false | Enable Kahan summation (AdamWComposite only) |
+
+### SGD Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `type` | str | — | Optimizer type (`"SGD"` or `"SGDComposite"`) |
+| `lr` | float | 1e-3 | Learning rate |
+| `momentum` | float | 0.0 | Momentum factor |
+| `dampening` | float | 0.0 | Dampening for momentum |
+| `weight_decay` | float | 0.0 | Weight decay coefficient |
+| `nesterov` | bool | false | Enable Nesterov momentum |
+| `param_groups` | list[dict] | [] | Parameter groups, see [Param groups](#param-groups) |
+
+### Param groups
+
+Every optimizer takes `param_groups`: a list where each entry has `modules` plus the per-group
+options it overrides. A param joins the first group where any `/`-separated segment of its name is listed in
+`modules`, so module names like `tok_emb` and leaf names like `gamma`/`bias` both work. Params in no group use the
+top-level values. They form group 0, which always exists (empty if every param is grouped), so the listed groups are
+groups 1, 2, ... in order. LR schedulers drive every group from its own base LR.
+
+| Optimizer | Per-group options | Optimizer-wide only |
+|-----------|-------------------|---------------------|
+| `AdamW` | `lr`, `beta1`, `beta2`, `epsilon`, `weight_decay` | `amsgrad`, `stochastic_rounding` |
+| `MorehAdamW` | `lr`, `beta1`, `beta2`, `epsilon`, `weight_decay` | - |
+| `AdamWComposite` | `lr`, `beta1`, `beta2`, `epsilon`, `weight_decay` | `amsgrad`, `kahan_summation` |
+| `SGD`, `SGDComposite` | `lr`, `momentum`, `dampening`, `weight_decay` | `nesterov` |
+| `MuonComposite` | `lr`, `momentum` | `ns_steps` |
+
+For `MuonWithAdamW`, set `param_groups` inside the nested `muon:` and `adamw:` sections.
+
+```yaml
+optimizer:
+  type: AdamW
+  lr: 0.0003
+  weight_decay: 0.1
+  param_groups:
+    - modules: [gamma, beta, bias]   # no weight decay on norm gains/betas and biases
+      weight_decay: 0.0
+```
+
+Matching is by name: list every name your model uses. RMSNorm models (Llama) have `gamma` only;
+LayerNorm models (GPT-2) also have `beta`. The Python `NanoGPT` model names its final norm `ln_f_gamma` /
+`ln_f_beta` (no `/` inside), so list those too. Hugging Face-style models (Qwen3) name norm gains `weight`, which
+every weight matrix also uses, so select their norms by module name instead (`input_layernorm`,
+`post_attention_layernorm`, `q_norm`, `k_norm`, ...). DeepSeek's `sparse_ep` MoE stores its routed experts as leaf
+tensors of the `ffn` module (`w_gate_0`, `w_up_0`, `w_down_0`, ... one per expert) rather than under an `experts`
+module, so list those leaf names to group them. A YAML group whose `modules` match no parameter is an error,
+unless the optimizer config sets `allow_empty_param_groups: true` — which `nano_gpt` and the Python
+`ttml.common.utils.create_optimizer` do automatically under pipeline parallelism, where each stage only holds its own
+params (e.g. `tok_emb` only on the first stage).
+
+Example configs in `training_configs/`:
+
+| Config | Shows |
+|--------|-------|
+| `training_shakespeare_nanogpt_char_param_groups.yaml` | AdamW (`nano_gpt`): no decay on norms/biases, separate LRs for the embeddings and the LM head, `beta2` for attention |
+| `training_shakespeare_nanollama3_char_muon_param_groups.yaml` | `MuonWithAdamW` (Python `train.py`): groups in both the `muon:` and `adamw:` sections |
+
+### Example
+
+```yaml
+training_config:
+  optimizer:
+    type: AdamW
+    lr: 0.0003
+    beta1: 0.9
+    beta2: 0.999
+    epsilon: 1.0e-8
+    weight_decay: 0.01
+    amsgrad: false
+    stochastic_rounding: false
+```
+
+## Configuration Loading
+
+Configurations are loaded using YAML::LoadFile in the main application:
+
+```cpp
+// Load configurations from files
+TrainingConfig training_config = parse_config(YAML::LoadFile(training_config_name));
+DeviceConfig device_config = parse_device_config(YAML::LoadFile(training_config_name));
+ModelConfig model_config = parse_model_config(YAML::LoadFile(training_config.model_config));
+
+// Optional multihost config
+MultihostConfig multihost_config;
+if (!multihost_config_name.empty()) {
+    multihost_config = parse_multihost_config(YAML::LoadFile(multihost_config_name));
+}
+```
+
+## Complete Example Configuration
+
+```yaml
+# Complete training configuration file
+training_config:
+  project_name: "shakespeare_training"
+  seed: 5489
+  model_save_interval: 500
+  batch_size: 8
+  gradient_accumulation_steps: 8
+  max_steps: 5000
+  optimizer:
+    type: AdamW
+    lr: 0.0003
+    beta1: 0.9
+    beta2: 0.999
+    epsilon: 1.0e-8
+    weight_decay: 0.01
+    amsgrad: false
+    stochastic_rounding: false
+  use_clip_grad_norm: false
+  clip_grad_norm_max_norm: 1.0
+  model_config: "configs/model_configs/tinyllama.yaml"
+  data_path: "data/shakespeare.txt"
+  scheduler_type: "warmup_linear"
+  tokenizer_type: "char"
+
+device_config:
+  enable_tp: true
+  mesh_shape: [1, 32]
+  device_ids: []
+
+# Optional multihost configuration (separate file)
+multihost_config:
+  enabled: false
+  num_workers: 1
+  socket_type: "mpi"
+```
+
+## Notes
+
+- Environment variable `TT_METAL_HOME` must be set
+- For BPE tokenization, data should be pre-tokenized (space-separated tokens)
+- Vocabulary size is automatically adjusted to be divisible by 32 (or 32 * num_devices for TP)
+- Model parameters are automatically loaded if both safetensors_path and model_path exist
+- Training state (optimizer, scheduler) is saved/loaded separately from model weights
+
+## Supported Model Types
+
+- **GPT-2**: Traditional transformer with learned positional embeddings
+- **LLaMA**: Transformer with RMSNorm, SwiGLU activation, and RoPE positional encoding
+
+See the respective model configuration files for architecture-specific parameters.

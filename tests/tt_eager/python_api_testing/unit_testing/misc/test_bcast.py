@@ -1,0 +1,389 @@
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
+
+# SPDX-License-Identifier: Apache-2.0
+
+import pytest
+import torch
+import math
+import numpy as np  # remove this
+from loguru import logger
+from tests.ttnn.utils_for_testing import check_with_pcc_without_tensor_printout, update_process_id
+from tests.ttnn.ttnn_utility_fuction import get_shard_grid_from_num_cores
+import ttnn
+from tt_lib.utils import (
+    _nearest_y,
+)
+
+
+@pytest.mark.parametrize(
+    "input_height, input_width, num_cores, shard_grid, shard_strategy",
+    (
+        (2048, 320, 40, (8, 5), ttnn.ShardStrategy.BLOCK),
+        (512, 640, 40, (8, 5), ttnn.ShardStrategy.BLOCK),
+        (2048, 1280, 40, (8, 5), ttnn.ShardStrategy.BLOCK),
+        (128, 1280, 40, (8, 5), ttnn.ShardStrategy.WIDTH),
+        (8192, 320, 40, (8, 5), ttnn.ShardStrategy.BLOCK),
+        (2048, 640, 40, (8, 5), ttnn.ShardStrategy.BLOCK),
+        (512, 1280, 40, (8, 5), ttnn.ShardStrategy.BLOCK),
+        (128, 1280, 32, (4, 8), ttnn.ShardStrategy.BLOCK),
+        (512, 1280, 64, (8, 8), ttnn.ShardStrategy.BLOCK),
+        # Wt=10 per core (=ceil(1280/32/4)): pre-fix w_blk=min(Wt,8)=8 did not divide Wt and
+        # deadlocked / corrupted on batch_b>1. Post-fix factory picks w_blk=5 (largest divisor
+        # <=8), so chunks are full (no partial w-block). in0=in1=2 also covers h partial-block.
+        (128, 1280, 4, (8, 5), ttnn.ShardStrategy.WIDTH),
+    ),
+)
+@pytest.mark.parametrize(
+    "in0_dtype",
+    [ttnn.bfloat16, ttnn.bfloat8_b],
+)
+@pytest.mark.parametrize(
+    "in1_dtype",
+    [ttnn.bfloat16, ttnn.bfloat8_b],
+)
+@pytest.mark.parametrize(
+    "op",
+    [ttnn.BcastOpMath.ADD, ttnn.BcastOpMath.MUL],
+)
+@pytest.mark.parametrize("in1_batch_size", [1, 2])
+@pytest.mark.parametrize("in0_batch_size", [1, 2])
+@pytest.mark.parametrize(
+    "orientation",
+    [ttnn.ShardOrientation.ROW_MAJOR, ttnn.ShardOrientation.COL_MAJOR],
+)
+def test_bcast(
+    device,
+    orientation,
+    in0_batch_size,
+    in1_batch_size,
+    input_height,
+    input_width,
+    num_cores,
+    shard_grid,
+    shard_strategy,
+    in0_dtype,
+    in1_dtype,
+    op,
+):
+    torch.manual_seed(0)
+    if (device.compute_with_storage_grid_size().x, device.compute_with_storage_grid_size().y) == (8, 7):
+        if shard_strategy == ttnn.ShardStrategy.BLOCK:
+            shard_grid = (
+                (shard_grid[0], 4)
+                if shard_grid[1] == 8 and orientation == ttnn.ShardOrientation.COL_MAJOR
+                else shard_grid
+            )
+            shard_grid = (
+                (4, shard_grid[1])
+                if shard_grid[0] == 8 and orientation == ttnn.ShardOrientation.ROW_MAJOR
+                else shard_grid
+            )
+    input_shape = [in0_batch_size, 1, input_height, input_width]
+    input = torch.rand(input_shape, dtype=torch.bfloat16)
+
+    input_tensor = ttnn.from_torch(
+        input, device=device, memory_config=ttnn.L1_MEMORY_CONFIG, layout=ttnn.TILE_LAYOUT, dtype=in0_dtype
+    )
+    input_2d_height = input_tensor.padded_shape[0] * input_tensor.padded_shape[1] * input_tensor.padded_shape[2]
+    input_2d_width = input_tensor.padded_shape[3]
+    if shard_strategy == ttnn.ShardStrategy.BLOCK:
+        input_2d_height_padded = _nearest_y(input_2d_height, shard_grid[0] * 32)
+        shard_height = math.ceil(input_2d_height_padded / shard_grid[0])
+        shard_width = math.ceil(input_2d_width / shard_grid[1])
+        shard_orientation = orientation
+        core_grid = (
+            ttnn.CoreGrid(y=shard_grid[0], x=shard_grid[1])
+            if shard_orientation == ttnn.ShardOrientation.ROW_MAJOR
+            else ttnn.CoreGrid(y=shard_grid[1], x=shard_grid[0])
+        )
+    else:
+        shard_height = input_2d_height
+        shard_width = math.ceil(input_2d_width / num_cores)
+        shard_orientation = orientation
+        core_grid = get_shard_grid_from_num_cores(num_cores, device)
+
+    logger.debug(f"core_grid={core_grid}")
+    logger.debug(f"input_2d_height={input_2d_height} and input_2d_width={input_2d_width}")
+    logger.debug(f"shard_height={shard_height} and shard_width={shard_width}")
+
+    in_sharded_mem_config = ttnn.create_sharded_memory_config(
+        shape=(
+            (shard_height, shard_width)
+            if shard_orientation == ttnn.ShardOrientation.ROW_MAJOR
+            else (shard_width, shard_height)
+        ),
+        core_grid=core_grid,
+        strategy=shard_strategy,
+        orientation=shard_orientation,
+        use_height_and_width_as_shard_shape=True,
+    )
+
+    tt_input = ttnn.to_memory_config(input_tensor, memory_config=in_sharded_mem_config)
+
+    if in0_batch_size == 1 and in1_batch_size > 1:
+        input = input.reshape(in1_batch_size, 1, input_height // in1_batch_size, input_width)
+
+    b_weights_shape = [in1_batch_size, 1, 1, input_width]
+    B_pyt = torch.rand(size=b_weights_shape).bfloat16()
+    if op == ttnn.BcastOpMath.ADD:
+        torch_ref_output = torch.add(input, B_pyt)
+    elif op == ttnn.BcastOpMath.MUL:
+        torch_ref_output = torch.mul(input, B_pyt)
+
+    if in0_batch_size == 1 and in1_batch_size > 1:
+        torch_ref_output = torch_ref_output.reshape(1, 1, input_height, input_width)
+
+    B_pyt = B_pyt.reshape(b_weights_shape)
+    tt_weight = ttnn.from_torch(B_pyt, device=device, layout=ttnn.TILE_LAYOUT, dtype=in1_dtype)
+    tt_output = ttnn.bcast(
+        tt_input,
+        tt_weight,
+        op,
+        ttnn.BcastOpDim.H,
+        memory_config=ttnn.get_memory_config(tt_input),
+    )
+
+    output_tensor = ttnn.to_torch(tt_output).float()
+    output_tensor = output_tensor.reshape(input_shape)
+
+    passing, pcc_msg = check_with_pcc_without_tensor_printout(torch_ref_output, output_tensor, 0.999)
+    logger.info(pcc_msg)
+    assert passing
+
+
+# With the batch in the C dim (a = [1, C, H, W], C > 1) and input_b's padded_shape[0] == C, the op
+# routes to the non-optimised BcastShardedHProgramFactory. Pre-fix that factory passed B = N*C to
+# compute while the reader only produces Ht*Wt tiles, so it deadlocked. Existing coverage only puts
+# the batch in N ([N, 1, H, W]), so N*C == 1 there and the bug is never exercised.
+@pytest.mark.parametrize(
+    "batch, height_per_batch, width, num_cores",
+    (
+        (2, 64, 256, 8),
+        (2, 1024, 1280, 40),
+    ),
+)
+@pytest.mark.parametrize(
+    "op",
+    [ttnn.BcastOpMath.ADD, ttnn.BcastOpMath.MUL],
+)
+def test_bcast_h_width_sharded_batched_channel(device, batch, height_per_batch, width, num_cores, op):
+    torch.manual_seed(0)
+
+    # input_a: [1, batch, H, W] -> flattened 2D height = batch * H (batch folded into C).
+    a_shape = [1, batch, height_per_batch, width]
+    a_torch = torch.rand(a_shape, dtype=torch.bfloat16)
+
+    # input_b: one broadcast row per batch. b.padded_shape[0] == batch (!= a.padded_shape[0] == 1),
+    # which forces the non-optimised sharded-H factory.
+    b_torch = torch.rand([batch, 1, 1, width], dtype=torch.bfloat16)
+
+    if op == ttnn.BcastOpMath.ADD:
+        torch_ref_output = a_torch + b_torch.reshape(1, batch, 1, width)
+    else:
+        torch_ref_output = a_torch * b_torch.reshape(1, batch, 1, width)
+
+    input_tensor = ttnn.from_torch(
+        a_torch, device=device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16, memory_config=ttnn.L1_MEMORY_CONFIG
+    )
+
+    shard_height = batch * height_per_batch
+    shard_width = width // num_cores
+    core_grid = get_shard_grid_from_num_cores(num_cores, device)
+    sharded_mem_config = ttnn.create_sharded_memory_config(
+        shape=(shard_height, shard_width),
+        core_grid=core_grid,
+        strategy=ttnn.ShardStrategy.WIDTH,
+        orientation=ttnn.ShardOrientation.ROW_MAJOR,
+        use_height_and_width_as_shard_shape=True,
+    )
+    tt_input = ttnn.to_memory_config(input_tensor, memory_config=sharded_mem_config)
+
+    tt_weight = ttnn.from_torch(b_torch, device=device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+
+    tt_output = ttnn.bcast(
+        tt_input,
+        tt_weight,
+        op,
+        ttnn.BcastOpDim.H,
+        memory_config=ttnn.get_memory_config(tt_input),
+    )
+    output_tensor = ttnn.to_torch(tt_output).float()
+
+    passing, pcc_msg = check_with_pcc_without_tensor_printout(torch_ref_output.float(), output_tensor, 0.999)
+    logger.info(pcc_msg)
+    assert passing, pcc_msg
+
+
+# Same non-optimised BcastShardedHProgramFactory path as the width-sharded case above, but for
+# BLOCK_SHARDED input (batch folded into C, distributed across grid rows). Pre-fix B = N*C was passed
+# for block sharding too, so this deadlocked identically.
+@pytest.mark.parametrize(
+    "batch, height_per_batch, width, shard_grid",
+    ((2, 128, 1280, (8, 5)),),
+)
+@pytest.mark.parametrize(
+    "op",
+    [ttnn.BcastOpMath.ADD, ttnn.BcastOpMath.MUL],
+)
+@pytest.mark.parametrize(
+    "orientation",
+    [ttnn.ShardOrientation.ROW_MAJOR, ttnn.ShardOrientation.COL_MAJOR],
+)
+def test_bcast_h_block_sharded_batched_channel(device, batch, height_per_batch, width, shard_grid, op, orientation):
+    torch.manual_seed(0)
+    if (device.compute_with_storage_grid_size().x, device.compute_with_storage_grid_size().y) == (8, 7):
+        if shard_grid[1] == 8 and orientation == ttnn.ShardOrientation.COL_MAJOR:
+            shard_grid = (shard_grid[0], 4)
+        if shard_grid[0] == 8 and orientation == ttnn.ShardOrientation.ROW_MAJOR:
+            shard_grid = (4, shard_grid[1])
+
+    # input_a: [1, batch, H, W] -> flattened 2D height = batch * H (batch folded into C).
+    a_shape = [1, batch, height_per_batch, width]
+    a_torch = torch.rand(a_shape, dtype=torch.bfloat16)
+
+    # input_b: one broadcast row per batch; b.padded_shape[0] == batch forces the non-optimised factory.
+    b_torch = torch.rand([batch, 1, 1, width], dtype=torch.bfloat16)
+
+    if op == ttnn.BcastOpMath.ADD:
+        torch_ref_output = a_torch + b_torch.reshape(1, batch, 1, width)
+    else:
+        torch_ref_output = a_torch * b_torch.reshape(1, batch, 1, width)
+
+    input_tensor = ttnn.from_torch(
+        a_torch, device=device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16, memory_config=ttnn.L1_MEMORY_CONFIG
+    )
+    input_2d_height = input_tensor.padded_shape[0] * input_tensor.padded_shape[1] * input_tensor.padded_shape[2]
+    input_2d_width = input_tensor.padded_shape[3]
+    input_2d_height_padded = _nearest_y(input_2d_height, shard_grid[0] * 32)
+    shard_height = math.ceil(input_2d_height_padded / shard_grid[0])
+    shard_width = math.ceil(input_2d_width / shard_grid[1])
+    core_grid = (
+        ttnn.CoreGrid(y=shard_grid[0], x=shard_grid[1])
+        if orientation == ttnn.ShardOrientation.ROW_MAJOR
+        else ttnn.CoreGrid(y=shard_grid[1], x=shard_grid[0])
+    )
+    in_sharded_mem_config = ttnn.create_sharded_memory_config(
+        shape=(
+            (shard_height, shard_width)
+            if orientation == ttnn.ShardOrientation.ROW_MAJOR
+            else (shard_width, shard_height)
+        ),
+        core_grid=core_grid,
+        strategy=ttnn.ShardStrategy.BLOCK,
+        orientation=orientation,
+        use_height_and_width_as_shard_shape=True,
+    )
+    tt_input = ttnn.to_memory_config(input_tensor, memory_config=in_sharded_mem_config)
+
+    tt_weight = ttnn.from_torch(b_torch, device=device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+
+    tt_output = ttnn.bcast(
+        tt_input,
+        tt_weight,
+        op,
+        ttnn.BcastOpDim.H,
+        memory_config=ttnn.get_memory_config(tt_input),
+    )
+    output_tensor = ttnn.to_torch(tt_output).float()
+
+    passing, pcc_msg = check_with_pcc_without_tensor_printout(torch_ref_output.float(), output_tensor, 0.999)
+    logger.info(pcc_msg)
+    assert passing, pcc_msg
+
+
+def _sharded_h_bcast_mem_config(layout, end_x, end_y, shard_shape):
+    grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(end_x, end_y))})
+    return ttnn.MemoryConfig(
+        layout, ttnn.BufferType.L1, ttnn.ShardSpec(grid, shard_shape, ttnn.ShardOrientation.ROW_MAJOR)
+    )
+
+
+def _exact_bf16(shape, start):
+    # Multiples of 1/8 in [-15.625, 15.625], so sums are exact in bfloat16.
+    n = torch.Size(shape).numel()
+    return ((torch.arange(start, start + n) % 251 - 125) / 8).reshape(shape).bfloat16()
+
+
+_BLOCK_1x2 = (ttnn.TensorMemoryLayout.BLOCK_SHARDED, 0, 1)
+_WIDTH_3x1 = (ttnn.TensorMemoryLayout.WIDTH_SHARDED, 2, 0)
+
+
+# Batches of b in its C dim: the sharded H factories counted b's batches from N alone and paired
+# rows of a with another batch's broadcast row (#63625).
+@pytest.mark.parametrize(
+    "a_shape, b_shape, sharding, shard_shape",
+    (
+        ([1, 2, 32, 64], [1, 2, 32, 64], _BLOCK_1x2, [32, 64]),
+        ([2, 1, 32, 64], [2, 1, 32, 64], _BLOCK_1x2, [32, 64]),
+        ([2, 2, 32, 64], [2, 1, 32, 64], _BLOCK_1x2, [64, 64]),
+        ([2, 3, 64, 96], [2, 3, 32, 96], _WIDTH_3x1, [384, 32]),
+        ([6, 1, 64, 96], [6, 1, 32, 96], _WIDTH_3x1, [384, 32]),
+        ([2, 3, 64, 96], [2, 1, 32, 96], _WIDTH_3x1, [384, 32]),
+        ([2, 3, 64, 96], [1, 1, 32, 96], _WIDTH_3x1, [384, 32]),
+        ([2, 1, 1, 32, 64], [2, 1, 1, 32, 64], (ttnn.TensorMemoryLayout.WIDTH_SHARDED, 1, 0), [64, 32]),
+    ),
+)
+def test_bcast_h_sharded_batches_of_b(device, a_shape, b_shape, sharding, shard_shape):
+    a = ttnn.from_torch(
+        _exact_bf16(a_shape, 0),
+        dtype=ttnn.bfloat16,
+        layout=ttnn.TILE_LAYOUT,
+        device=device,
+        memory_config=_sharded_h_bcast_mem_config(*sharding, shard_shape),
+    )
+    b = ttnn.from_torch(_exact_bf16(b_shape, 7), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+    out = ttnn.to_torch(ttnn.bcast(a, b, ttnn.BcastOpMath.ADD, ttnn.BcastOpDim.H))
+    expected = ttnn.to_torch(a) + ttnn.to_torch(b)[..., 0:1, :]
+    assert torch.equal(out, expected)
+
+
+# Four batches of b over the two cores along the shard height: the block-sharded offsets divided by
+# ncores / bN == 0.
+def test_bcast_h_block_sharded_more_batches_than_height_cores(device, expect_error):
+    a = ttnn.from_torch(
+        _exact_bf16([1, 4, 32, 64], 0),
+        dtype=ttnn.bfloat16,
+        layout=ttnn.TILE_LAYOUT,
+        device=device,
+        memory_config=_sharded_h_bcast_mem_config(*_BLOCK_1x2, [64, 64]),
+    )
+    b = ttnn.from_torch(_exact_bf16([1, 4, 32, 64], 7), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+    with expect_error(RuntimeError, "split evenly between the 4 batches"):
+        ttnn.bcast(a, b, ttnn.BcastOpMath.ADD, ttnn.BcastOpDim.H)
+
+
+@pytest.mark.parametrize(
+    "orientation", [ttnn.ShardOrientation.ROW_MAJOR, ttnn.ShardOrientation.COL_MAJOR], ids=["row_major", "col_major"]
+)
+def test_bcast_hw_sharded_multi_row_col(device, orientation):
+    # Regression: cores were walked in device-grid order, not shard order. Needs a 2D grid and bN*bC > 1.
+    torch.manual_seed(0)
+    N, C, H, W = 2, 1, 256, 32
+    a_torch = torch.rand([N, C, H, W], dtype=torch.bfloat16)
+    b_torch = torch.rand([N, C, 1, 1], dtype=torch.bfloat16)
+    torch_ref_output = a_torch + b_torch
+
+    a_tt = ttnn.from_torch(a_torch, device=device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+
+    # Explicit ShardSpec: create_sharded_memory_config transposes the shard shape for COL_MAJOR.
+    grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(3, 1))})
+    shard_shape = [N * C * H // grid.num_cores(), W]
+    in_sharded_mem_config = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, ttnn.ShardSpec(grid, shard_shape, orientation)
+    )
+    a_tt = ttnn.to_memory_config(a_tt, in_sharded_mem_config)
+
+    b_tt = ttnn.from_torch(b_torch, device=device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+
+    tt_output = ttnn.bcast(
+        a_tt,
+        b_tt,
+        ttnn.BcastOpMath.ADD,
+        ttnn.BcastOpDim.HW,
+        memory_config=ttnn.get_memory_config(a_tt),
+    )
+    output_tensor = ttnn.to_torch(tt_output).float()
+
+    passing, pcc_msg = check_with_pcc_without_tensor_printout(torch_ref_output.float(), output_tensor, 0.999)
+    logger.info(pcc_msg)
+    assert passing, pcc_msg

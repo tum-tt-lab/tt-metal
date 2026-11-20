@@ -1,0 +1,47 @@
+// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <cstdint>
+#include <optional>
+
+#include <tt-metalium/global_semaphore.hpp>
+#include <tt-metalium/buffer_types.hpp>
+#include <tt-metalium/core_coord.hpp>
+
+namespace tt::tt_metal::experimental {
+// clang-format off
+/**
+ * Experimental API for creating a global semaphore at a specific address.
+ * and with optional initial value used by tt-mlir.
+ *
+ * Return value: GlobalSemaphore
+ *
+ * | Argument       | Description                                            | Type                                                      | Valid Range  | Required |
+ * |----------------|--------------------------------------------------------|-----------------------------------------------------------|--------------|----------|
+ * | device         | The mesh device to create the semaphore on             | distributed::MeshDevice&                                  |              | Yes      |
+ * | cores          | Range of the Tensix coordinates using the semaphore    | const CoreRangeSet &                                      |              | Yes      |
+ * | initial_value  | Initial value of the semaphore                         | uint32_t                                                  |              | Yes      |
+ * | buffer_type    | Buffer type to store the semaphore                     | BufferType                                                | L1 types     | No       |
+ * | address        | Address of the semaphore to create                     | uint64_t                                                  |              | Yes      |
+ */
+// clang-format on
+GlobalSemaphore CreateGlobalSemaphore(
+    distributed::MeshDevice& device,
+    const CoreRangeSet& cores,
+    std::optional<uint32_t> initial_value,
+    BufferType buffer_type,
+    uint64_t address,
+    uint8_t cq_id = 0);
+
+// Same as above, but the semaphore is created on `mesh_cq`'s mesh device and the initial value is written through
+// `mesh_cq` with fast dispatch. The queue is not used for the write on slow dispatch / simulator.
+GlobalSemaphore CreateGlobalSemaphore(
+    distributed::MeshCommandQueue& mesh_cq,
+    const CoreRangeSet& cores,
+    std::optional<uint32_t> initial_value,
+    BufferType buffer_type,
+    uint64_t address);
+}  // namespace tt::tt_metal::experimental

@@ -1,0 +1,48 @@
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include "sdpa_bw.hpp"
+
+#include "device/sdpa_bw_kv_device_operation.hpp"
+#include "device/sdpa_bw_q_device_operation.hpp"
+
+namespace ttml::metal {
+
+std::tuple<ttnn::Tensor, ttnn::Tensor, ttnn::Tensor, std::optional<ttnn::Tensor>> sdpa_bw(
+    const ttnn::Tensor& grad_output,
+    const ttnn::Tensor& attn_output,
+    const ttnn::Tensor& query,
+    const ttnn::Tensor& key,
+    const ttnn::Tensor& value,
+    const ttnn::Tensor& intermediates,
+    AttentionMaskType mask_type,
+    const std::optional<ttnn::Tensor>& attn_mask,
+    const float dropout_probability,
+    const std::optional<ttnn::Tensor>& gate,
+    const std::optional<ttnn::Tensor>& preallocated_grad_gate) {
+    // Call Q kernel first to compute grad_Q and u_scaler = rowsum(dO * O)
+    auto [grad_Q, u_scaler, grad_gate, gated_grad_output] = ttnn::prim::ttml_sdpa_q_bw(
+        grad_output,
+        attn_output,
+        query,
+        key,
+        value,
+        mask_type,
+        attn_mask,
+        intermediates,
+        dropout_probability,
+        /*preallocated_grad_query=*/std::nullopt,
+        /*preallocated_u_scaler=*/std::nullopt,
+        gate,
+        preallocated_grad_gate);
+
+    const auto& kv_grad_output = gated_grad_output.has_value() ? gated_grad_output.value() : grad_output;
+
+    auto [grad_K, grad_V] = ttnn::prim::ttml_sdpa_kv_bw(
+        kv_grad_output, query, key, value, mask_type, attn_mask, intermediates, u_scaler, dropout_probability);
+
+    return {grad_Q, grad_K, grad_V, grad_gate};
+}
+
+}  // namespace ttml::metal

@@ -1,0 +1,53 @@
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include "api/compute/common_globals.h"
+#ifdef TRISC_MATH
+#include "ckernel_sfpu_logsigmoid.h"
+#include "llk_math_eltwise_binary_sfpu_macros.h"
+#endif
+
+namespace ckernel {
+
+// clang-format off
+/**
+ * Performs logsigmoid operation: logsigmoid(x) = -softplus(-x) = -log(1 + exp(-x))
+ *
+ * Return value: None
+ *
+ * | Argument       | Description                                       | Type     | Valid Range                                           | Required |
+ * |----------------|---------------------------------------------------|----------|-------------------------------------------------------|----------|
+ * | idst_in0       | Index of tile in DST with input (x)               | uint32_t | Must be less than the size of the DST register buffer | True     |
+ * | idst_in1       | Index of tile in DST with exp(-x)                 | uint32_t | Must be less than the size of the DST register buffer | True     |
+ * | idst_out       | Index of tile in DST for output                   | uint32_t | Must be less than the size of the DST register buffer | True     |
+ */
+// clang-format on
+ALWI void logsigmoid_tile(uint32_t idst_in0, uint32_t idst_in1, uint32_t idst_out) {
+    MATH((SFPU_BINARY_CALL(
+        DST_SYNC_MODE,
+        DST_ACCUM_MODE,
+        calculate_logsigmoid,
+        (APPROX, 8 /* ITERATIONS */),
+        idst_in0,
+        idst_in1,
+        idst_out,
+        VectorMode::RC)));
+}
+
+/**
+ * Initialize logsigmoid operation.
+ * Must be called before logsigmoid_tile.
+ * On Wormhole this loads polynomial coefficients into vConstFloatPrgm0..2, the registers exp_tile_init
+ * (and other SFPU inits) also program. Call it after those inits, right before logsigmoid_tile, and call
+ * exp_tile_init again after it before the next exp_tile.
+ * On Quasar it loads the same registers, which exp_tile_init leaves alone there but other SFPU inits
+ * (reciprocal, log, tanh among them) program: call it again after any of those, before logsigmoid_tile.
+ *
+ * Return value: None
+ */
+ALWI void logsigmoid_tile_init() { MATH((SFPU_BINARY_INIT_FN(unused, sfpu::logsigmoid_init, (APPROX)))); }
+
+}  // namespace ckernel

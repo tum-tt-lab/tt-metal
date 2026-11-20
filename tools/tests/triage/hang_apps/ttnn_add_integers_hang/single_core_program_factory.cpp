@@ -1,0 +1,135 @@
+// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include "add_integers_hang_op.hpp"
+
+#include <tt-metalium/workload/run_args/program_run_args.hpp>
+#include <tt-metalium/workload/specification/program_spec.hpp>
+
+#include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
+
+namespace triage_hang_apps {
+
+using namespace tt;
+using namespace tt::tt_metal;
+
+namespace {
+
+const DFBSpecName IN0_DFB{"in0_dfb"};
+const DFBSpecName IN1_DFB{"in1_dfb"};
+const DFBSpecName OUT_DFB{"out_dfb"};
+const TensorParamName IN0_T{"in0_tensor"};
+const TensorParamName IN1_T{"in1_tensor"};
+const TensorParamName OUT_T{"out_tensor"};
+const KernelSpecName READER{"reader"};
+const KernelSpecName WRITER{"writer"};
+const KernelSpecName COMPUTE{"compute"};
+const SemaphoreSpecName PROGRAM_SEM{"program_sem"};
+
+constexpr auto KERNEL_DIR = "tools/tests/triage/hang_apps/add_2_integers_hang/kernels/";
+
+}  // namespace
+
+ttnn::device_operation::ProgramArtifacts AddIntegersHangOperation::SingleCore::create_program_artifacts(
+    const operation_attributes_t& operation_attributes,
+    const tensor_args_t& tensor_args,
+    tensor_return_value_t& tensor_return_value) {
+    // Bind the MeshTensors reachable from tensor_args / tensor_return_value: the adapter matches
+    // TensorArguments to those by pointer identity, so a copy would be rejected.
+    const auto& src0 = tensor_args.input_tensor_a.mesh_tensor();
+    const auto& src1 = tensor_args.input_tensor_b.mesh_tensor();
+    const auto& dst = tensor_return_value.mesh_tensor();
+
+    const tt::DataFormat data_format = datatype_to_dataformat_converter(tensor_args.input_tensor_a.dtype());
+    const tt::DataFormat data_format_output = datatype_to_dataformat_converter(tensor_return_value.dtype());
+
+    constexpr uint32_t num_tiles = 1;
+    auto make_dfb_spec = [](const DFBSpecName& name, tt::DataFormat format) {
+        return DataflowBufferSpec{
+            .unique_id = name,
+            .entry_size = tile_size(format),
+            .num_entries = num_tiles,
+            .data_format_metadata = format,
+        };
+    };
+
+    // Reuse the sibling add_2_integers_hang kernels. They carry the architecture-portable Metal 2.0
+    // dataflow-buffer device API, so the same sources run on Wormhole / Blackhole and on Quasar; the
+    // runtime reads only the part of each hardware config that matches the active architecture.
+    const ComputeHardwareConfig compute_hw_config{.fpu_math_fidelity = MathFidelity::HiFi4};
+
+    KernelSpec reader_spec{
+        .unique_id = READER,
+        .source = std::string(KERNEL_DIR) + "dataflow/reader_binary_1_tile.cpp",
+        .dfb_bindings = {ProducerOf(IN0_DFB, "in0"), ProducerOf(IN1_DFB, "in1")},
+        .tensor_bindings =
+            {{.tensor_parameter_name = IN0_T, .accessor_name = "in0"},
+             {.tensor_parameter_name = IN1_T, .accessor_name = "in1"}},
+        .hw_config = ttnn::create_reader_datamovement_config(),
+    };
+
+    KernelSpec writer_spec{
+        .unique_id = WRITER,
+        .source = std::string(KERNEL_DIR) + "dataflow/writer_1_tile.cpp",
+        .dfb_bindings = {ConsumerOf(OUT_DFB, "out")},
+        .semaphore_bindings = {{.semaphore_spec_name = PROGRAM_SEM, .accessor_name = "program_sem"}},
+        .tensor_bindings = {{.tensor_parameter_name = OUT_T, .accessor_name = "out"}},
+        .compile_time_args = {{"ct_marker", 0x5678}},
+        .runtime_arg_schema =
+            {.runtime_arg_names = {"rt_marker"}, .common_runtime_arg_names = {"incremented_semaphore"}},
+        .hw_config = ttnn::create_writer_datamovement_config(),
+        .advanced_options = {.num_runtime_varargs = 1},
+    };
+
+    KernelSpec compute_spec{
+        .unique_id = COMPUTE,
+        .source = std::string(KERNEL_DIR) + "compute/add_2_tiles_hang.cpp",
+        // Metal 2.0's type-agnostic default opt level is O2; a compute kernel used to get O3, so
+        // state it explicitly to keep the generated code the same as before.
+        .compiler_options = {.opt_level = KernelBuildOptLevel::O3},
+        .dfb_bindings = {ConsumerOf(IN0_DFB, "in0"), ConsumerOf(IN1_DFB, "in1"), ProducerOf(OUT_DFB, "out")},
+        .hw_config = compute_hw_config,
+    };
+
+    ProgramSpec spec{
+        .name = "add_integers_hang",
+        .kernels = {reader_spec, writer_spec, compute_spec},
+        .dataflow_buffers =
+            {make_dfb_spec(IN0_DFB, data_format),
+             make_dfb_spec(IN1_DFB, data_format),
+             make_dfb_spec(OUT_DFB, data_format_output)},
+        // Read by dump_semaphores, same as in add_2_integers_hang: the shared writer bumps it twice.
+        .semaphores = {{.unique_id = PROGRAM_SEM, .target_nodes = NodeCoord{0, 0}}},
+        .tensor_parameters =
+            {{.unique_id = IN0_T, .spec = src0.tensor_spec()},
+             {.unique_id = IN1_T, .spec = src1.tensor_spec()},
+             {.unique_id = OUT_T, .spec = dst.tensor_spec()}},
+        .work_units = {{.name = "main", .kernels = {READER, WRITER, COMPUTE}, .target_nodes = NodeCoord{0, 0}}},
+    };
+
+    // The reader and writer get their buffer addresses from the tensor arguments and the compute kernel
+    // needs none; the writer's one runtime arg is the GlobalSemaphore it bumps, and its ct_marker, rt_marker
+    // and unnamed runtime arg are checked by triage, same as in add_2_integers_hang. Kernels without runtime
+    // args may be left out.
+    // The framework applies these run args for us; the factory must not call Program::set_program_run_args itself.
+    ProgramRunArgs run_args;
+    run_args.kernel_run_args = {
+        ProgramRunArgs::KernelRunArgs{
+            .kernel = WRITER,
+            .runtime_arg_values = {{"rt_marker", {{NodeCoord{0, 0}, 0x9abc}}}},
+            .common_runtime_arg_values =
+                {{"incremented_semaphore", operation_attributes.incremented_semaphore_address}},
+            .advanced_options = experimental::AdvancedKernelRunArgs{.runtime_varargs = {{NodeCoord{0, 0}, {0x1234}}}},
+        },
+    };
+    run_args.tensor_args = {
+        {IN0_T, ProgramRunArgs::TensorArgument{src0}},
+        {IN1_T, ProgramRunArgs::TensorArgument{src1}},
+        {OUT_T, ProgramRunArgs::TensorArgument{dst}},
+    };
+
+    return ttnn::device_operation::ProgramArtifacts{.spec = std::move(spec), .run_params = std::move(run_args)};
+}
+
+}  // namespace triage_hang_apps

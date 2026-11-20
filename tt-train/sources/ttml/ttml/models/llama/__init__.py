@@ -1,0 +1,393 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import json
+import os
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from math import sqrt
+from pathlib import Path
+from typing import Optional
+
+import ttnn
+import ttml
+from ttml.common.utils import build_rope_params_from_config
+from ttml.modules import (
+    AbstractModuleBase,
+    ColumnParallelLinear,
+    Embedding,
+    FeatureParallelEmbedding,
+    LinearLayer,
+    ModuleList,
+    VocabParallelEmbedding,
+)
+
+from .. import EmbeddingPlacement, RunnerType, WeightTyingType, memory_efficient_runner
+from .autograd_ops import SliceLastDim
+from .transformer import LlamaBlock, RMSNormLayer, compute_swiglu_intermediate_size
+
+
+@dataclass(frozen=True)
+class LlamaRopeScalingConfig:
+    """Llama 3.x RoPE frequency scaling configuration."""
+
+    scaling_factor: float = 0.0  # 0.0 means no scaling
+    high_freq_factor: float = 4.0
+    low_freq_factor: float = 1.0
+    original_context_length: int = 0  # 0 means no scaling
+
+
+def _read_hf_config(path: str | os.PathLike) -> dict:
+    path = Path(path)
+    if path.is_dir():
+        path = path / "config.json"
+    with open(path) as f:
+        return json.load(f)
+
+
+@dataclass(frozen=True)
+class LlamaConfig:
+    """Llama model hyper-parameters.
+
+    When ``use_tp=True`` the mesh must already be open and the ``"tp"`` axis
+    size must evenly divide ``num_attention_heads``, ``num_key_value_heads``,
+    and ``intermediate_size`` — this is validated in ``__post_init__``.  The
+    vocab does *not* need to be TP-divisible: the embedding and LM-head
+    weights are padded internally to a multiple of ``32 * tp_size``, exposed as
+    ``Llama.padded_vocab_size``.
+
+    ``embedding_placement`` selects how the token-embedding table is placed across the
+    TP axis (see :class:`EmbeddingPlacement`); it defaults to ``Replicated`` (no
+    sharding) and is ignored when ``use_tp=False``.
+
+    ``use_composite_sdpa`` runs the attention of the forward without a KV cache through
+    ``scaled_dot_product_attention_composite``, which also accepts non-broadcast masks such as
+    ``(B, 1, S, S)``. The KV-cache forward picks its SDPA from the mask shape.
+    """
+
+    hidden_size: int = 384
+    intermediate_size: Optional[int] = None
+    num_hidden_layers: int = 6
+    num_attention_heads: int = 6
+    num_key_value_heads: int = 2
+    vocab_size: int = 256
+    max_position_embeddings: int = 256
+    rope_theta: float = 10000.0
+    attention_bias: bool = False
+    rms_norm_eps: float = 1e-5
+    attention_dropout: float = 0.0
+    mlp_dropout: float = 0.0
+    runner_type: RunnerType = RunnerType.Default
+    weight_tying: WeightTyingType = WeightTyingType.Disabled
+    rope_scaling: LlamaRopeScalingConfig = field(default_factory=LlamaRopeScalingConfig)
+    use_tp: bool = False
+    embedding_placement: EmbeddingPlacement = EmbeddingPlacement.Replicated
+    use_composite_sdpa: bool = False
+
+    def __post_init__(self):
+        if self.max_position_embeddings % 32 != 0:
+            raise ValueError(
+                "Max position embeddings must be divisible by 32 due to current limitations in tensor. "
+                f"Provided max_position_embeddings={self.max_position_embeddings}"
+            )
+        if self.hidden_size % 32 != 0:
+            raise ValueError(
+                "Hidden size must be divisible by 32 due to current limitations in tensor. "
+                f"Provided hidden_size={self.hidden_size}"
+            )
+        if self.num_attention_heads <= 0:
+            raise ValueError(
+                "Number of attention heads must be a positive integer. "
+                f"Provided num_attention_heads={self.num_attention_heads}"
+            )
+        if self.num_key_value_heads <= 0:
+            raise ValueError(
+                "Number of key/value heads must be a positive integer. "
+                f"Provided num_key_value_heads={self.num_key_value_heads}"
+            )
+        if self.hidden_size % self.num_attention_heads != 0:
+            raise ValueError(
+                "Hidden size must be divisible by the number of attention heads. "
+                f"Provided hidden_size={self.hidden_size}, num_attention_heads={self.num_attention_heads}"
+            )
+        if self.num_attention_heads % self.num_key_value_heads != 0:
+            raise ValueError(
+                "Number of attention heads must be divisible by the number of key/value heads. "
+                f"Provided num_attention_heads={self.num_attention_heads}, num_key_value_heads={self.num_key_value_heads}"
+            )
+        if self.use_tp:
+            if (
+                self.weight_tying == WeightTyingType.Enabled
+                and self.embedding_placement != EmbeddingPlacement.VocabParallel
+            ):
+                raise ValueError(
+                    "weight tying ties the token embedding to the vocab-parallel LM head, so "
+                    "the embedding must share that layout: embedding_placement must be "
+                    f"VocabParallel, got {self.embedding_placement.name}. Set "
+                    "embedding_placement=VocabParallel or weight_tying=Disabled."
+                )
+            tp_size = ttml.mesh().axis_size("tp")
+            if self.num_attention_heads % tp_size != 0:
+                raise ValueError(
+                    "Number of attention heads must be divisible by TP size. "
+                    f"num_attention_heads={self.num_attention_heads}, tp_size={tp_size}"
+                )
+            if self.num_key_value_heads % tp_size != 0:
+                raise ValueError(
+                    "Number of key/value heads must be divisible by TP size. "
+                    f"num_key_value_heads={self.num_key_value_heads}, tp_size={tp_size}"
+                )
+            intermediate_size = self.intermediate_size
+            if intermediate_size is None:
+                intermediate_size = compute_swiglu_intermediate_size(self.hidden_size)
+            if intermediate_size % tp_size != 0:
+                raise ValueError(
+                    "Intermediate size must be divisible by TP size. "
+                    f"intermediate_size={intermediate_size}, tp_size={tp_size}"
+                )
+
+    @classmethod
+    def from_hf(cls, hf_config: str | os.PathLike | Mapping, max_position_embeddings: int, **overrides) -> LlamaConfig:
+        """The architecture of a HuggingFace Llama checkpoint, read from its ``config.json``."""
+        if not isinstance(hf_config, Mapping):
+            hf_config = _read_hf_config(hf_config)
+        model_type = hf_config.get("model_type", "llama")
+        if model_type != "llama":
+            raise ValueError(f"model_type {model_type!r} is not a Llama checkpoint")
+        if (quantization := hf_config.get("quantization_config")) is not None:
+            method = quantization.get("quant_method", "unknown") if isinstance(quantization, Mapping) else "unknown"
+            raise ValueError(f"quantized checkpoints ({method}) are not supported")
+        # The model has no MLP bias, and the loader cannot load attention biases.
+        for bias in ("attention_bias", "mlp_bias"):
+            if hf_config.get(bias, False):
+                raise ValueError(f"{bias}=true is not supported")
+        if (hidden_act := hf_config.get("hidden_act", "silu")) != "silu":
+            raise ValueError(f"hidden_act {hidden_act!r} is not supported, only 'silu'")
+        hidden_size = hf_config["hidden_size"]
+        num_heads = hf_config["num_attention_heads"]
+        head_dim = hf_config.get("head_dim", hidden_size // num_heads)
+        if head_dim * num_heads != hidden_size:
+            raise ValueError(f"head_dim {head_dim} * num_attention_heads {num_heads} != hidden_size {hidden_size}")
+
+        # transformers v5 writes rope_theta and the scaling as rope_parameters; v4 as rope_theta and rope_scaling.
+        rope = hf_config.get("rope_parameters") or hf_config.get("rope_scaling") or {}
+        rope_type = rope.get("rope_type", rope.get("type", "default"))
+        if rope_type == "llama3":
+            rope_scaling = LlamaRopeScalingConfig(
+                scaling_factor=rope["factor"],
+                high_freq_factor=rope["high_freq_factor"],
+                low_freq_factor=rope["low_freq_factor"],
+                original_context_length=rope["original_max_position_embeddings"],
+            )
+        elif rope_type == "default":
+            rope_scaling = LlamaRopeScalingConfig()
+        else:
+            raise ValueError(f"rope type {rope_type!r} is not supported, only 'llama3' and 'default'")
+
+        architecture = dict(
+            hidden_size=hidden_size,
+            intermediate_size=hf_config["intermediate_size"],
+            num_hidden_layers=hf_config["num_hidden_layers"],
+            num_attention_heads=num_heads,
+            num_key_value_heads=hf_config.get("num_key_value_heads", num_heads),
+            vocab_size=hf_config["vocab_size"],
+            max_position_embeddings=max_position_embeddings,
+            rope_theta=rope.get("rope_theta", hf_config.get("rope_theta", 10000.0)),
+            rms_norm_eps=hf_config.get("rms_norm_eps", 1e-6),  # HF's default
+            weight_tying=(
+                WeightTyingType.Enabled if hf_config.get("tie_word_embeddings", False) else WeightTyingType.Disabled
+            ),
+            rope_scaling=rope_scaling,
+        )
+        return cls(**{**architecture, **overrides})
+
+
+class Llama(AbstractModuleBase):
+    """Llama decoder-only transformer (Python implementation)."""
+
+    def __init__(self, config: LlamaConfig) -> None:
+        super().__init__()
+
+        self.config = config
+
+        if config.use_tp:
+            # Pad the vocab so the LM head's sharded output rows are
+            # tile-aligned: ColumnParallelLinear shards dim 2 across TP, so
+            # each shard needs to be divisible by 32 -- i.e. the padded global
+            # size must be a multiple of 32 * tp_size. The trailing padded
+            # columns are kept on-device and handled by the downstream
+            # vocab_parallel_cross_entropy_loss, so ``config.vocab_size`` is
+            # free to be arbitrary.
+            tp_size = ttml.mesh().axis_size("tp")
+            align = 32 * tp_size
+            self.padded_vocab_size = ((config.vocab_size + align - 1) // align) * align
+            # gather_output=False: keep the LM head output vocab-sharded
+            # ([B,1,S,padded_V/tp_size] per device) so callers can route through
+            # ttml.ops.distributed.vocab_parallel_cross_entropy_loss without an
+            # all-gather of the full vocab dimension.
+            self.fc = ColumnParallelLinear(
+                config.hidden_size,
+                self.padded_vocab_size,
+                has_bias=False,
+                gather_output=False,
+                axis_name="tp",
+            )
+            if config.embedding_placement == EmbeddingPlacement.VocabParallel:
+                self.tok_emb = VocabParallelEmbedding(
+                    self.padded_vocab_size,
+                    config.hidden_size,
+                    weight_init=ttml.init.normal(0.0, 0.02),
+                    axis_name="tp",
+                )
+            elif config.embedding_placement == EmbeddingPlacement.FeatureParallel:
+                self.tok_emb = FeatureParallelEmbedding(
+                    self.padded_vocab_size,
+                    config.hidden_size,
+                    weight_init=ttml.init.normal(0.0, 0.02),
+                    axis_name="tp",
+                )
+            else:
+                self.tok_emb = Embedding(
+                    self.padded_vocab_size,
+                    config.hidden_size,
+                    weight_init=ttml.init.normal(0.0, 0.02),
+                )
+        else:
+            self.padded_vocab_size = ((config.vocab_size + 31) // 32) * 32
+            self.fc = LinearLayer(
+                config.hidden_size,
+                self.padded_vocab_size,
+                False,
+            )
+            self.tok_emb = Embedding(
+                self.padded_vocab_size,
+                config.hidden_size,
+                weight_init=ttml.init.normal(0.0, 0.02),
+            )
+
+        if config.weight_tying == ttml.models.WeightTyingType.Enabled:
+            self.tok_emb.weight = self.fc.weight
+
+        rope_params = build_rope_params_from_config(config, config.hidden_size // config.num_attention_heads)
+
+        # Depth-scaled init for the residual-writing projections (attention out-proj, MLP
+        # down-proj): each of them adds its output into the residual stream, so the stream's
+        # variance at init grows ~linearly with the number of such additions.
+        # Std is the usual 1/sqrt(fan_in) damped by 1/sqrt(N), where N is the total number of
+        # residual additions. Each block adds into the stream twice (after attention and after
+        # the MLP), so N = 2 * num_hidden_layers. fan_in differs between the two: hidden_size
+        # for out-proj, intermediate_size for down-proj.
+        intermediate_size = config.intermediate_size or compute_swiglu_intermediate_size(config.hidden_size)
+        num_residual_writes = 2 * config.num_hidden_layers
+        out_proj_init = ttml.init.normal(0.0, 1.0 / sqrt(config.hidden_size * num_residual_writes))
+        down_proj_init = ttml.init.normal(0.0, 1.0 / sqrt(intermediate_size * num_residual_writes))
+
+        # Transformer blocks (ModuleList auto-registers all blocks)
+        self.blocks = ModuleList(
+            [
+                LlamaBlock(
+                    hidden_size=config.hidden_size,
+                    num_attention_heads=config.num_attention_heads,
+                    num_key_value_heads=config.num_key_value_heads,
+                    rope_params=rope_params,
+                    attention_dropout=config.attention_dropout,
+                    mlp_dropout=config.mlp_dropout,
+                    intermediate_size=config.intermediate_size,
+                    attention_bias=config.attention_bias,
+                    rms_norm_eps=config.rms_norm_eps,
+                    use_tp=config.use_tp,
+                    out_proj_init=out_proj_init,
+                    down_proj_init=down_proj_init,
+                    use_composite_sdpa=config.use_composite_sdpa,
+                )
+                for _ in range(config.num_hidden_layers)
+            ]
+        )
+
+        self.ln_fc = RMSNormLayer(config.hidden_size, config.rms_norm_eps)
+
+    def forward(
+        self,
+        input: ttml.autograd.Tensor,
+        mask: ttml.autograd.Tensor,
+        kv_cache: Optional[ttml.models.KvCache] = None,
+        new_tokens: Optional[int] = None,
+        unpadded_token_positions: Optional[ttml.autograd.Tensor] = None,
+    ) -> ttml.autograd.Tensor:
+        """``unpadded_token_positions``: [B, S] UINT32 ROW_MAJOR, sharded like input, ids < max_position_embeddings."""
+        # Token IDs must be padded to the tile boundary so the embedding lookup
+        # produces a tile-aligned tensor.  The padding is stripped after lookup.
+        TILE_SIZE = 32
+        input_shape = input.shape()
+        actual_seq_len = input_shape[-1]
+        padded_seq_len = ((actual_seq_len + TILE_SIZE - 1) // TILE_SIZE) * TILE_SIZE
+
+        input_padded = input
+        if padded_seq_len != actual_seq_len:
+            padding = [(0, 0), (0, 0), (0, 0), (0, padded_seq_len - actual_seq_len)]
+            input_val_padded = ttnn.pad(input.get_value(), padding=padding, value=0.0)
+            input_padded = ttml.autograd.create_tensor(input_val_padded)
+
+        tok_emb_out = self.tok_emb(input_padded)
+
+        out = tok_emb_out
+        if padded_seq_len != actual_seq_len:
+            slice_start = [0, 0, 0, 0]
+            slice_end = [
+                tok_emb_out.shape()[0],
+                tok_emb_out.shape()[1],
+                actual_seq_len,
+                tok_emb_out.shape()[3],
+            ]
+            step = [1, 1, 1, 1]
+            out_val = ttnn.slice(tok_emb_out.get_value(), slice_start, slice_end, step)
+            out = ttml.autograd.create_tensor(out_val)
+
+        rope_positions = None
+        if unpadded_token_positions is not None:
+            rope_positions = ttml.ops.rope.RotaryEmbeddingPositions(unpadded_token_positions)
+        for layer_idx, block in enumerate(self.blocks):
+            extra_args = () if kv_cache is None else (kv_cache, layer_idx, new_tokens)
+            if self.config.runner_type == ttml.models.RunnerType.MemoryEfficient:
+                out = memory_efficient_runner(block, out, mask, *extra_args, rope_positions=rope_positions)
+            elif self.config.runner_type == ttml.models.RunnerType.Default:
+                out = block(out, mask, *extra_args, rope_positions=rope_positions)
+            else:
+                raise ValueError("Unknown runner type. Supported runner types ['default', 'memory_efficient']")
+
+        out = self.ln_fc(out)
+        logits = self.fc(out)
+        # In TP mode the LM head output stays vocab-sharded; the trailing
+        # padded columns are handled by vocab_parallel_cross_entropy_loss.
+        # The non-TP path returns full-vocab logits, so we still need to drop
+        # the tile-alignment padding before handing them off to the caller.
+        if not self.config.use_tp and self.padded_vocab_size != self.config.vocab_size:
+            logits = SliceLastDim.apply(logits, self.config.vocab_size)
+        return logits
+
+
+# C++ Llama bindings from _ttml.models.llama
+from _ttml.models.llama import (
+    CppLlama,
+    CppLlamaConfig,
+    create_cpp_llama_model,
+)
+
+from .safetensors_loader import load_from_safetensors
+from .flops import calculate_flops_per_token
+
+__all__ = [
+    # C++ bindings
+    "CppLlama",
+    "CppLlamaConfig",
+    "create_cpp_llama_model",
+    # Python implementations
+    "Llama",
+    "LlamaConfig",
+    "LlamaRopeScalingConfig",
+    "calculate_flops_per_token",
+    "load_from_safetensors",
+]

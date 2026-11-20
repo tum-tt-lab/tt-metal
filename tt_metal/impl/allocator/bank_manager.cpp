@@ -1,0 +1,759 @@
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include "bank_manager.hpp"
+
+#include <enchantum/enchantum.hpp>
+#include <tt-metalium/allocator.hpp>
+#include "allocator_state.hpp"
+#include <string>
+#include <utility>
+#include <algorithm>
+
+#include "allocator/algorithms/allocator_algorithm.hpp"
+#include <tt_stl/assert.hpp>
+#include "buffer_types.hpp"
+#include <tt-logger/tt-logger.hpp>
+#include "tt_metal/impl/allocator/algorithms/free_list_opt.hpp"
+#include "tt_metal/impl/allocator/algorithms/address_ranges.hpp"
+#include "tt_metal/impl/allocator/allocation_request.hpp"
+
+namespace tt::tt_metal {
+
+namespace {
+
+// L1_SMALL is sized once at device open, so running out of it looks like fragmentation of a
+// near-empty card unless the message names the parameter that sizes it.
+std::string l1_small_hint(BufferType buffer_type, DeviceAddr bank_size) {
+    if (buffer_type != BufferType::L1_SMALL) {
+        return "";
+    }
+    if (bank_size == 0) {
+        return " The L1_SMALL region is 0 B because it is reserved at device open; set l1_small_size large enough for "
+               "this allocation when opening the device.";
+    }
+    return " The L1_SMALL region is sized at device open; increase l1_small_size when opening the device.";
+}
+
+}  // namespace
+
+BankManager::AllocatorDependencies::AllocatorDependencies() = default;
+
+BankManager::AllocatorDependencies::AllocatorDependencies(
+    const std::unordered_map<AllocatorID, ttsl::SmallVector<AllocatorID>>& dependencies_map) {
+    // Determine total number of allocators as max allocator id seen anywhere (keys or values)
+    if (dependencies_map.empty()) {
+        dependencies = AdjacencyList{{}};
+        return;
+    }
+
+    uint32_t max_id = 0;
+    for (const auto& [allocator_id, dependencies] : dependencies_map) {
+        max_id = std::max(max_id, allocator_id.get());
+        for (const auto dep_allocator_id : dependencies) {
+            max_id = std::max(max_id, dep_allocator_id.get());
+        }
+    }
+    const uint32_t num_allocators = static_cast<uint32_t>(max_id) + 1;  // +1 because allocator ids are zero-indexed
+
+    // Use set form to ensure uniqueness while building undirected adjacency list
+    ttsl::SmallVector<std::unordered_set<uint32_t>> undirected_sets(num_allocators);
+
+    // Build undirected adjacency: for each edge (u -> v), add v to u and u to v
+    for (const auto& [allocator_id, dependencies] : dependencies_map) {
+        // Ensure uniqueness of dependency values per allocator (catch duplicates in provided list)
+        std::unordered_set<uint32_t> seen_values;
+        for (const auto dep_allocator_id : dependencies) {
+            const bool inserted = seen_values.insert(dep_allocator_id.get()).second;
+            TT_FATAL(
+                inserted,
+                "Duplicate dependency for allocator {}: {} appears more than once!",
+                allocator_id.get(),
+                dep_allocator_id.get());
+        }
+
+        for (const auto dep_allocator_id : dependencies) {
+            const uint32_t u = allocator_id.get();
+            const uint32_t v = dep_allocator_id.get();
+            undirected_sets[u].insert(v);
+            undirected_sets[v].insert(u);
+        }
+    }
+
+    // Build dependencies list: for each allocator s, which allocators s depends on / depends on s
+    // Note: Need to sort dependencies because dependencies_map is unordered
+    dependencies.clear();
+    dependencies.resize(num_allocators);
+    for (uint32_t i = 0; i < num_allocators; ++i) {
+        auto& dst = dependencies[i];
+        dst.assign(undirected_sets[i].begin(), undirected_sets[i].end());
+        std::sort(dst.begin(), dst.end());
+    }
+}
+
+uint32_t BankManager::AllocatorDependencies::num_allocators() const {
+    return static_cast<uint32_t>(dependencies.size());
+}
+
+ttsl::SmallVector<BankManager::AllocatorDependencies::AllocatorID> BankManager::AllocatorDependencies::allocator_ids()
+    const {
+    ttsl::SmallVector<AllocatorID> allocators;
+    allocators.reserve(num_allocators());
+    for (size_t i = 0; i < num_allocators(); i++) {
+        allocators.push_back(AllocatorID{static_cast<uint32_t>(i)});
+    }
+    return allocators;
+}
+
+bool BankManager::AllocatorDependencies::operator==(const BankManager::AllocatorDependencies& other) const noexcept {
+    if (dependencies.size() != other.dependencies.size()) {
+        return false;
+    }
+    // Direct comparison assuming dependencies are already sorted
+    for (size_t i = 0; i < dependencies.size(); ++i) {
+        if (dependencies[i] != other.dependencies[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void BankManager::init_allocators(DeviceAddr size_bytes, uint32_t alignment_bytes, DeviceAddr offset) {
+    const uint32_t n = allocator_dependencies_.num_allocators();
+    allocators_.resize(n);
+    allocated_buffers_.resize(n);
+    allocated_ranges_cache_.resize(n);
+
+    for (uint32_t allocator_id = 0; allocator_id < n; ++allocator_id) {
+        allocators_[allocator_id] = std::make_unique<allocator::FreeListOpt>(
+            size_bytes, offset, alignment_bytes, alignment_bytes, allocator::FreeListOpt::SearchPolicy::FIRST);
+    }
+}
+
+void validate_num_banks(uint32_t num_banks, const BufferType& buffer_type, bool disable_interleaved) {
+    bool doesnt_support_interleaved = buffer_type == BufferType::L1_SMALL or disable_interleaved;
+    bool is_pow2_num_banks = num_banks && (!(num_banks & (num_banks - 1)));
+    // Dataflow API does not have a working implementation of generic modulo to determine bank_id for interleaved
+    // address gen For non pow2 num banks, special cases need to be added to avoid falling back to generic
+    // implementation. See https://github.com/tenstorrent/tt-metal/issues/3321
+    std::unordered_set<uint32_t> acceptable_num_non_pow2_mem_banks = {7,  12, 20,  28,  48,  56,  63,  70,  72,  80, 84,
+                                                                      94, 96, 108, 110, 117, 120, 124, 126, 130, 140};
+    bool custom_mod_bank_id_calculation_exists = acceptable_num_non_pow2_mem_banks.contains(num_banks);
+    bool valid_num_banks = (is_pow2_num_banks or custom_mod_bank_id_calculation_exists or doesnt_support_interleaved);
+    if (not valid_num_banks) {
+        TT_THROW(
+            "Invalid number of memory banks {} for {}. Num banks must be power of 2 or have a dedicated modulo "
+            "implementation",
+            num_banks,
+            enchantum::to_string(buffer_type));
+    }
+}
+
+BankManager::BankManager(
+    const BufferType& buffer_type,
+    const std::vector<int64_t>& bank_offsets,
+    DeviceAddr size_bytes,
+    uint32_t alignment_bytes,
+    uint32_t dram_alignment_bytes,
+    DeviceAddr alloc_offset,
+    bool disable_interleaved,
+    const AllocatorDependencies& dependencies) :
+    buffer_type_(buffer_type),
+
+    alignment_bytes_(alignment_bytes),
+    allocator_dependencies_(dependencies) {
+    unsigned int bank_id = 0;
+    for (const auto bank_offset : bank_offsets) {
+        bank_id_to_bank_offset_.insert({bank_id, bank_offset});
+        bank_id++;
+    }
+
+    validate_num_banks(bank_id_to_bank_offset_.size(), buffer_type_, disable_interleaved);
+
+    // Initialize all allocators; sets up allocator-dependent members
+    // Pass in the DRAM alignment to ensure L1<->DRAM or DRAM<->DRAM data transfers are aligned
+    this->init_allocators(size_bytes, dram_alignment_bytes, alloc_offset);
+}
+
+BankManager::BankManager(
+    const BufferType& buffer_type,
+    const std::unordered_map<uint32_t, int64_t>& bank_id_to_bank_offset,
+    DeviceAddr size_bytes,
+    DeviceAddr interleaved_address_limit,
+    uint32_t alignment_bytes,
+    uint32_t dram_alignment_bytes,
+    DeviceAddr alloc_offset,
+    bool disable_interleaved,
+    const AllocatorDependencies& dependencies) :
+    buffer_type_(buffer_type),
+    bank_id_to_bank_offset_(bank_id_to_bank_offset),
+    interleaved_address_limit_(interleaved_address_limit),
+    alignment_bytes_(alignment_bytes),
+    allocator_dependencies_(dependencies) {
+    validate_num_banks(bank_id_to_bank_offset_.size(), buffer_type_, disable_interleaved);
+
+    // Initialize all allocators; sets up allocator-dependent members
+    // Pass in the DRAM alignment to ensure L1<->DRAM or DRAM<->DRAM data transfers are aligned
+    this->init_allocators(size_bytes, dram_alignment_bytes, alloc_offset);
+}
+
+uint32_t BankManager::num_banks() const { return bank_id_to_bank_offset_.size(); }
+
+DeviceAddr BankManager::bank_size() const {
+    const auto* alloc0 = this->get_allocator_from_id(AllocatorDependencies::AllocatorID{0});
+    TT_FATAL(alloc0, "Allocator not initialized!");
+    return alloc0->max_size_bytes();
+}
+
+int64_t BankManager::bank_offset(uint32_t bank_id) const {
+    this->validate_bank_id(bank_id);
+    return bank_id_to_bank_offset_.at(bank_id);
+}
+
+void BankManager::validate_bank_id(uint32_t bank_id) const {
+    TT_FATAL(
+        bank_id_to_bank_offset_.contains(bank_id),
+        "Expected bank {} to be tracked!",
+        bank_id,
+        bank_id_to_bank_offset_.size());
+}
+
+allocator::Algorithm* BankManager::get_allocator_from_id(BankManager::AllocatorDependencies::AllocatorID allocator_id) {
+    TT_FATAL(
+        allocator_id.get() < allocator_dependencies_.num_allocators(),
+        "Invalid allocator ID {} (num_allocators={})",
+        allocator_id.get(),
+        allocator_dependencies_.num_allocators());
+    return allocators_[allocator_id.get()] ? allocators_[allocator_id.get()].get() : nullptr;
+}
+
+const allocator::Algorithm* BankManager::get_allocator_from_id(
+    BankManager::AllocatorDependencies::AllocatorID allocator_id) const {
+    return const_cast<BankManager*>(this)->get_allocator_from_id(allocator_id);
+}
+
+void BankManager::invalidate_allocated_ranges_cache_for_dependent_allocators(
+    BankManager::AllocatorDependencies::AllocatorID allocator_id) {
+    TT_FATAL(
+        allocator_id.get() < allocator_dependencies_.num_allocators(),
+        "Invalid allocator ID {} (num_allocators={})",
+        allocator_id.get(),
+        allocator_dependencies_.num_allocators());
+    const auto& dependent_allocators = allocator_dependencies_.dependencies[allocator_id.get()];
+    for (const auto dep_allocator_id : dependent_allocators) {
+        allocated_ranges_cache_[dep_allocator_id.get()].reset();
+    }
+}
+
+std::vector<std::pair<DeviceAddr, DeviceAddr>> BankManager::merge_allocated_ranges_from(
+    const ttsl::SmallVector<AllocatorDependencies::AllocatorID>& dependent_allocators) {
+    // Collect allocated address ranges per dependent allocator (single pass)
+    std::vector<std::pair<DeviceAddr, DeviceAddr>> all_allocated_ranges;
+    for (const auto dep_allocator_id : dependent_allocators) {
+        auto* dep_alloc = this->get_allocator_from_id(dep_allocator_id);
+        TT_FATAL(dep_alloc, "Allocator not initialized!");
+        const auto allocated_addresses = dep_alloc->allocated_addresses();
+        all_allocated_ranges.reserve(all_allocated_ranges.size() + allocated_addresses.size());
+        for (const auto& [addr, end_addr] : allocated_addresses) {
+            if (end_addr > addr) {
+                all_allocated_ranges.emplace_back(addr, end_addr);
+            }
+        }
+    }
+
+    return allocator::coalesce(std::move(all_allocated_ranges));
+}
+
+const std::vector<std::pair<DeviceAddr, DeviceAddr>>& BankManager::compute_merged_allocated_ranges(
+    BankManager::AllocatorDependencies::AllocatorID allocator_id) {
+    TT_FATAL(
+        allocator_id.get() < allocator_dependencies_.num_allocators(),
+        "Invalid allocator ID {} (num_allocators={})",
+        allocator_id.get(),
+        allocator_dependencies_.num_allocators());
+
+    // Return cached value if available
+    if (allocated_ranges_cache_[allocator_id.get()].has_value()) {
+        return allocated_ranges_cache_[allocator_id.get()].value();
+    }
+
+    allocated_ranges_cache_[allocator_id.get()] =
+        this->merge_allocated_ranges_from(allocator_dependencies_.dependencies[allocator_id.get()]);
+    return allocated_ranges_cache_[allocator_id.get()].value();
+}
+
+std::vector<std::pair<DeviceAddr, DeviceAddr>> BankManager::compute_scoped_allocated_ranges(
+    BankManager::AllocatorDependencies::AllocatorID allocator_id,
+    const std::unordered_set<uint32_t>& scoped_dependent_allocators) {
+    TT_FATAL(
+        allocator_id.get() < allocator_dependencies_.num_allocators(),
+        "Invalid allocator ID {} (num_allocators={})",
+        allocator_id.get(),
+        allocator_dependencies_.num_allocators());
+
+    // Not cached: the cache is keyed by allocator id alone, and this result depends on the scope
+    // as well. Range lockstep buffers are the only caller, so the full merge keeps its fast path.
+    ttsl::SmallVector<AllocatorDependencies::AllocatorID> filtered;
+    for (const auto dep_allocator_id : allocator_dependencies_.dependencies[allocator_id.get()]) {
+        if (scoped_dependent_allocators.contains(dep_allocator_id.get())) {
+            filtered.push_back(dep_allocator_id);
+        }
+    }
+    return this->merge_allocated_ranges_from(filtered);
+}
+
+std::vector<std::pair<DeviceAddr, DeviceAddr>> BankManager::compute_available_addresses(
+    BankManager::AllocatorDependencies::AllocatorID allocator_id,
+    DeviceAddr size_per_bank,
+    DeviceAddr address_limit,
+    const std::vector<std::pair<DeviceAddr, DeviceAddr>>& additional_occupied_ranges,
+    const std::optional<std::unordered_set<uint32_t>>& scoped_dependent_allocators) {
+    auto* alloc = this->get_allocator_from_id(allocator_id);
+    TT_FATAL(alloc, "Allocator not initialized!");
+
+    // available_addresses includes addresses below address_limit
+    std::vector<std::pair<DeviceAddr, DeviceAddr>> available_ranges = alloc->available_addresses(size_per_bank);
+    allocator::trim_below(available_ranges, address_limit);
+    std::sort(available_ranges.begin(), available_ranges.end(), [](const auto& a, const auto& b) {
+        return a.first < b.first;
+    });
+
+    // Allocated ranges from dependent allocators; ranges are merged. A scope narrows that to the
+    // named allocators, which is how a range lockstep buffer avoids only its own cores here.
+    std::vector<std::pair<DeviceAddr, DeviceAddr>> scoped_ranges;
+    if (scoped_dependent_allocators.has_value()) {
+        scoped_ranges = this->compute_scoped_allocated_ranges(allocator_id, *scoped_dependent_allocators);
+    }
+    const auto& allocated_ranges_in_dependent_allocators =
+        scoped_dependent_allocators.has_value() ? scoped_ranges : this->compute_merged_allocated_ranges(allocator_id);
+
+    std::vector<std::pair<DeviceAddr, DeviceAddr>> updated_available_ranges =
+        allocator::set_difference(available_ranges, allocated_ranges_in_dependent_allocators);
+
+    // Also subtract additional occupied ranges (e.g., from device-level per-bank allocators passed at allocation time)
+    if (!additional_occupied_ranges.empty()) {
+        updated_available_ranges =
+            allocator::set_difference(updated_available_ranges, allocator::coalesce(additional_occupied_ranges));
+    }
+
+    return updated_available_ranges;
+}
+
+uint64_t BankManager::allocate_buffer(
+    DeviceAddr size,
+    DeviceAddr page_size,
+    bool bottom_up,
+    const CoreRangeSet& compute_grid,
+    std::optional<uint32_t> num_shards,
+    BankManager::AllocatorDependencies::AllocatorID allocator_id,
+    const std::vector<std::pair<DeviceAddr, DeviceAddr>>& additional_occupied_ranges,
+    const std::optional<std::unordered_set<uint32_t>>& scoped_dependent_allocators) {
+    auto* alloc = this->get_allocator_from_id(allocator_id);
+    TT_FATAL(alloc, "Allocator not initialized!");
+
+    const allocator::BankRequest request = allocator::compute_bank_request(
+        buffer_type_,
+        size,
+        page_size,
+        this->num_banks(),
+        alignment_bytes_,
+        interleaved_address_limit_,
+        compute_grid,
+        num_shards);
+    const uint32_t num_banks = request.num_banks;
+    const DeviceAddr size_per_bank = request.size_per_bank;
+    const DeviceAddr address_limit = request.address_limit;
+
+    // If there are no dependent allocators, fall back to allocator's single allocator strategy
+    const auto& dependent_allocators = allocator_dependencies_.dependencies[allocator_id.get()];
+
+    // If using single allocator strategy, Algorithm::allocate handles address limit, which means it can only be used
+    // with top-down allocation. Otherwise, address limit is used to trim the available ranges regardless of bottom_up
+    // vs. top-down allocation
+    if (dependent_allocators.empty()) {
+        auto address = alloc->allocate(size_per_bank, bottom_up, address_limit);
+        if (!address.has_value()) {
+            auto mem_stats = alloc->get_statistics();
+            TT_FATAL(
+                false,
+                "Out of Memory: Not enough space to allocate {} B {} buffer across {} banks, where each bank needs to "
+                "store {} B, but bank size is {} B (allocated: {} B, free: {} B, largest free block: {} B).{}",
+                size,
+                enchantum::to_string(buffer_type_),
+                num_banks,
+                size_per_bank,
+                bank_size(),
+                mem_stats.total_allocated_bytes,
+                mem_stats.total_free_bytes,
+                mem_stats.largest_free_block_bytes,
+                l1_small_hint(buffer_type_, bank_size()));
+        }
+        allocated_buffers_[allocator_id.get()].insert(address.value());
+
+        // Track allocation high water mark
+        if (tracking_high_water_mark_) {
+            // Calculate end address in interleaved space: address + size_per_bank
+            // Bank offsets don't need to be accounted for here since overlap comparisons
+            // are done in interleaved space where both allocations have the same bank offset applied
+            DeviceAddr end_address = address.value() + size_per_bank;
+            allocation_high_water_mark_ = std::max(allocation_high_water_mark_, end_address);
+        }
+
+        // No neighbors, nothing to invalidate
+        return address.value();
+    }
+
+    // Get available address ranges after subtracting dependencies
+    // The pair represents (start, end) of the available address range(s)
+    std::vector<std::pair<DeviceAddr, DeviceAddr>> available_ranges = this->compute_available_addresses(
+        allocator_id, size_per_bank, address_limit, additional_occupied_ranges, scoped_dependent_allocators);
+
+    // Addresses should already be aligned to alignment_bytes_
+    std::optional<DeviceAddr> chosen = allocator::first_fit(available_ranges, size_per_bank, bottom_up);
+
+    if (!chosen.has_value()) {
+        auto mem_stats = alloc->get_statistics();
+        // The free/largest-free-block figures are this allocator's own view; dependency and
+        // additional ranges are subtracted before an address is chosen. Report what survived that
+        // too, or a failure with plenty free reads as capacity exhaustion.
+        DeviceAddr placeable_bytes = 0;
+        DeviceAddr largest_placeable = 0;
+        for (const auto& r : available_ranges) {
+            placeable_bytes += (r.second - r.first);
+            largest_placeable = std::max(largest_placeable, r.second - r.first);
+        }
+        TT_FATAL(
+            false,
+            "Out of Memory: Not enough space after considering dependencies to allocate {} B {} across {} banks ({} B "
+            "per bank), bank size is {} B (allocated: {} B, free: {} B, largest free block: {} B). After subtracting "
+            "{} dependency range(s) and {} additional occupied range(s), {} B remained placeable across {} window(s), "
+            "largest {} B.{}",
+            size,
+            enchantum::to_string(buffer_type_),
+            num_banks,
+            size_per_bank,
+            bank_size(),
+            mem_stats.total_allocated_bytes,
+            mem_stats.total_free_bytes,
+            mem_stats.largest_free_block_bytes,
+            scoped_dependent_allocators.has_value()
+                ? this->compute_scoped_allocated_ranges(allocator_id, *scoped_dependent_allocators).size()
+                : this->compute_merged_allocated_ranges(allocator_id).size(),
+            additional_occupied_ranges.size(),
+            placeable_bytes,
+            available_ranges.size(),
+            largest_placeable,
+            l1_small_hint(buffer_type_, bank_size()));
+    }
+    TT_FATAL(
+        chosen.value() % alignment_bytes_ == 0,
+        "Chosen address {} is not aligned to {} B",
+        chosen.value(),
+        alignment_bytes_);
+
+    auto address = alloc->allocate_at_address(chosen.value(), size_per_bank);
+    TT_FATAL(address.has_value(), "Allocator failed to place at chosen address {}", chosen.value());
+    allocated_buffers_[allocator_id.get()].insert(address.value());
+
+    // Track allocation high water mark
+    if (tracking_high_water_mark_) {
+        // Calculate end address in interleaved space: address + size_per_bank
+        // Bank offsets don't need to be accounted for here since overlap comparisons
+        // are done in interleaved space where both allocations have the same bank offset applied
+        DeviceAddr end_address = address.value() + size_per_bank;
+        allocation_high_water_mark_ = std::max(allocation_high_water_mark_, end_address);
+    }
+
+    // Allocation in this allocator invalidates caches in allocators that depend on this allocator
+    this->invalidate_allocated_ranges_cache_for_dependent_allocators(allocator_id);
+    return address.value();
+}
+
+void BankManager::deallocate_buffer(DeviceAddr address, BankManager::AllocatorDependencies::AllocatorID allocator_id) {
+    auto* alloc = this->get_allocator_from_id(allocator_id);
+    TT_FATAL(alloc, "Allocator not initialized!");
+
+    // Track deletion high water mark - remember the extent of buffers being freed
+    if (tracking_high_water_mark_) {
+        auto size_opt = alloc->get_allocation_size(address);
+        if (size_opt.has_value()) {
+            // Update deletion high water mark with the end address of the buffer being deallocated
+            DeviceAddr end_address = address + size_opt.value();
+            deletion_high_water_mark_ = std::max(deletion_high_water_mark_, end_address);
+        }
+    }
+
+    alloc->deallocate(address);
+    allocated_buffers_[allocator_id.get()].erase(address);
+    // Deallocation in this allocator invalidates caches in allocators that depend on this allocator
+    this->invalidate_allocated_ranges_cache_for_dependent_allocators(allocator_id);
+}
+
+void BankManager::deallocate_all() {
+    for (const auto allocator_id : allocator_dependencies_.allocator_ids()) {
+        auto* alloc = this->get_allocator_from_id(allocator_id);
+        TT_FATAL(alloc, "Allocator not initialized!");
+        for (DeviceAddr addr : allocated_buffers_[allocator_id.get()]) {
+            alloc->deallocate(addr);
+        }
+        allocated_buffers_[allocator_id.get()].clear();
+        allocated_ranges_cache_[allocator_id.get()].reset();
+    }
+}
+
+void BankManager::clear() {
+    for (const auto allocator_id : allocator_dependencies_.allocator_ids()) {
+        if (allocators_[allocator_id.get()]) {
+            allocators_[allocator_id.get()]->clear();
+            allocated_buffers_[allocator_id.get()].clear();
+        }
+        allocated_ranges_cache_[allocator_id.get()].reset();
+    }
+}
+
+BankManager& BankManager::operator=(BankManager&& that) noexcept {
+    buffer_type_ = that.buffer_type_;
+    allocated_buffers_ = std::move(that.allocated_buffers_);
+    bank_id_to_bank_offset_ = std::move(that.bank_id_to_bank_offset_);
+    allocators_ = std::move(that.allocators_);
+    interleaved_address_limit_ = that.interleaved_address_limit_;
+    alignment_bytes_ = that.alignment_bytes_;
+    allocator_dependencies_ = std::move(that.allocator_dependencies_);
+    allocated_ranges_cache_ = std::move(that.allocated_ranges_cache_);
+    return *this;
+}
+
+std::optional<DeviceAddr> BankManager::lowest_occupied_address(
+    uint32_t bank_id, BankManager::AllocatorDependencies::AllocatorID allocator_id) const {
+    const auto* alloc = this->get_allocator_from_id(allocator_id);
+    if (alloc == nullptr) {
+        return std::nullopt;
+    }
+    auto lowest_address = alloc->lowest_occupied_address();
+    if (not lowest_address.has_value()) {
+        return lowest_address;
+    }
+    DeviceAddr adjusted_abs_addr = lowest_address.value() + this->bank_offset(bank_id);
+    return adjusted_abs_addr;
+}
+
+Statistics BankManager::get_statistics(BankManager::AllocatorDependencies::AllocatorID allocator_id) const {
+    const auto* alloc = this->get_allocator_from_id(allocator_id);
+    return alloc ? alloc->get_statistics() : Statistics();
+}
+
+void BankManager::begin_high_water_mark_tracking() {
+    tracking_high_water_mark_ = true;
+    allocation_high_water_mark_ = 0;
+    deletion_high_water_mark_ = 0;
+}
+
+DeviceAddr BankManager::end_high_water_mark_tracking() {
+    tracking_high_water_mark_ = false;
+    return std::max(allocation_high_water_mark_, deletion_high_water_mark_);
+}
+
+DeviceAddr BankManager::get_high_water_mark() const {
+    return std::max(allocation_high_water_mark_, deletion_high_water_mark_);
+}
+
+DeviceAddr BankManager::get_allocation_high_water_mark() const { return allocation_high_water_mark_; }
+
+DeviceAddr BankManager::get_deletion_high_water_mark() const { return deletion_high_water_mark_; }
+
+void BankManager::dump_blocks(std::ostream& out, BankManager::AllocatorDependencies::AllocatorID allocator_id) const {
+    const auto* alloc = this->get_allocator_from_id(allocator_id);
+    if (alloc) {
+        alloc->dump_blocks(out);
+    }
+}
+
+MemoryBlockTable BankManager::get_memory_block_table(
+    BankManager::AllocatorDependencies::AllocatorID allocator_id) const {
+    const auto* alloc = this->get_allocator_from_id(allocator_id);
+    if (alloc) {
+        return alloc->get_memory_block_table();
+    }
+
+    log_warning(tt::LogAlways, "allocator is not initialized, cannot get block table for memory");
+    return {};
+}
+
+std::vector<std::pair<DeviceAddr, DeviceAddr>> BankManager::get_allocated_ranges(
+    BankManager::AllocatorDependencies::AllocatorID allocator_id) const {
+    const auto* alloc = this->get_allocator_from_id(allocator_id);
+    if (alloc == nullptr) {
+        return {};
+    }
+    auto ranges = alloc->allocated_addresses();
+    std::sort(ranges.begin(), ranges.end());
+    return ranges;
+}
+
+void BankManager::shrink_size(
+    DeviceAddr shrink_size, bool bottom_up, BankManager::AllocatorDependencies::AllocatorID allocator_id) {
+    if (allocator_dependencies_.num_allocators() == 1 || allocator_id.get() != 0) {
+        auto* alloc = this->get_allocator_from_id(allocator_id);
+        if (alloc) {
+            alloc->shrink_size(shrink_size, bottom_up);
+            this->invalidate_allocated_ranges_cache_for_dependent_allocators(allocator_id);
+        }
+        return;
+    }
+
+    const auto allocator_ids = allocator_dependencies_.allocator_ids();
+    for (const auto current_allocator_id : allocator_ids) {
+        const auto* alloc = this->get_allocator_from_id(current_allocator_id);
+        TT_FATAL(alloc != nullptr, "Allocator {} is not initialized", current_allocator_id.get());
+        alloc->validate_shrink_size(shrink_size, bottom_up);
+    }
+    for (const auto current_allocator_id : allocator_ids) {
+        auto* alloc = this->get_allocator_from_id(current_allocator_id);
+        TT_FATAL(alloc != nullptr, "Allocator {} is not initialized", current_allocator_id.get());
+        alloc->shrink_size(shrink_size, bottom_up);
+    }
+    for (const auto current_allocator_id : allocator_ids) {
+        this->invalidate_allocated_ranges_cache_for_dependent_allocators(current_allocator_id);
+    }
+}
+
+void BankManager::reset_size(BankManager::AllocatorDependencies::AllocatorID allocator_id) {
+    if (allocator_dependencies_.num_allocators() == 1 || allocator_id.get() != 0) {
+        auto* alloc = this->get_allocator_from_id(allocator_id);
+        if (alloc) {
+            alloc->reset_size();
+            this->invalidate_allocated_ranges_cache_for_dependent_allocators(allocator_id);
+        }
+        return;
+    }
+
+    for (const auto current_allocator_id : allocator_dependencies_.allocator_ids()) {
+        auto* alloc = this->get_allocator_from_id(current_allocator_id);
+        if (alloc) {
+            alloc->reset_size();
+            this->invalidate_allocated_ranges_cache_for_dependent_allocators(current_allocator_id);
+        }
+    }
+}
+
+// ============================================================================
+// Allocator State Methods
+// ============================================================================
+
+AllocatorState::BufferTypeState BankManager::extract_state(
+    BankManager::AllocatorDependencies::AllocatorID allocator_id) const {
+    AllocatorState::BufferTypeState state;
+
+    // Copy metadata
+    state.buffer_type = buffer_type_;
+    state.num_banks = num_banks();
+    state.bank_size = bank_size();
+    state.interleaved_address_limit = interleaved_address_limit_;
+    state.alignment_bytes = alignment_bytes_;
+    state.bank_id_to_bank_offset = bank_id_to_bank_offset_;
+
+    // Extract allocated regions from the allocator
+    const auto* alloc = get_allocator_from_id(allocator_id);
+    if (alloc) {
+        auto allocated_addresses = alloc->allocated_addresses();
+        state.allocated_regions.reserve(allocated_addresses.size());
+
+        for (const auto& [start, end] : allocated_addresses) {
+            if (end > start) {
+                state.allocated_regions.emplace_back(start, end);
+            }
+        }
+    }
+
+    // Normalize to sort and coalesce
+    state.normalize();
+
+    return state;
+}
+
+void BankManager::mark_allocated(AllocatorDependencies::AllocatorID allocator_id, DeviceAddr address, DeviceAddr size) {
+    auto* alloc = get_allocator_from_id(allocator_id);
+    TT_FATAL(alloc, "Allocator not initialized for ID {}", allocator_id.get());
+    // Skip if this address is already marked (e.g., multiple devices mirroring the same address)
+    if (allocated_buffers_[allocator_id.get()].contains(address)) {
+        return;
+    }
+    auto stats = alloc->get_statistics();
+    auto result = alloc->allocate_at_address(address, size);
+    TT_FATAL(
+        result.has_value(),
+        "Failed to mirror allocation at address {} of size {} in allocator {} "
+        "(num_allocators={}, bank_size={}, alloc_stats: total_alloc={}, total_free={}, largest_free={})",
+        address,
+        size,
+        allocator_id.get(),
+        allocator_dependencies_.num_allocators(),
+        bank_size(),
+        stats.total_allocated_bytes,
+        stats.total_free_bytes,
+        stats.largest_free_block_bytes);
+    allocated_buffers_[allocator_id.get()].insert(address);
+    invalidate_allocated_ranges_cache_for_dependent_allocators(allocator_id);
+}
+
+void BankManager::mark_deallocated(AllocatorDependencies::AllocatorID allocator_id, DeviceAddr address) {
+    auto* alloc = get_allocator_from_id(allocator_id);
+    TT_FATAL(alloc, "Allocator not initialized for ID {}", allocator_id.get());
+    // Skip if this address is not marked (e.g., was deduplicated during mirroring)
+    if (!allocated_buffers_[allocator_id.get()].contains(address)) {
+        return;
+    }
+    alloc->deallocate(address);
+    allocated_buffers_[allocator_id.get()].erase(address);
+    invalidate_allocated_ranges_cache_for_dependent_allocators(allocator_id);
+}
+
+void BankManager::override_state(
+    const AllocatorState::BufferTypeState& state, BankManager::AllocatorDependencies::AllocatorID target_allocator_id) {
+    // Validate that state can be applied
+    TT_FATAL(can_apply_state(state), "Cannot apply state: incompatible configuration");
+
+    auto* alloc = get_allocator_from_id(target_allocator_id);
+    TT_FATAL(alloc, "Allocator not initialized for ID {}", target_allocator_id.get());
+
+    // Clear current allocations
+    for (DeviceAddr addr : allocated_buffers_[target_allocator_id.get()]) {
+        alloc->deallocate(addr);
+    }
+    allocated_buffers_[target_allocator_id.get()].clear();
+    allocated_ranges_cache_[target_allocator_id.get()].reset();
+
+    // Apply each allocated region
+    for (const auto& [start_addr, end_addr] : state.allocated_regions) {
+        DeviceAddr size = end_addr - start_addr;
+
+        // Use allocate_at_address to mark this region as allocated
+        auto result = alloc->allocate_at_address(start_addr, size);
+        TT_FATAL(
+            result.has_value(),
+            "Failed to apply state: cannot allocate region [{}, {}) of size {} B at address {} in {} buffer type. "
+            "Region may already be occupied or invalid.",
+            start_addr,
+            end_addr,
+            size,
+            start_addr,
+            enchantum::to_string(buffer_type_));
+
+        // Track the allocation
+        allocated_buffers_[target_allocator_id.get()].insert(start_addr);
+    }
+
+    // Invalidate caches for dependent allocators
+    invalidate_allocated_ranges_cache_for_dependent_allocators(target_allocator_id);
+}
+
+bool BankManager::can_apply_state(const AllocatorState::BufferTypeState& state) const {
+    return buffer_type_ == state.buffer_type &&                              //
+           interleaved_address_limit_ == state.interleaved_address_limit &&  //
+           num_banks() == state.num_banks &&                                 //
+           bank_size() == state.bank_size &&                                 //
+           alignment_bytes_ == state.alignment_bytes;
+}
+
+}  // namespace tt::tt_metal

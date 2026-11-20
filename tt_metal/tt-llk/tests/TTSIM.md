@@ -1,0 +1,172 @@
+# Running LLK Tests on ttsim
+
+[ttsim](https://github.com/tenstorrent/ttsim) is Tenstorrent's functional
+simulator. It models a Wormhole, Blackhole, or Quasar chip end-to-end on
+a plain x86_64 Linux host — no silicon required. The LLK test suite can
+target ttsim with the same pytest invocations used for silicon, modulo a
+couple of environment variables.
+
+## Prerequisites
+
+- `libttsim_{wh,bh}.so` downloaded from
+  [ttsim releases](https://github.com/tenstorrent/ttsim/releases).
+- A SoC descriptor YAML for the target arch, placed next to the `.so`
+  and named `soc_descriptor.yaml` (ttsim derives its path from the `.so`
+  path).
+- `tt-umd` with TTSim fixes for arch / noc-translation / chip-info and
+  clock advance on host writes (check `pip show tt-umd`; required
+  version depends on when these land).
+- `tt-exalens` with the `send_tensix_risc_reset` positional-API fix
+  (0.3.16+).
+- SFPI compiler set up per the main `README.md` (SFPI is required for
+  kernel compilation regardless of backend).
+
+## Setup
+
+```bash
+# One-time: assemble the simulator directory
+mkdir -p ~/sim
+cd ~/sim
+# Pick the arch that matches the tests you want to run:
+wget https://github.com/tenstorrent/ttsim/releases/latest/download/libttsim_bh.so
+# Copy the arch-appropriate SOC descriptor from tt-metal:
+cp $TT_METAL_HOME/tt_metal/soc_descriptors/blackhole_140_arch.yaml \
+   ~/sim/soc_descriptor.yaml
+```
+
+## Running tests
+
+```bash
+export TT_METAL_SIMULATOR=~/sim/libttsim_bh.so
+
+# ttsim does not currently support SFPLOADMACRO — disable it if your
+# tests hit the SFPU:
+export TT_METAL_DISABLE_SFPLOADMACRO=1
+
+cd $TT_METAL_HOME/tt_metal/tt-llk/tests/python_tests
+pytest -v --run-simulator --timeout=600 test_eltwise_unary_datacopy.py
+```
+
+Quasar ttsim only: ttsim does not implement NOC API v2, so also export
+`TT_METAL_QUASAR_NOC_API_VERSION=1` (ignored for wormhole/blackhole).
+
+`TT_METAL_SIMULATOR` is the canonical env var — the same one tt-metal
+runtime and the ttsim project docs use. `TT_UMD_SIMULATOR_PATH` is
+accepted as an alias for back-compat with the RTL-simulator flow; when
+both are set, `TT_METAL_SIMULATOR` wins.
+
+### Canonical smoke test
+
+The simplest end-to-end check that the stack is wired up:
+
+```bash
+pytest -v --run-simulator --timeout=300 \
+  test_eltwise_unary_datacopy.py -k "Float16_b and not tilize"
+```
+
+This exercises unpack → math (datacopy) → pack on a single tile with
+the most common format and no SFPU/tilize paths.
+
+## Supported architectures
+
+| Arch | LLK tests on ttsim |
+|---|---|
+| Blackhole | Working |
+| Wormhole B0 | Working |
+| Quasar | Working |
+
+## Skip list
+
+Tests that ttsim cannot run yet are listed in
+[`tests/pipeline_reorg/ttsim-skip-list.yaml`](../../../tests/pipeline_reorg/ttsim-skip-list.yaml),
+the same file the ttnn simulator jobs use.
+[`run_ttsim_regression.sh`](run_ttsim_regression.sh) reads it by default
+and passes the matching entries to pytest as `--deselect`. A plain
+`pytest` command does not consult the file.
+
+LLK entries are pytest node ids from the repo root, and they have to
+start with `tt_metal/tt-llk/tests/python_tests/`. The script drops that
+prefix, because this suite collects with `python_tests/` as its root.
+Put an entry under `wormhole_b0`, `blackhole`, or `quasar`. The ttnn
+jobs only apply the first two, so a `quasar:` entry does not affect them.
+
+`--deselect` matches a prefix of the node id. `file.py::test_name` also
+drops `test_name_extra`. To drop a single parametrized case, keep the
+`[` and enough of the parameter id that nothing else shares that prefix.
+
+```yaml
+quasar:
+  - tt_metal/tt-llk/tests/python_tests/quasar/test_rand_quasar.py::test_rand_quasar
+```
+
+See which prefixes the script would drop, without downloading ttsim:
+
+```bash
+cd $TT_METAL_HOME/tt_metal/tt-llk/tests
+./run_ttsim_regression.sh -a quasar --list-ignore
+```
+
+`--no-ignore` runs every collected test. The weekly ttsim workflow does
+that, so a test on this list still appears in the weekly report. The
+Quasar PR gate, and LLK sanity when that leg is turned on, use the list.
+Those two jobs run the functional Quasar suite as two shards on ttsim
+and pass `--no-html`; they keep the JUnit XML and skip the HTML report.
+Editing the skip list or `tt_metal/ttsim-version` reruns the PR-gate
+shards. The script itself downloads the release named in
+`tt_metal/ttsim-version` when `TT_METAL_SIMULATOR` is unset, which is
+the build CI runs.
+
+## Limitations
+
+- **Slow dispatch only.** ttsim does not yet implement fast dispatch.
+  LLK tests go through the direct exalens path and are unaffected, but
+  any programming example invoked alongside needs
+  `TT_METAL_SLOW_DISPATCH_MODE=1`.
+- **SFPLOADMACRO** is not implemented. Set
+  `TT_METAL_DISABLE_SFPLOADMACRO=1` if your test hits the SFPU.
+- **NOC API v2 is not supported** (Quasar ttsim only). Set
+  `TT_METAL_QUASAR_NOC_API_VERSION=1` so Quasar kernels compile
+  against NOC API v1. Wormhole/Blackhole JIT does not use this define.
+- **Not all ISA is modeled.** Unimplemented opcodes surface as
+  `UnimplementedFunctionality` errors from the simulator. See the
+  [ttsim README](https://github.com/tenstorrent/ttsim) for the error
+  taxonomy, and file a bug against the ttsim repo with a minimal repro
+  if you hit one. A gap that should not fail the Quasar PR gate belongs
+  on the skip list above; the weekly run still executes it.
+- **Performance.** ttsim is substantially slower than silicon for
+  individual tests. Use it for correctness and CI coverage, not
+  performance measurements.
+
+## What the harness does differently on ttsim
+
+ttsim does not model everything the test and perf harness uses. Device code
+handles each gap with a `TT_METAL_TTSIM` branch (the define comes from
+`TestTargetConfig.runs_on_ttsim()` in `test_config.py`), host code with
+`runs_on_ttsim()` or `is_ttsim()` (`helpers/target_config.py`). When you add
+one, add its row here. A row can go once ttsim closes that gap.
+
+| ttsim gap | Where | What the harness does on ttsim |
+|---|---|---|
+| No BRISC reads of the TRISC PC buffers | `brisc.cpp`, `trisc.cpp` | The TRISCs do not park on their PC buffer. BRISC polls the L1 mailboxes instead. |
+| No overlay stream registers (the launch done flag) | `brisc.cpp`, `device.py` `launch_done_address()` | BRISC writes no launch done flag. The host polls only the soft reset register, then checks the L1 mailboxes once after BRISC puts the cores in reset. |
+| No Quasar cluster control scratch registers 28 to 31 | `boot.h` `host_signal`, `device.py` `host_signal_address()` | Quasar completion stays in the L1 mailboxes only. |
+| No perf counter registers or Wormhole/Blackhole counted zones register (STREAM\_SCRATCH\_1) | `counters.h` (`launch_word`, `configure_hardware`, `arm_all_counters`, `freeze_all_counters`, `read_all_counters`), `test_config.py` `counted_zones_address()` | Counter work compiles out. The host skips `configure_quasar_counters`, writes no counted zones word, and skips the counter readout in `_read_counters_of_launch`. |
+| No Quasar bank-1 semaphore reads (barrier semaphores 8–11) | `barrier.h` `reset_semaphores()` | The reset of the profiler-barrier semaphores (8–11) is skipped in `LLK_PROFILER` builds. |
+| No debug feature disable register | `counters.h` `clear_debug_features()` | The clear is skipped. |
+| Blackhole `PACK_GLOBAL_CFG_CTL`: any access aborts | `tt_llk_blackhole/common/inc/cpack_common.h` (production LLK), `tt_metal/llrt/hal/tt-1xx/blackhole/bh_hal.cpp` (tt-metal JIT builds) | The fast tile end drain write for L1 accumulate is skipped. |
+| No timing of the Wormhole L1 port that TRISC1 and TRISC2 fetch through | `brisc.cpp` | TRISC1 is not released first. |
+| BRISC resets the TRISCs as soon as their L1 mailboxes read complete | `trisc.cpp` `_start` | Coverage builds write the mailbox after `gcov_dump`. |
+| No simulation server (ttsim runs in process) | `llk_pytest_plugin.py` | ttsim is initialized when the plugin is imported, and `--reset-simulator-per-test` is rejected. |
+
+## Troubleshooting
+
+- `Getting NOC translation status is not supported in TTSim simulation device` —
+  old tt-umd; upgrade to a release that contains the TTSimTTDevice fixes.
+- `Exactly 2 or 14 ETH cores should be harvested on full Blackhole` —
+  same cause; upgrade tt-umd.
+- `SOFT_RESET_0=0x6F` warnings flooding the log — old tt-exalens;
+  upgrade to 0.3.16+ (the reset sequence is skipped on ttsim).
+- `UnimplementedFunctionality: <opcode>` from ttsim — ISA gap, not a
+  test or harness issue. File against
+  [tenstorrent/ttsim](https://github.com/tenstorrent/ttsim/issues) with
+  a minimal repro.

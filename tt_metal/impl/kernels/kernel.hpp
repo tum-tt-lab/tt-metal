@@ -1,0 +1,1058 @@
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <tt-umd/types/core_coordinates.hpp>
+#include <cstdint>
+#include <filesystem>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
+
+#include "api/tt-metalium/kernel_types.hpp"
+#include "api/tt-metalium/runtime_args_data.hpp"
+#include "api/tt-metalium/device.hpp"
+#include "impl/host_api/temp_quasar_api.hpp"
+#include "api/tt-metalium/experimental/offline_kernel_compile.hpp"
+#include <tt-metalium/workload/specification/scratchpad_spec.hpp>
+#include "impl/context/metal_context.hpp"
+#include "impl/metal2_host_api/sram_arena_support.hpp"
+#include "core_coord.hpp"
+#include "hal_types.hpp"
+#include "jit_build/jit_build_settings.hpp"
+#include "impl/program/program_impl.hpp"
+#include "impl/kernels/kernel_source.hpp"
+#include "binary_metadata.hpp"
+#include <tt_stl/small_vector.hpp>
+#include <enchantum/enchantum.hpp>
+#include "tt_cluster.hpp"
+
+namespace tt::tt_metal {
+
+class JitBuildOptions;
+namespace detail {
+class ProgramImpl;
+}  // namespace detail
+
+enum Eth : uint8_t {
+    SENDER = 0,
+    RECEIVER = 1,
+    IDLE = 2,
+};
+
+struct EthernetConfig {
+    Eth eth_mode = Eth::SENDER;
+    NOC noc = NOC::NOC_0;
+    DataMovementProcessor processor = DataMovementProcessor::RISCV_0;
+    std::vector<uint32_t> compile_args;
+    // Will cause CompileProgram to emit a file hlk_defines_generated.h
+    // Each unique combination of defines will produce a unique compiled instantiation
+    // This file is then automatically included in the generated compiled kernel files
+    std::map<std::string, std::string> defines;
+    // Both compile_args and named_compile_args contain compile time arguments
+    // The former is accessed by index, the latter by name
+    // Can be used in new/existing kernels by explicitly defining them in the config
+    // Ex. std::vector<uint32_t> compile_args = {5, 7};
+    //     std::unordered_map<std::string, uint32_t> named_compile_args = {{"arg1", 5}, {"arg2", 7}};
+    //     CreateKernel(program, "kernel.cpp", core, EthernetConfig{.compile_args = compile_args, .named_compile_args =
+    //     named_compile_args})
+    std::unordered_map<std::string, uint32_t> named_compile_args;
+    // Set the compiler and linker optimization level
+    KernelBuildOptLevel opt_level = KernelBuildOptLevel::Os;
+    NOC_MODE noc_mode = NOC_MODE::DM_DEDICATED_NOC;
+};
+
+KernelHandle CreateKernel(
+    Program& program,
+    const std::string& file_name,
+    const std::variant<CoreCoord, CoreRange, CoreRangeSet>& core_spec,
+    const EthernetConfig& config);
+
+KernelHandle CreateKernelFromString(
+    Program& program,
+    const std::string& kernel_src_code,
+    const std::variant<CoreCoord, CoreRange, CoreRangeSet>& core_spec,
+    const EthernetConfig& config);
+
+struct DramConfig {
+    // The kernel can only initiate NOC transactions on a NIU firmware left in stream mode. NOC0
+    // qualifies on every DRAM core; NOC1 only on cores that are no DRAM view's NOC1 endpoint. A
+    // kernel that drives both NOCs regardless of this field (the streaming profiler's relay reads on
+    // the one it does not write on) has to pick its core off
+    // metal_SocDescriptor::get_dram_endpoint_noc_mask. See tt_metal/hw/inc/experimental/drisc_mode.h.
+    NOC noc = NOC::NOC_0;
+    std::vector<uint32_t> compile_args;
+    std::map<std::string, std::string> defines;
+    std::unordered_map<std::string, uint32_t> named_compile_args;
+    KernelBuildOptLevel opt_level = KernelBuildOptLevel::Os;
+};
+
+KernelHandle CreateKernel(
+    Program& program,
+    const std::string& file_name,
+    const std::variant<CoreCoord, CoreRange, CoreRangeSet>& core_spec,
+    const DramConfig& config);
+
+KernelHandle CreateKernelFromString(
+    Program& program,
+    const std::string& kernel_src_code,
+    const std::variant<CoreCoord, CoreRange, CoreRangeSet>& core_spec,
+    const DramConfig& config);
+
+// Metal 2.0: DFB accessor names -> device-slot binding (optionally typed as relay).
+// Normal DFBs may carry LLK metadata; relays do not. prefetcher_pipe_id is 0xFF
+// (RelayDFBBindingToken::NO_PREFETCHER_PIPE) except for PrefetcherPipe relays, where it names
+// the persistent slot baked into the token so the TRISC constructor can O(1)-align the borrowed
+// iface to the durable checkpoint. pap / cap are both sides' access patterns (dfb::AccessPattern
+// numbering) so DFBBindingToken<Pap, Cap> can specialize the device DataflowBuffer at compile time.
+struct DataflowBufferBindingHandle {
+    uint16_t logical_dfb_id = 0;
+    bool is_relay = false;
+    uint8_t prefetcher_pipe_id = 0xFF;
+    std::optional<LLKMetadata> llk_metadata;
+    // Borrowed-memory DFB (DataflowBufferSpec::borrowed_from): the program-wide DFB id and the TensorParameter
+    // whose memory the DFB is, and which sides of it this kernel is on -- both, for a self-loop pair bound under one
+    // accessor name. Op-to-op R/W inference (Kernel::resolve_buf_rw) records producing as writing that tensor and
+    // consuming as reading it.
+    std::optional<uint32_t> borrowed_dfb_id;
+    std::string borrowed_tensor_parameter_name;
+    bool produces = false;
+    bool consumes = false;
+    uint8_t pap = 0;
+    uint8_t cap = 0;
+    // Watcher: the nodes the DFB's address is reserved on, as rectangles in NoC coordinates. Empty without Watcher NoC
+    // sanitizing, and for a DFB borrowed from an interleaved tensor: that tensor holds the address in every L1 bank, so
+    // no node set narrower than the whole grid limits a multicast into it.
+    std::vector<NodeRange> watcher_node_ranges;
+};
+using DataflowBufferBindingHandleMap = std::unordered_map<std::string, DataflowBufferBindingHandle>;
+
+// Metal 2.0: per-binding semaphore handle -> id and the host-baked scope; kernel code sees only a uint32_t id.
+struct SemaphoreBindingHandle {
+    uint16_t id = 0;
+    SemScope scope = SemScope::LOCAL_NONATOMIC;
+    uint32_t total_binder_harts = 0;
+    // Watcher: the nodes the semaphore exists on, as for DataflowBufferBindingHandle::watcher_node_ranges.
+    std::vector<NodeRange> watcher_node_ranges;
+};
+// Metal 2.0: semaphore accessor names -> {semaphore id, scope}
+using SemaphoreBindingHandleMap = std::unordered_map<std::string, SemaphoreBindingHandle>;
+
+// Metal 2.0: per-kernel resolved TensorBinding.
+// Carries the offsets the kernel-side codegen needs to emit a token, plus the program-level
+// TensorParameter name so Program::set_program_run_args can fill the binding's base-address slot
+// (and any runtime accessor fields) from the corresponding TensorArgument at enqueue time.
+struct TensorBindingHandle {
+    std::string accessor_name;          // user-facing identifier (kernel symbol in `tensor::`)
+    std::string tensor_parameter_name;  // refers back to the program-level TensorParameter
+    uint32_t cta_offset;                // first word index of this binding's payload in the kernel's compile-time args
+    uint32_t addr_crta_offset = 0;  // byte offset of this binding's base-address slot within the kernel's CRTA buffer
+    // Count of runtime accessor field words that immediately follow the address slot
+    // in this binding's CRTA section.
+    // Non-zero when the TensorParameter opts into a CRTA-resident dynamic field.
+    // The first runtime field word lives at byte offset addr_crta_offset + sizeof(uint32_t).
+    uint32_t num_runtime_field_crta_words = 0;
+    // What info the runtime field CRTA words actually contain depends on the relaxation chosen.
+    // Currently, there are only two mutually exclusive possibilities (though more may be added):
+    //  1. The interleaved row-major page-size (one CRTA only)
+    //  2. The sharded dynamic_tensor_shape shape (one CRTA per tensor dim)
+    // For now, since there are only two mutually exclusive possibilities, it's sufficient to
+    // distinguish them with a boolean.
+    // (We'll need to extend this to something more flexible if additional possibilities are added.)
+    bool runtime_field_is_page_size = false;
+    LLKMetadata llk_metadata;
+    // A per-node allocated tensor has its own base address on every node, so the address lives in each node's
+    // RTA buffer at addr_rta_offset, and the binding takes no CRTA words (addr_crta_offset and
+    // num_runtime_field_crta_words are unused).
+    bool is_per_node = false;
+    uint32_t addr_rta_offset = 0;  // byte offset of this binding's base-address slot within each node's RTA buffer
+};
+
+// Metal 2.0: per-kernel resolved scratchpad binding.
+// A scratchpad is an uninitialized, node-local L1 region, private to a kernel by default.
+//  - The base address is allocated at Program-compile time or supplied through an SRAMArena
+//    argument, and is passed to the kernel as an implicit CRTA.
+//  - Since the address is persistent across enqueues, we store it on the Kernel object rather
+//    than rely on the statefulness of the CRTA buffer. (The invariant of Program::set_program_run_args is that
+//    the CRTA and RTA buffers are completely overwritten when it's called.)
+//  - It is possible for DFB size overrides to be applied between enqueues. If this happens, the
+//    allocated scratchpad addresses will update between enqueues as well.
+//  - The address is 0 until local memory is allocated or an SRAMArena argument is bound.
+//  - Unlike ScratchpadBindingHandle, TensorBindingHandle does NOT store the address, as for bound
+//    tensors the base address is strictly a user enqueue-time argument.
+struct ScratchpadBindingHandle {
+    std::string accessor_name;                // user-facing identifier (kernel symbol in `scratch::`)
+    uint32_t size_bytes = 0;                  // per-node size; emitted as the accessor's compile-time size
+    uint32_t addr_crta_word = 0;              // word index of the base-address slot within the kernel's CRTA buffer
+    uint32_t allocated_address = 0;           // L1 base address; 0 until allocated or bound
+    std::optional<LLKMetadata> llk_metadata;  // LLK related metadata (dataformat/ tile format)
+    // Present only if the binding handle could share it's allocation with another scratchpad.
+    // Set for allow_instance_multi_binding or override_placement. Grouping allocations
+    // does not itself permit multiple binding kernel instances on a reserved node.
+    // For all the scratchpad binding handle sharing the same identifier,
+    // the size_bytes are all equivalent.
+    //
+    // Note this field does not affect kernel hash computation,
+    // as the build artifact of 2 kernels with/without shared allocation is the same.
+    //
+    // The ScratchpadSpecName serves as an identifier & does not carry specific meaning.
+    using AllocationIdentifier = ScratchpadSpecName;
+    std::optional<ScratchpadSpecName> shared_allocation_identifier;
+    std::optional<SRAMArenaSource> allocation_override;
+    // Resolved reservation nodes, excluded from the kernel hash.
+    // Invariant: Placement is non-empty and fixed for the Program's lifetime.
+    CoreRangeSet placement;
+};
+
+// Metal 2.0: per-kernel resolved GlobalSemaphore binding. The address is a run argument: Program::set_program_run_args
+// writes the bound GlobalSemaphore's address into the word at addr_crta_word.
+struct GlobalSemaphoreBindingHandle {
+    std::string accessor_name;                    // user-facing identifier (kernel symbol in `global_sem::`)
+    std::string global_semaphore_parameter_name;  // refers back to the program-level GlobalSemaphoreParameter
+    uint32_t addr_crta_word = 0;                  // word index of the address slot within the kernel's CRTA buffer
+};
+
+// Metal 2.0: per-kernel resolved PrefetcherPipe accessor (KernelAdvancedOptions::PrefetcherPipeBinding).
+// One accessor names one program PrefetcherPipe slot (dense id the kernel constructs its
+// PrefetcherPipe with); the slot resolves to whichever pipe of the accessor's group is present
+// on the executing node. Emitted as a constexpr token in the `pipe::` namespace.
+struct PrefetcherPipeBindingHandle {
+    std::string accessor_name;
+    uint8_t prefetcher_pipe_id = 0;
+};
+
+// Metal 2.0: ordered TensorBinding tokens (KernelAdvancedOptions::tensor_binding_sequences).
+struct TensorBindingSequenceHandle {
+    std::string sequence_name;
+    std::vector<std::string> members;
+};
+
+// Op-to-op R/W inference, resolved to bound objects (see Kernel::resolve_buf_rw). Each access is
+// identified by its program-level TensorParameter name and the bound buffer's base address. The address
+// is the cross-op RAW comparison key -- two ops touch the "same" buffer iff their addresses match (the
+// same matching the ttnn-graph RAW analysis used). Derived by mapping each .tt.BUF_RW slot (a binding's
+// base-address CRTA byte offset) back through the kernel's tensor bindings (slot -> param name) and its
+// CRTA (slot/sizeof(u32) -> the address the runtime bound at that word). Accesses through a borrowed-memory
+// DFB come from the program instead: the device sees only a DFB there, never the tensor.
+struct ResolvedBufRw {
+    struct Access {
+        // View into the kernel's TensorBindingHandle -- no allocation; valid while the kernel lives.
+        // Diagnostic only: the cross-op RAW comparison keys on `address`, not the name.
+        std::string_view param_name;
+        uint32_t address = 0;
+    };
+    // Stack-backed: no heap for the common case (a kernel touches only a few tensor-like objects).
+    ttsl::SmallVector<Access, 8> reads;
+    ttsl::SmallVector<Access, 8> writes;
+    bool opaque = false;  // an un-analyzable (raw) access was seen -> a detector must keep the barrier
+};
+
+// Enforced ceiling on the combined (unique + common) runtime-arg count for a Tensix kernel. Args above
+// max_runtime_args are dispatched via CQ_DISPATCH_CMD_WRITE_PACKED_LARGE_UNICAST, which sends a single core's
+// payload inline in one prefetcher command. The smallest dispatch prefetch command size is the ethernet
+// dispatcher's 32 KB (~8176 words), and the dispatch core type is not known when validate_runtime_args_size
+// runs (SetRuntimeArgs time), so this cap is dispatch-core-independent and set conservatively below that limit
+// (with margin so several cores' commands still fit the ethernet cmddat queue). The actual L1 fit is still
+// enforced at program finalize. (Metal 2.0 spec validation also checks a KernelSpec's declared args against it.)
+constexpr uint32_t max_runtime_args_tensix = 4096;
+
+class Kernel : public JitBuildSettings {
+public:
+    using Config = std::variant<
+        DataMovementConfig,
+        EthernetConfig,
+        ComputeConfig,
+        DramConfig,
+        experimental::quasar::QuasarDataMovementConfig,
+        experimental::quasar::QuasarComputeConfig>;
+
+    ~Kernel() override = default;
+
+    std::string name() const;
+
+    const KernelSource& kernel_source() const { return kernel_src_; }
+
+    const CoreRangeSet& core_range_set() const { return core_range_set_; }
+
+    const std::set<CoreCoord>& cores_with_runtime_args() const { return core_with_runtime_args_; }
+    // 1 when runtime-arg storage is prefixed with a watcher count word, else 0.
+    uint32_t watcher_count_word_offset() const { return watcher_count_word_offset_; }
+
+    const std::map<std::string, std::string>& defines() const { return defines_; }
+
+    const std::set<CoreCoord>& logical_cores() const;
+
+    std::vector<CoreRange> logical_coreranges() const;
+
+    bool is_on_logical_core(const CoreCoord& logical_core) const;
+
+    std::vector<uint32_t> compile_time_args() const { return compile_time_args_; }
+    std::unordered_map<std::string, uint32_t> named_compile_time_args() const { return named_compile_time_args_; }
+
+    ////////////////////////////////////////////////////////////
+    // Blaze-only experimental named args
+    // Removal is tracked by issue #50953
+    //
+    // All named-args declarations for this class are grouped in this single
+    // block for easy removal. Accessor/override methods are public; the
+    // backing members follow under `protected:`, and the enclosing `public:`
+    // access is restored after the closing fence.
+    const NamedRuntimeArgNamespaces& named_runtime_arg_namespaces() const { return named_runtime_arg_namespaces_; }
+    void set_named_runtime_arg_namespaces(const NamedRuntimeArgNamespaces& namespaces) {
+        named_runtime_arg_namespaces_ = namespaces;
+    }
+    const NamedCTArgNamespaces& named_ct_arg_namespaces() const { return named_ct_arg_namespaces_; }
+    void set_named_ct_arg_namespaces(const NamedCTArgNamespaces& namespaces) { named_ct_arg_namespaces_ = namespaces; }
+    void process_named_runtime_args(std::function<void(const NamedRuntimeArgNamespaces&)>) const override;
+    void process_named_ct_arg_namespaces(std::function<void(const NamedCTArgNamespaces&)>) const override;
+
+protected:
+    NamedRuntimeArgNamespaces named_runtime_arg_namespaces_;
+    NamedCTArgNamespaces named_ct_arg_namespaces_;
+
+public:
+    ////////////////////////////////////////////////////////////
+
+    // Note: When watcher assert is enabled, vector is stored as [count | args...]
+    std::vector<uint32_t>& runtime_args(const CoreCoord& logical_core);
+    // User-arg count. Ignores the watcher count word and dispatch-view padding.
+    std::size_t logical_runtime_arg_count(const CoreCoord& logical_core) const;
+    RuntimeArgsData& runtime_args_data(const CoreCoord& logical_core);
+    std::vector<std::vector<std::vector<uint32_t>>>& runtime_args();
+    std::vector<std::vector<RuntimeArgsData>>& runtime_args_data();
+    void set_runtime_args_count(CoreRangeSet& core_ranges, uint32_t count);
+
+    // Note: When watcher assert is enabled, vector is stored as [count | args...]
+    std::vector<uint32_t>& common_runtime_args();
+    std::size_t logical_common_runtime_arg_count() const;
+    RuntimeArgsData& common_runtime_args_data();
+    void set_common_runtime_args_count(uint32_t count);
+    // Once a command sequence is assembled, the runtime-arg views point into it and hold the current values. Before
+    // the program's command sequences are discarded, copy the current values back into the kernel's own storage and
+    // point the views there again, so the next assembly starts from them.
+    void reclaim_runtime_args_from_command_sequence();
+    uint32_t get_common_runtime_args_count() const { return this->common_runtime_args_count_; }
+
+    virtual bool configure(
+        IDevice* device, const CoreCoord& logical_core, uint32_t base_address, const uint32_t offsets[]) const = 0;
+
+    virtual Config config() const = 0;
+
+    uint64_t compute_hash() const;
+
+    const std::string& get_full_kernel_name() const override;
+    std::string get_observability_event_src_id() const override {
+        return this->kernel_src_.observability_event_src_id();
+    }
+    void process_defines(std::function<void(const std::string& define, const std::string& value)>) const override;
+    void process_compile_time_args(std::function<void(const std::vector<uint32_t>& values)>) const override;
+    void process_named_compile_time_args(
+        std::function<void(const std::unordered_map<std::string, uint32_t>& named_args)>) const override;
+    void process_dataflow_buffer_binding_handles(const std::function<void(
+                                                     const std::string& accessor_name,
+                                                     uint16_t logical_dfb_id,
+                                                     bool is_relay,
+                                                     uint8_t prefetcher_pipe_id,
+                                                     const std::optional<LLKMetadata>&,
+                                                     uint8_t pap,
+                                                     uint8_t cap)>&) const override;
+    void process_semaphore_binding_handles(
+        std::function<
+            void(const std::string& accessor_name, uint16_t semaphore_id, SemScope scope, uint32_t total_binder_harts)>)
+        const override;
+    void process_watcher_node_ranges(
+        const std::function<void(const std::string& accessor_name, const std::vector<NodeRange>& node_ranges)>&
+            dfb_callback,
+        const std::function<void(const std::string& accessor_name, const std::vector<NodeRange>& node_ranges)>&
+            semaphore_callback) const override;
+    void process_tensor_binding_handles(const std::function<void(
+                                            const std::string& accessor_name,
+                                            uint32_t cta_offset,
+                                            bool is_per_node,
+                                            uint32_t addr_offset,
+                                            uint32_t num_runtime_field_crta_words,
+                                            const LLKMetadata&)>&) const override;
+    const std::vector<TensorBindingHandle>& tensor_binding_handles() const { return tensor_binding_handles_; }
+    void process_scratchpad_binding_handles(const std::function<void(
+                                                const std::string& accessor_name,
+                                                uint32_t size_bytes,
+                                                uint32_t addr_crta_word,
+                                                const std::optional<LLKMetadata>&)>&) const override;
+    // Scratchpad binding handles are set post-construction.
+    // Non-const accessor lets allocate_scratchpads fill each handle's allocated_address after L1 allocation.
+    const std::vector<ScratchpadBindingHandle>& scratchpad_binding_handles() const {
+        return scratchpad_binding_handles_;
+    }
+    std::vector<ScratchpadBindingHandle>& scratchpad_binding_handles() { return scratchpad_binding_handles_; }
+    void set_scratchpad_binding_handles(std::vector<ScratchpadBindingHandle> handles) {
+        scratchpad_binding_handles_ = std::move(handles);
+    }
+    // GlobalSemaphore binding handles are set post-construction (before compile: they are part of
+    // the kernel cache key and of kernel_bindings_generated.h).
+    void process_global_semaphore_binding_handles(
+        std::function<void(const std::string& accessor_name, uint32_t addr_crta_word)>) const override;
+    const std::vector<GlobalSemaphoreBindingHandle>& global_semaphore_binding_handles() const {
+        return global_semaphore_binding_handles_;
+    }
+    void set_global_semaphore_binding_handles(std::vector<GlobalSemaphoreBindingHandle> handles) {
+        global_semaphore_binding_handles_ = std::move(handles);
+    }
+    // PrefetcherPipe binding handles are set post-construction (before compile: they are part of
+    // the kernel cache key and of kernel_bindings_generated.h).
+    void process_prefetcher_pipe_binding_handles(
+        std::function<void(const std::string& accessor_name, uint8_t prefetcher_pipe_id)>) const override;
+    const std::vector<PrefetcherPipeBindingHandle>& prefetcher_pipe_binding_handles() const {
+        return prefetcher_pipe_binding_handles_;
+    }
+    void set_prefetcher_pipe_binding_handles(std::vector<PrefetcherPipeBindingHandle> handles) {
+        prefetcher_pipe_binding_handles_ = std::move(handles);
+    }
+    void process_tensor_binding_sequences(
+        std::function<void(const std::string& sequence_name, const std::vector<std::string>& members)>) const override;
+    void set_tensor_binding_sequences(std::vector<TensorBindingSequenceHandle> sequences) {
+        tensor_binding_sequences_ = std::move(sequences);
+    }
+    // Metal 2.0: length of the CTA-vararg prefix in compile_time_args_.
+    // Values live in compile_time_args_.
+    uint32_t get_compile_time_vararg_count() const override { return compile_time_vararg_count_; }
+    void set_compile_time_vararg_count(uint32_t count) { compile_time_vararg_count_ = count; }
+    const std::vector<std::string>& get_runtime_arg_names() const override { return runtime_arg_names_; }
+    const std::vector<std::string>& get_common_runtime_arg_names() const override { return common_runtime_arg_names_; }
+    // Metal 2.0: array arguments (set post-construction, before compile: they are part of the kernel
+    // cache key and of kernel_args_generated.h).
+    const KernelArrayArgs& get_array_args() const override { return array_args_; }
+    void set_array_args(KernelArrayArgs array_args) { array_args_ = std::move(array_args); }
+    KernelCrtaLayout get_crta_layout() const override { return crta_layout_; }
+    KernelRtaLayout get_rta_layout() const override { return rta_layout_; }
+    bool is_metal2_kernel() const override { return is_metal2_kernel_; }
+    void process_include_paths(const std::function<void(const std::string& path)>&) const override;
+
+    void validate_runtime_args_size(
+        size_t num_unique_rt_args, size_t num_common_rt_args, const CoreCoord& logical_core) const;
+    void set_runtime_args(const CoreCoord& logical_core, ttsl::Span<const uint32_t> runtime_args);
+    void set_common_runtime_args(ttsl::Span<const uint32_t> runtime_args);
+
+    int get_watcher_kernel_id() const { return watcher_kernel_id_; }
+
+    ContextId get_context_id() const { return context_id_; }
+
+    // Get the corresponding core type, processor class, and processor type of the kernel as defined by HAL.
+    // The processor type is per-binary, where 0 <= index < expected_num_binaries.
+    HalProgrammableCoreType get_kernel_programmable_core_type() const { return this->programmable_core_type_; }
+    HalProcessorClassType get_kernel_processor_class() const { return this->processor_class_; }
+    virtual uint32_t get_kernel_processor_type(int index) const = 0;
+
+    CoreType get_kernel_core_type() const;
+    void set_full_name(const std::string& s) { kernel_full_name_ = s; }
+    void add_defines(const std::map<std::string, std::string>& defines);
+
+    virtual uint8_t expected_num_binaries() const = 0;
+    // Returns the HAL processor indices that use the given binary (for L1 offset / set_iram_text_size).
+    virtual std::vector<uint32_t> get_processor_indices_for_binary(int binary_index) const;
+    uint32_t get_binary_packed_size(IDevice* device, int index) const;
+    uint32_t get_binary_text_size(IDevice* device, int index) const;
+
+    bool is_idle_eth() const;
+
+    // Collects metadata of the kernel and the binaries within the kernel if device is non-null
+    // Note: device is nullable
+    detail::KernelMeta meta(IDevice* device) const;
+
+    // Binary management (moved from KernelImpl)
+    const std::vector<const ll_api::memory*>& binaries(uint64_t build_key) const;
+    void set_binaries(uint64_t build_key, std::vector<const ll_api::memory*>&& binaries);
+    bool binaries_exist_on_disk(const IDevice* device, const std::string& binary_root) const;
+
+    virtual void set_build_options(JitBuildOptions& /*build_options*/) const {}
+    virtual void generate_binaries(IDevice* device, JitBuildOptions& build_options) const = 0;
+    virtual void read_binaries(IDevice* device, const std::string& binary_root) = 0;
+
+    void register_kernel_elf_paths_with_watcher(IDevice& device, const std::string& binary_root) const;
+
+    // Returns the ELF file paths indexed by processor index. Processor indices not used by this kernel are left empty.
+    std::vector<std::string> elf_paths_by_processor_index(const IDevice& device, const std::string& binary_root) const;
+
+    // Op-to-op R/W inference (POC): return the decoded per-binding read/write sets for this kernel (see
+    // ll_api::BufRwInfo), unioned across its binaries. The metadata is harvested by the loader when the
+    // binary is loaded (llrt::get_binary_metadata), so this does no ELF parsing itself; the kernel must
+    // already be compiled -- call after a warm-up enqueue. binary_root is derived internally from `device`.
+    ll_api::BufRwInfo query_buf_rw(const IDevice& device) const;
+
+    // Resolve query_buf_rw's raw slots to bound objects (TensorParameter name + bound buffer address).
+    // Non-const: reads the kernel's CRTA (where the runtime wrote the bound addresses), so the addresses are those
+    // of the last Program::set_program_run_args / Program::update_tensor_args -- call after the final run-args update
+    // for the enqueue being analyzed, and after the binary is compiled. A slot that can't be resolved marks the result
+    // opaque. `program` is the one this kernel belongs to: it holds the address each borrowed-memory DFB is bound to.
+    ResolvedBufRw resolve_buf_rw(const IDevice& device, const detail::ProgramImpl& program);
+
+    void set_precompiled_config(experimental::PrecompiledKernelConfig config);
+    const std::optional<experimental::PrecompiledKernelConfig>& precompiled_config() const {
+        return precompiled_config_;
+    }
+
+protected:
+    Kernel(
+        ContextId context_id,
+        HalProgrammableCoreType programmable_core_type,
+        HalProcessorClassType processor_class,
+        const KernelSource& kernel_src,
+        const CoreRangeSet& core_range_set,
+        const std::vector<uint32_t>& compile_args,
+        const std::map<std::string, std::string>& defines,
+        const std::unordered_map<std::string, uint32_t>& named_compile_args,
+        // Metal 2.0-only parameters below.
+        // If is_metal2_kernel is false, the remaining parameters are ignored and should be left default.
+        bool is_metal2_kernel = false,
+        const DataflowBufferBindingHandleMap& dataflow_buffer_binding_handles = {},
+        const SemaphoreBindingHandleMap& semaphore_binding_handles = {},
+        const std::vector<std::string>& runtime_arg_names = {},
+        const std::vector<std::string>& common_runtime_arg_names = {},
+        const std::vector<TensorBindingHandle>& tensor_binding_handles = {},
+        const KernelCrtaLayout& crta_layout = {},
+        const KernelRtaLayout& rta_layout = {});
+
+    ContextId context_id_{DEFAULT_CONTEXT_ID};
+    HalProgrammableCoreType programmable_core_type_;
+    HalProcessorClassType processor_class_;
+
+    int watcher_kernel_id_{};
+    KernelSource kernel_src_;
+    std::string kernel_full_name_;  // Name + hash
+    CoreRangeSet core_range_set_;
+    std::vector<uint32_t> compile_time_args_;
+    std::unordered_map<std::string, uint32_t> named_compile_time_args_;
+    // Metal 2.0-only members below. is_metal2_kernel_ leads the group; the others are
+    // populated only when is_metal2_kernel_ is true. Order of runtime_arg_names_ /
+    // common_runtime_arg_names_ determines byte-offset layout in the dispatch buffer.
+    const bool is_metal2_kernel_;
+    const DataflowBufferBindingHandleMap dataflow_buffer_binding_handles_;
+    const SemaphoreBindingHandleMap semaphore_binding_handles_;
+    const std::vector<std::string> runtime_arg_names_;
+    const std::vector<std::string> common_runtime_arg_names_;
+    const std::vector<TensorBindingHandle> tensor_binding_handles_;
+    const KernelCrtaLayout crta_layout_;
+    const KernelRtaLayout rta_layout_;
+    // Non-const (unlike tensor_binding_handles_): set post-construction via set_scratchpad_binding_handles,
+    // and allocate_scratchpads fills each handle's allocated_address after L1 allocation.
+    // NOTE: Scratchpad allocated addresses can change between enqueues if DFB size overrides are used.
+    std::vector<ScratchpadBindingHandle> scratchpad_binding_handles_;
+    // Metal 2.0: tensor binding sequences (set post-construction, like scratchpads).
+    std::vector<TensorBindingSequenceHandle> tensor_binding_sequences_;
+    // Metal 2.0: GlobalSemaphore bindings (set post-construction, like scratchpads).
+    std::vector<GlobalSemaphoreBindingHandle> global_semaphore_binding_handles_;
+    // Metal 2.0: PrefetcherPipe accessors -> program slot (set post-construction, like scratchpads).
+    std::vector<PrefetcherPipeBindingHandle> prefetcher_pipe_binding_handles_;
+    // Metal 2.0: number of user CTA-vararg words at the start of compile_time_args_.
+    uint32_t compile_time_vararg_count_{0};
+    // Metal 2.0: array arguments (set post-construction, like scratchpads).
+    KernelArrayArgs array_args_;
+    std::vector<std::vector<std::vector<uint32_t>>> core_to_runtime_args_;
+    std::vector<std::vector<RuntimeArgsData>> core_to_runtime_args_data_;
+    uint32_t common_runtime_args_count_{0};
+    std::vector<uint32_t> common_runtime_args_;
+    RuntimeArgsData common_runtime_args_data_;
+    std::set<CoreCoord> core_with_runtime_args_;
+    std::size_t max_runtime_args_per_core_{0};  // Max user-visible unique RTA count, for validation
+    CoreCoord core_with_max_runtime_args_;      // For validation
+    std::map<std::string, std::string>
+        defines_;  // preprocessor defines. this is to be able to generate generic instances.
+    const bool watcher_assert_enabled_;
+    const uint32_t watcher_count_word_offset_;
+    std::set<CoreCoord> logical_cores_;
+
+    // Build key -> binaries (moved from KernelImpl)
+    std::unordered_map<uint64_t, std::vector<const ll_api::memory*>> binaries_;
+    std::optional<experimental::PrecompiledKernelConfig> precompiled_config_;
+
+    // User-supplied include paths (-I), resolved to absolute paths
+    // Populated by subclass constructors via set_compiler_include_paths()
+    std::vector<std::string> resolved_compiler_include_paths_;
+
+    // Resolve user-supplied include paths and store them on the kernel:
+    //  - Absolute paths pass through unmodified
+    //  - Relative paths are resolved against the current working directory
+    void set_compiler_include_paths(const std::vector<std::filesystem::path>& paths);
+
+    virtual std::string config_hash() const = 0;
+
+    std::vector<std::string> file_paths(const IDevice& device, const std::string& binary_root) const;
+
+private:
+    void register_kernel_with_watcher();
+};
+
+// Set the address used by a scratchpad binding.
+// precondition: binding belongs to kernel, and address is a nonzero L1 address.
+// side-effect: Update the kernel's common runtime argument slot if storage exists.
+void SetScratchpadBindingAddress(Kernel& kernel, ScratchpadBindingHandle& binding, DeviceAddr address);
+
+class DataMovementKernel : public Kernel {
+public:
+    DataMovementKernel(
+        ContextId context_id,
+        const KernelSource& kernel_src,
+        const CoreRangeSet& cr_set,
+        const DataMovementConfig& config,
+        // Metal 2.0-only parameters below.
+        bool is_metal2_kernel = false,
+        const DataflowBufferBindingHandleMap& dataflow_buffer_binding_handles = {},
+        const SemaphoreBindingHandleMap& semaphore_binding_handles = {},
+        const std::vector<std::string>& runtime_arg_names = {},
+        const std::vector<std::string>& common_runtime_arg_names = {},
+        const std::vector<TensorBindingHandle>& tensor_binding_handles = {},
+        const KernelCrtaLayout& crta_layout = {},
+        const KernelRtaLayout& rta_layout = {}) :
+        Kernel(
+            context_id,
+            HalProgrammableCoreType::TENSIX,
+            HalProcessorClassType::DM,
+            kernel_src,
+            cr_set,
+            config.compile_args,
+            config.defines,
+            config.named_compile_args,
+            is_metal2_kernel,
+            dataflow_buffer_binding_handles,
+            semaphore_binding_handles,
+            runtime_arg_names,
+            common_runtime_arg_names,
+            tensor_binding_handles,
+            crta_layout,
+            rta_layout),
+        config_(config) {
+        TT_FATAL(
+            MetalContext::instance(context_id_).get_cluster().arch() != ARCH::QUASAR,
+            "DataMovementKernel is not supported on Quasar. Use QuasarDataMovementKernel instead.");
+        this->set_compiler_include_paths(config_.compiler_include_paths);
+    }
+
+    ~DataMovementKernel() override = default;
+
+    uint32_t get_kernel_processor_type(int index) const override;
+    void generate_binaries(IDevice* device, JitBuildOptions& build_options) const override;
+    void read_binaries(IDevice* device, const std::string& binary_root) override;
+
+    bool configure(
+        IDevice* device, const CoreCoord& logical_core, uint32_t base_address, const uint32_t offsets[]) const override;
+
+    Config config() const override { return this->config_; }
+
+    void process_defines(std::function<void(const std::string& define, const std::string& value)>) const override;
+
+    std::string_view get_compiler_opt_level() const override;
+
+    std::string_view get_linker_opt_level() const override;
+
+private:
+    const DataMovementConfig config_;
+
+    uint8_t expected_num_binaries() const override;
+
+    std::string config_hash() const override;
+};
+
+class EthernetKernel : public Kernel {
+public:
+    EthernetKernel(
+        ContextId context_id,
+        const KernelSource& kernel_src,
+        const CoreRangeSet& cr_set,
+        const EthernetConfig& config) :
+        Kernel(
+            context_id,
+            config.eth_mode == Eth::IDLE ? HalProgrammableCoreType::IDLE_ETH : HalProgrammableCoreType::ACTIVE_ETH,
+            HalProcessorClassType::DM,
+            kernel_src,
+            cr_set,
+            config.compile_args,
+            config.defines,
+            config.named_compile_args),
+        config_(config) {}
+
+    ~EthernetKernel() override = default;
+
+    uint32_t get_kernel_processor_type(int index) const override;
+    void generate_binaries(IDevice* device, JitBuildOptions& build_options) const override;
+    void read_binaries(IDevice* device, const std::string& binary_root) override;
+
+    bool configure(
+        IDevice* device, const CoreCoord& logical_core, uint32_t base_address, const uint32_t offsets[]) const override;
+
+    Config config() const override { return this->config_; }
+
+    void process_defines(std::function<void(const std::string& define, const std::string& value)>) const override;
+
+    std::string_view get_compiler_opt_level() const override;
+
+    std::string_view get_linker_opt_level() const override;
+
+private:
+    const EthernetConfig config_;
+
+    uint8_t expected_num_binaries() const override;
+
+    std::string config_hash() const override;
+};
+
+class DramKernel : public Kernel {
+public:
+    DramKernel(
+        ContextId context_id, const KernelSource& kernel_src, const CoreRangeSet& cr_set, const DramConfig& config) :
+        Kernel(
+            context_id,
+            HalProgrammableCoreType::DRAM,
+            HalProcessorClassType::DM,
+            kernel_src,
+            cr_set,
+            config.compile_args,
+            config.defines,
+            config.named_compile_args),
+        config_(config) {}
+
+    ~DramKernel() override = default;
+
+    uint32_t get_kernel_processor_type(int index) const override;
+    void generate_binaries(IDevice* device, JitBuildOptions& build_options) const override;
+    void read_binaries(IDevice* device, const std::string& binary_root) override;
+
+    bool configure(
+        IDevice* device, const CoreCoord& logical_core, uint32_t base_address, const uint32_t offsets[]) const override;
+
+    Config config() const override { return this->config_; }
+
+    void process_defines(std::function<void(const std::string& define, const std::string& value)>) const override;
+
+    std::string_view get_compiler_opt_level() const override;
+
+    std::string_view get_linker_opt_level() const override;
+
+private:
+    const DramConfig config_;
+
+    uint8_t expected_num_binaries() const override;
+
+    std::string config_hash() const override;
+};
+
+namespace experimental::quasar {
+
+class DispatchEngineKernel : public Kernel {
+public:
+    DispatchEngineKernel(
+        ContextId context_id,
+        const KernelSource& kernel_src,
+        const CoreRangeSet& cr_set,
+        const QuasarDataMovementConfig& config,
+        DataMovementProcessor dm_processor) :
+        Kernel(
+            context_id,
+            HalProgrammableCoreType::DISPATCH,
+            HalProcessorClassType::DM,
+            kernel_src,
+            cr_set,
+            config.compile_args,
+            config.defines,
+            config.named_compile_args),
+        config_(config),
+        dm_processors_{dm_processor} {
+        TT_FATAL(
+            MetalContext::instance(context_id_).get_cluster().arch() == ARCH::QUASAR,
+            "DispatchEngineKernel is only supported on Quasar");
+        TT_FATAL(config.num_threads_per_cluster == 1, "DispatchEngineKernel requires num_threads_per_cluster=1");
+        this->set_compiler_include_paths(config_.compiler_include_paths);
+    }
+
+    ~DispatchEngineKernel() override = default;
+
+    uint32_t get_kernel_processor_type(int index) const override;
+    void generate_binaries(IDevice* device, JitBuildOptions& build_options) const override;
+    void read_binaries(IDevice* device, const std::string& binary_root) override;
+
+    bool configure(
+        IDevice* device, const CoreCoord& logical_core, uint32_t base_address, const uint32_t offsets[]) const override;
+
+    Config config() const override { return this->config_; }
+
+    void process_defines(
+        std::function<void(const std::string& define, const std::string& value)> callback) const override;
+
+    std::string_view get_compiler_opt_level() const override;
+
+    std::string_view get_linker_opt_level() const override;
+
+    const std::vector<DataMovementProcessor>& get_dm_processors() const { return this->dm_processors_; }
+
+private:
+    const QuasarDataMovementConfig config_;
+    const std::vector<DataMovementProcessor> dm_processors_;
+
+    uint8_t expected_num_binaries() const override;
+
+    std::string config_hash() const override;
+};
+
+}  // namespace experimental::quasar
+
+class ComputeKernel : public Kernel {
+public:
+    ComputeKernel(
+        ContextId context_id,
+        const KernelSource& kernel_src,
+        const CoreRangeSet& cr_set,
+        const ComputeConfig& config,
+        // Metal 2.0-only parameters below.
+        bool is_metal2_kernel = false,
+        const DataflowBufferBindingHandleMap& dataflow_buffer_binding_handles = {},
+        const SemaphoreBindingHandleMap& semaphore_binding_handles = {},
+        const std::vector<std::string>& runtime_arg_names = {},
+        const std::vector<std::string>& common_runtime_arg_names = {},
+        const std::vector<TensorBindingHandle>& tensor_binding_handles = {},
+        const KernelCrtaLayout& crta_layout = {},
+        const KernelRtaLayout& rta_layout = {}) :
+        Kernel(
+            context_id,
+            HalProgrammableCoreType::TENSIX,
+            HalProcessorClassType::COMPUTE,
+            kernel_src,
+            cr_set,
+            config.compile_args,
+            config.defines,
+            config.named_compile_args,
+            is_metal2_kernel,
+            dataflow_buffer_binding_handles,
+            semaphore_binding_handles,
+            runtime_arg_names,
+            common_runtime_arg_names,
+            tensor_binding_handles,
+            crta_layout,
+            rta_layout),
+        config_(config) {
+        TT_FATAL(
+            MetalContext::instance(context_id_).get_cluster().arch() != ARCH::QUASAR,
+            "ComputeKernel is not supported on Quasar. Use QuasarComputeKernel instead.");
+        this->set_compiler_include_paths(config_.compiler_include_paths);
+    }
+
+    ~ComputeKernel() override = default;
+
+    uint32_t get_kernel_processor_type(int index) const override;
+    void set_build_options(JitBuildOptions& build_options) const override;
+    void generate_binaries(IDevice* device, JitBuildOptions& build_options) const override;
+    void read_binaries(IDevice* device, const std::string& binary_root) override;
+
+    bool configure(
+        IDevice* device, const CoreCoord& logical_core, uint32_t base_address, const uint32_t offsets[]) const override;
+
+    Config config() const override { return this->config_; }
+
+    void process_defines(std::function<void(const std::string& define, const std::string& value)>) const override;
+
+    std::string_view get_compiler_opt_level() const override;
+
+    std::string_view get_linker_opt_level() const override;
+
+    bool get_rvv_enabled() const override { return this->config_.enable_trisc2_rvv; }
+
+    bool get_sfpu_replay_optimization_disabled() const override;
+
+private:
+    const ComputeConfig config_;
+
+    uint8_t expected_num_binaries() const override;
+
+    std::string config_hash() const override;
+};
+
+namespace experimental::quasar {
+
+static constexpr uint32_t QUASAR_NUM_COMPUTE_PROCESSORS_PER_TENSIX_ENGINE = 4;
+
+enum class QuasarComputeProcessor : uint8_t {
+    NEO_0_COMPUTE_0 = 0,
+    NEO_0_COMPUTE_1 = 1,
+    NEO_0_COMPUTE_2 = 2,
+    NEO_0_COMPUTE_3 = 3,
+    NEO_1_COMPUTE_0 = 4,
+    NEO_1_COMPUTE_1 = 5,
+    NEO_1_COMPUTE_2 = 6,
+    NEO_1_COMPUTE_3 = 7,
+    NEO_2_COMPUTE_0 = 8,
+    NEO_2_COMPUTE_1 = 9,
+    NEO_2_COMPUTE_2 = 10,
+    NEO_2_COMPUTE_3 = 11,
+    NEO_3_COMPUTE_0 = 12,
+    NEO_3_COMPUTE_1 = 13,
+    NEO_3_COMPUTE_2 = 14,
+    NEO_3_COMPUTE_3 = 15,
+};
+
+class QuasarDataMovementKernel : public Kernel {
+public:
+    QuasarDataMovementKernel(
+        ContextId context_id,
+        const KernelSource& kernel_src,
+        const CoreRangeSet& cr_set,
+        const QuasarDataMovementConfig& config,
+        const std::set<DataMovementProcessor>& dm_processors,
+        // Metal 2.0-only parameters below.
+        bool is_metal2_kernel = false,
+        const DataflowBufferBindingHandleMap& dataflow_buffer_binding_handles = {},
+        const SemaphoreBindingHandleMap& semaphore_binding_handles = {},
+        const std::vector<std::string>& runtime_arg_names = {},
+        const std::vector<std::string>& common_runtime_arg_names = {},
+        const std::vector<TensorBindingHandle>& tensor_binding_handles = {},
+        const KernelCrtaLayout& crta_layout = {},
+        const KernelRtaLayout& rta_layout = {}) :
+        Kernel(
+            context_id,
+            HalProgrammableCoreType::TENSIX,
+            HalProcessorClassType::DM,
+            kernel_src,
+            cr_set,
+            config.compile_args,
+            config.defines,
+            config.named_compile_args,
+            is_metal2_kernel,
+            dataflow_buffer_binding_handles,
+            semaphore_binding_handles,
+            runtime_arg_names,
+            common_runtime_arg_names,
+            tensor_binding_handles,
+            crta_layout,
+            rta_layout),
+        config_(config),
+        dm_processors_(dm_processors.begin(), dm_processors.end()) {
+        TT_FATAL(
+            MetalContext::instance(context_id_).get_cluster().arch() == ARCH::QUASAR,
+            "QuasarDataMovementKernel is only supported on Quasar");
+        TT_FATAL(
+            config.num_threads_per_cluster == dm_processors.size(),
+            "Number of DM cores per cluster specified in config must match number of DM cores per cluster that have "
+            "been reserved");
+        TT_FATAL(std::is_sorted(dm_processors_.begin(), dm_processors_.end()), "DM cores must be ordered");
+        this->set_compiler_include_paths(config_.compiler_include_paths);
+    }
+
+    ~QuasarDataMovementKernel() override = default;
+
+    uint32_t get_kernel_processor_type(int index) const override;
+    std::vector<uint32_t> get_processor_indices_for_binary(int binary_index) const override;
+    void generate_binaries(IDevice* device, JitBuildOptions& build_options) const override;
+    void read_binaries(IDevice* device, const std::string& binary_root) override;
+
+    bool configure(
+        IDevice* device, const CoreCoord& logical_core, uint32_t base_address, const uint32_t offsets[]) const override;
+
+    Config config() const override { return this->config_; }
+
+    void process_defines(std::function<void(const std::string& define, const std::string& value)>) const override;
+
+    std::string_view get_compiler_opt_level() const override;
+
+    std::string_view get_linker_opt_level() const override;
+
+    const std::vector<DataMovementProcessor>& get_dm_processors() const { return this->dm_processors_; }
+
+private:
+    const QuasarDataMovementConfig config_;
+    const std::vector<DataMovementProcessor> dm_processors_;
+
+    uint8_t expected_num_binaries() const override;
+
+    std::string config_hash() const override;
+};
+
+class QuasarComputeKernel : public Kernel {
+public:
+    QuasarComputeKernel(
+        ContextId context_id,
+        const KernelSource& kernel_src,
+        const CoreRangeSet& cr_set,
+        const QuasarComputeConfig& config,
+        const std::set<QuasarComputeProcessor>& compute_processors,
+        // Metal 2.0-only parameters below.
+        bool is_metal2_kernel = false,
+        const DataflowBufferBindingHandleMap& dataflow_buffer_binding_handles = {},
+        const SemaphoreBindingHandleMap& semaphore_binding_handles = {},
+        const std::vector<std::string>& runtime_arg_names = {},
+        const std::vector<std::string>& common_runtime_arg_names = {},
+        const std::vector<TensorBindingHandle>& tensor_binding_handles = {},
+        const KernelCrtaLayout& crta_layout = {},
+        const KernelRtaLayout& rta_layout = {}) :
+        Kernel(
+            context_id,
+            HalProgrammableCoreType::TENSIX,
+            HalProcessorClassType::COMPUTE,
+            kernel_src,
+            cr_set,
+            config.compile_args,
+            config.defines,
+            config.named_compile_args,
+            is_metal2_kernel,
+            dataflow_buffer_binding_handles,
+            semaphore_binding_handles,
+            runtime_arg_names,
+            common_runtime_arg_names,
+            tensor_binding_handles,
+            crta_layout,
+            rta_layout),
+        config_(config),
+        compute_processors_(compute_processors.begin(), compute_processors.end()) {
+        TT_FATAL(
+            MetalContext::instance(context_id_).get_cluster().arch() == ARCH::QUASAR,
+            "QuasarComputeKernel is only supported on Quasar");
+        TT_FATAL(
+            config.num_threads_per_cluster * QUASAR_NUM_COMPUTE_PROCESSORS_PER_TENSIX_ENGINE ==
+                compute_processors.size(),
+            "Number of Tensix engines per cluster specified in config multiplied by the number of compute processors "
+            "per Tensix engine must match number of compute cores per cluster that have been reserved");
+        TT_FATAL(
+            std::is_sorted(compute_processors_.begin(), compute_processors_.end()), "Compute cores must be ordered");
+        this->set_compiler_include_paths(config_.compiler_include_paths);
+        init_trisc_binary_groups();
+    }
+
+    ~QuasarComputeKernel() override = default;
+
+    uint32_t get_kernel_processor_type(int index) const override;
+    std::vector<uint32_t> get_processor_indices_for_binary(int binary_index) const override;
+    void generate_binaries(IDevice* device, JitBuildOptions& build_options) const override;
+    void read_binaries(IDevice* device, const std::string& binary_root) override;
+
+    bool configure(
+        IDevice* device, const CoreCoord& logical_core, uint32_t base_address, const uint32_t offsets[]) const override;
+
+    Config config() const override { return this->config_; }
+
+    void process_defines(std::function<void(const std::string& define, const std::string& value)>) const override;
+
+    std::string_view get_compiler_opt_level() const override;
+
+    std::string_view get_linker_opt_level() const override;
+
+    bool get_rvv_enabled() const override { return this->config_.enable_trisc0_rvv; }
+
+    void set_build_options(JitBuildOptions& build_options) const override;
+
+    const std::vector<QuasarComputeProcessor>& get_compute_processors() const { return this->compute_processors_; }
+
+private:
+    const QuasarComputeConfig config_;
+    const std::vector<QuasarComputeProcessor> compute_processors_;
+    // Processors grouped by TRISC slot (enum % 4). Same slot across NEOs shares one compile,
+    // one on-disk ELF, and one device transfer.
+    std::vector<std::vector<QuasarComputeProcessor>> trisc_binary_groups_;
+
+    void init_trisc_binary_groups();
+
+    uint8_t expected_num_binaries() const override;
+
+    std::string config_hash() const override;
+};
+}  // namespace experimental::quasar
+
+}  // namespace tt::tt_metal

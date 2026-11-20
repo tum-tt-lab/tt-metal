@@ -1,0 +1,18 @@
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <tt_stl/llvm/llvm_small_vector.hpp>
+
+namespace ttsl {
+
+static constexpr size_t SMALL_VECTOR_SIZE = 8;
+
+template <typename T, std::size_t PREALLOCATED_SIZE = SMALL_VECTOR_SIZE>
+struct SmallVector : public ttsl::detail::llvm::SmallVector<T, PREALLOCATED_SIZE> {
+    using ttsl::detail::llvm::SmallVector<T, PREALLOCATED_SIZE>::SmallVector;
+};
+
+}  // namespace ttsl

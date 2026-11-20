@@ -1,0 +1,147 @@
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <cstdlib>
+#include <filesystem>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+
+#include <tt_stl/assert.hpp>
+#include "llrt/rtoptions.hpp"
+#include "tracy/Tracy.hpp"
+#include <tt-umd/pcie/pci_device.hpp>
+#include <tt-umd/soc_descriptor.hpp>
+#include <tt-umd/simulation/tt_sim_communicator.hpp>
+#include <tt-umd-workload/simulation/simulation_chip.hpp>
+
+namespace tt::tt_metal {
+
+// The simulator's soc_descriptor.yaml when it ships one, else empty: a wh/bh ttsim image needs none.
+inline std::string find_simulator_soc_descriptor_path(const std::filesystem::path& simulator_path) {
+    std::string soc_desc = umd::SimulationChip::get_soc_descriptor_path_from_simulator_path(simulator_path);
+    return std::filesystem::exists(soc_desc) ? soc_desc : "";
+}
+
+// Declared by the simulator's soc_descriptor.yaml when it ships one, else read from the PCI device id its
+// ttsim image reports. The first probe of an image must come before any simulator is brought up; UMD caches
+// the answer per image, so later calls are safe once a simulator is running.
+inline tt::ARCH get_simulator_architecture(const std::filesystem::path& simulator_path) {
+    const std::string soc_desc = find_simulator_soc_descriptor_path(simulator_path);
+    if (!soc_desc.empty()) {
+        return umd::SocDescriptor::get_arch_from_soc_descriptor_path(soc_desc);
+    }
+    const std::string expected_soc_desc =
+        umd::SimulationChip::get_soc_descriptor_path_from_simulator_path(simulator_path);
+    TT_FATAL(
+        simulator_path.extension() == ".so",
+        "{} not found: an RTL simulator declares its architecture only through its SoC descriptor.",
+        expected_soc_desc);
+    const tt::ARCH arch = umd::arch_from_pci_device_id(umd::TTSimCommunicator::read_pci_device_id(simulator_path));
+    TT_FATAL(
+        arch == tt::ARCH::WORMHOLE_B0 || arch == tt::ARCH::BLACKHOLE,
+        "Simulator {} reports {}, which has no built-in SoC descriptor. Place its soc_descriptor.yaml at {}.",
+        simulator_path.string(),
+        tt::arch_to_str(arch),
+        expected_soc_desc);
+    return arch;
+}
+
+inline tt::ARCH get_physical_architecture() {
+    ZoneScoped;
+    static tt::ARCH current_arch = tt::ARCH::Invalid;
+    static std::once_flag current_arch_once_flag;
+    std::call_once(current_arch_once_flag, []() {
+        // Issue tt_umd#361: ClusterDescriptor::create() won't work here.
+        // This map holds PCI info for each mmio chip.
+        auto devices_info = umd::PCIDevice::enumerate_devices_info();
+        if (!devices_info.empty()) {
+            current_arch = devices_info.begin()->second.get_arch();
+            for (auto& [device_id, device_info] : devices_info) {
+                tt::ARCH detected_arch = device_info.get_arch();
+                TT_FATAL(
+                    current_arch == detected_arch,
+                    "Expected all devices to be {} but device {} is {}",
+                    tt::arch_to_str(current_arch),
+                    device_id,
+                    tt::arch_to_str(detected_arch));
+            }
+        }
+    });
+    return current_arch;
+}
+
+/**
+ * @brief Detects the platform architecture based on the environment or hardware.
+ *
+ * This function determines the platform architecture by inspecting the environment
+ * variables or available physical devices. If the environment variable
+ * `TT_METAL_SIMULATOR` is set, the architecture is retrieved from simulator.
+ * Otherwise, the architecture is deduced by detecting available physical devices.
+ *
+ * @return tt::ARCH The detected platform architecture. Returns tt::ARCH::Invalid
+ *                  if no valid architecture could be detected.
+ *
+ * @note
+ * - A fatal error occurs if multiple devices are detected with conflicting
+ *   architectures.
+ *
+ * @exception std::runtime_error Throws a fatal error if:
+ * - Multiple devices with inconsistent architectures are detected.
+ *
+ * Example usage:
+ * @code
+ * #include "tt_backend_api_types.hpp"
+ *
+ * tt::ARCH arch = tt::tt_metal::get_platform_architecture();
+ * if (arch == tt::ARCH::Invalid) {
+ *     std::cerr << "Failed to detect architecture!" << std::endl;
+ * } else {
+ *     std::cout << "Detected architecture: " << tt::arch_to_str(arch) << std::endl;
+ * }
+ * @endcode
+ *
+ * @see tt::get_arch_from_string
+ * @see PCIDevice::enumerate_devices_info
+ */
+
+inline tt::ARCH get_platform_architecture(const tt::llrt::RunTimeOptions& rtoptions) {
+    auto arch = tt::ARCH::Invalid;
+    // If running in mock mode, derive architecture from provided cluster descriptor
+    if (rtoptions.get_target_device() == tt::TargetDevice::Mock ||
+        rtoptions.get_target_device() == tt::TargetDevice::Emule) {
+        // Parse each descriptor once: ttnn.get_arch_name() lands here per op in model code. Keyed by path
+        // rather than call_once because tests open several mock descriptors in one process.
+        static std::mutex mock_arch_mutex;
+        static std::unordered_map<std::string, tt::ARCH> mock_arch_by_path;
+        const std::string& path = rtoptions.get_mock_cluster_desc_path();
+        {
+            std::lock_guard<std::mutex> lock(mock_arch_mutex);
+            if (auto it = mock_arch_by_path.find(path); it != mock_arch_by_path.end()) {
+                return it->second;
+            }
+        }
+        auto cluster_desc = umd::ClusterDescriptor::create_from_yaml(path);
+        if (cluster_desc && cluster_desc->get_number_of_chips() > 0) {
+            auto chips = cluster_desc->get_all_chips();
+            arch = cluster_desc->get_arch(*chips.begin());
+        }
+        if (arch != tt::ARCH::Invalid) {
+            std::lock_guard<std::mutex> lock(mock_arch_mutex);
+            mock_arch_by_path.emplace(path, arch);
+        }
+        return arch;
+    }
+    if (rtoptions.get_target_device() == tt::TargetDevice::Simulator) {
+        arch = get_simulator_architecture(rtoptions.get_simulator_path());
+    } else {
+        arch = get_physical_architecture();
+    }
+
+    return arch;
+}
+
+}  // namespace tt::tt_metal

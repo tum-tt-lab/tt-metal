@@ -1,0 +1,280 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
+# SPDX-License-Identifier: Apache-2.0
+
+import pytest
+from helpers.chip_architecture import ChipArchitecture, get_chip_architecture
+from helpers.constraints import (
+    get_valid_dest_accumulation_modes,
+)
+from helpers.data_format_inference import unpacks_to_dest
+from helpers.format_config import DataFormat
+from helpers.golden_generators import (
+    TILE_DIMENSIONS,
+    DataCopyGolden,
+    TilizeGolden,
+    get_golden_generator,
+)
+from helpers.llk_params import (
+    BlocksCalculationAlgorithm,
+    DestSync,
+    PerfRunType,
+    Tilize,
+)
+from helpers.param_config import (
+    get_num_blocks_and_num_tiles_in_block,
+    input_output_formats,
+    parametrize,
+)
+from helpers.perf.core import create_test_or_perf_config
+from helpers.stimuli_config import StimuliConfig
+from helpers.stimuli_generator import generate_stimuli
+from helpers.test_variant_parameters import (
+    DEST_INDEX,
+    LOOP_FACTOR,
+    NUM_BLOCKS,
+    NUM_FACES,
+    NUM_TILES_IN_BLOCK,
+    TILE_COUNT,
+    TILIZE,
+    generate_input_dim,
+)
+from helpers.tile_constants import get_tile_params
+from helpers.utils import passed_test, result_tensor
+
+# Sub-byte block-float formats need extra handling: tilize is unsupported and
+# the golden must round-trip the input through the format's quantization to
+# match what the hardware actually sees after unpack from L1.
+SUB_BYTE_BFP_FORMATS = (DataFormat.Bfp4_b, DataFormat.Bfp2_b)
+
+
+def get_valid_tilize_datacopy(formats):
+    """
+    Get valid tilize options for _llk_math_eltwise_unary_datacopy_
+
+    - Blackhole and Wormhole have differing APIs:
+        - Blackhole: Has tilize argument (SW workaround for HW bug)
+        - Wormhole: No tilize argument (No SW workaround needed)
+    - Tilize cannot be enabled if input format is Bfp8_b (HW limitation)
+
+    Therefore we only test tilization on Blackhole
+    """
+
+    chip_arch = get_chip_architecture()
+
+    if chip_arch == ChipArchitecture.WORMHOLE:
+        return [Tilize.No]
+
+    if formats.input_format == DataFormat.Bfp8_b:
+        return [Tilize.No]
+
+    if formats.input_format == DataFormat.Fp8_e4m3:
+        return [Tilize.No]
+
+    return [Tilize.No, Tilize.Yes]
+
+
+def get_valid_tile_dimensions_datacopy(tilize):
+    """
+    Get valid tile shapes for _llk_math_eltwise_unary_datacopy_
+
+    - The tile must be a full 32x32 (four faces) when tilization is enabled (SW limitation)
+    - Otherwise it can be 16x16 (one face), 16x32 (two faces) or 32x32 (four faces)
+    """
+
+    if tilize == Tilize.Yes:
+        return [[32, 32]]
+
+    return [[16, 16], [16, 32], [32, 32]]
+
+
+DATACOPY_FORMATS = input_output_formats(
+    [
+        DataFormat.Float32,
+        DataFormat.Float16_b,
+        DataFormat.Bfp8_b,
+        DataFormat.Fp8_e4m3,
+    ]
+)
+
+SUB_BYTE_DATACOPY_FORMATS = [
+    fmt
+    for fmt in input_output_formats(
+        [
+            *SUB_BYTE_BFP_FORMATS,
+            DataFormat.Float16_b,
+            DataFormat.Bfp8_b,
+            DataFormat.Float32,
+        ]
+    )
+    if fmt.input_format in SUB_BYTE_BFP_FORMATS
+    or fmt.output_format in SUB_BYTE_BFP_FORMATS
+]
+
+# Shared with perf_eltwise_unary_datacopy.py so the two sweeps stay aligned.
+DATACOPY_SWEEP = dict(
+    formats=DATACOPY_FORMATS,
+    dest_acc=get_valid_dest_accumulation_modes,
+    tile_dimensions=get_valid_tile_dimensions_datacopy,
+    tilize=get_valid_tilize_datacopy,
+    input_dimensions=[[64, 64], [32, 256], [128, 256]],
+)
+DATACOPY_SUB_BYTE_SWEEP = dict(
+    formats=SUB_BYTE_DATACOPY_FORMATS,
+    dest_acc=get_valid_dest_accumulation_modes,
+    tile_dimensions=get_valid_tile_dimensions_datacopy,
+    tilize=Tilize.No,
+    input_dimensions=[[32, 32], [64, 64], [32, 256], [128, 256]],
+)
+
+
+def _run_unary_datacopy_test(
+    formats,
+    dest_acc,
+    tile_dimensions,
+    tilize,
+    input_dimensions,
+    *,
+    quantize_golden_input: bool = False,
+    is_perf: bool = False,
+    perf_report=None,
+    run_types=None,
+    loop_factor: int = 1,
+):
+    """Shared body for the unary datacopy tests.
+
+    When ``quantize_golden_input`` is True, the input is passed to
+    :class:`DataCopyGolden` so it can apply the format-specific round-trip
+    quantization (needed for sub-byte block-float inputs whose unpacked
+    values differ from the raw stimuli).
+    """
+
+    if get_chip_architecture() == ChipArchitecture.WORMHOLE and (
+        formats.input_format == DataFormat.Fp8_e4m3
+        or formats.output_format == DataFormat.Fp8_e4m3
+    ):
+        pytest.skip("Fp8_e4m3 not supported on wormhole")
+
+    # num_faces follows the tile shape: 16x16 is one face, 16x32 two, 32x32 four (face_r_dim 16).
+    _, num_faces_r_dim, num_faces_c_dim = get_tile_params(tile_dimensions)
+    num_faces = num_faces_r_dim * num_faces_c_dim
+
+    src_A, tile_cnt_A, src_B, tile_cnt_B = generate_stimuli(
+        stimuli_format_A=formats.input_format,
+        input_dimensions_A=input_dimensions,
+        stimuli_format_B=formats.input_format,
+        input_dimensions_B=input_dimensions,
+    )
+
+    if tilize == Tilize.No:
+        generate_golden = get_golden_generator(DataCopyGolden)
+        golden_kwargs = (
+            {"input_format": formats.input_format} if quantize_golden_input else {}
+        )
+        golden_tensor = generate_golden(
+            src_A,
+            formats.output_format,
+            num_faces,
+            input_dimensions,
+            **golden_kwargs,
+        )
+    else:
+        generate_golden = get_golden_generator(TilizeGolden)
+        golden_tensor = generate_golden(src_A, input_dimensions, formats.output_format)
+
+    unpack_to_dest = unpacks_to_dest(formats.input_format, dest_acc, tilize)
+
+    blocks_calculation_algorithm = (
+        BlocksCalculationAlgorithm.Standard
+        if tilize == Tilize.No
+        else BlocksCalculationAlgorithm.Tilize
+    )
+    num_blocks, num_tiles_in_block = get_num_blocks_and_num_tiles_in_block(
+        DestSync.Half,
+        dest_acc,
+        formats,
+        input_dimensions,
+        TILE_DIMENSIONS,
+        blocks_calculation_algorithm,
+    )
+
+    if is_perf and perf_report is None:
+        raise ValueError("perf_report must be provided when is_perf=True")
+
+    if run_types is None:
+        run_types = [PerfRunType.L1_TO_L1]
+
+    test_config_kwargs = {
+        "test_name": "sources/eltwise_unary_datacopy_test.cpp",
+        "formats": formats,
+        "templates": [
+            generate_input_dim(input_dimensions, input_dimensions),
+            TILIZE(tilize),
+        ],
+        "runtimes": [
+            DEST_INDEX(0),
+            TILE_COUNT(tile_cnt_A),
+            NUM_FACES(num_faces),
+            NUM_BLOCKS(num_blocks),
+            NUM_TILES_IN_BLOCK(num_tiles_in_block),
+            LOOP_FACTOR(loop_factor),
+        ],
+        "variant_stimuli": StimuliConfig(
+            src_A,
+            formats.input_format,
+            src_B,
+            formats.input_format,
+            formats.output_format,
+            tile_count_A=tile_cnt_A,
+            tile_count_B=tile_cnt_B,
+            tile_count_res=tile_cnt_A,
+            num_faces=num_faces,
+        ),
+        "dest_acc": dest_acc,
+        "unpack_to_dest": unpack_to_dest,
+    }
+
+    configuration = create_test_or_perf_config(
+        is_perf=is_perf,
+        run_types=run_types,
+        test_config_kwargs=test_config_kwargs,
+    )
+    if is_perf:
+        configuration.run(perf_report)
+        return
+
+    res_from_L1 = configuration.run().result
+
+    res_tensor = result_tensor(res_from_L1, formats.output_format, golden_tensor)
+
+    assert passed_test(golden_tensor, res_tensor, formats.output_format)
+
+
+@parametrize(**DATACOPY_SWEEP)
+def test_eltwise_unary_datacopy(
+    formats,
+    dest_acc,
+    tile_dimensions,
+    tilize,
+    input_dimensions,
+):
+    _run_unary_datacopy_test(
+        formats, dest_acc, tile_dimensions, tilize, input_dimensions
+    )
+
+
+@parametrize(**DATACOPY_SUB_BYTE_SWEEP)
+def test_eltwise_unary_datacopy_sub_byte_bfp(
+    formats,
+    dest_acc,
+    tile_dimensions,
+    tilize,
+    input_dimensions,
+):
+    _run_unary_datacopy_test(
+        formats,
+        dest_acc,
+        tile_dimensions,
+        tilize,
+        input_dimensions,
+        quantize_golden_input=True,
+    )

@@ -1,0 +1,585 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tests for ``ttml.fsdp.fully_shard`` on a multi-device mesh.
+
+Covered:
+  * Shard mechanics on a single ``LinearLayer`` — local-shape change,
+    dtype preservation, ``_fsdp_managed`` marker.
+  * ``shard -> gather`` matches the source tensor (proves the shards are
+    the correct slices, not arbitrary garbage).
+  * ``shard -> unshard`` round-trip preserves the full tensor's values.
+  * ``fully_shard`` guard rails: double-wrap raises, unknown axis raises.
+  * Root-wrapping with nested blocks (FSDP2-root semantics: the root
+    wrapper claims only parameters NOT already owned by a nested
+    wrapper).
+  * Forward and backward equivalence against a replicated reference
+    (every device runs the same computation, every device sees the same
+    weights). With identical inputs on every device the reduce-scatter
+    mean inside FSDP's backward_post collapses to the per-device full
+    grad sliced to the local shard, so the gathered FSDP grad must
+    match the full reference grad (modulo bf16 rounding).
+
+These tests need two devices on the ``"fsdp"`` axis (the smallest viable
+layout, e.g. an N300 board); the shared module-scoped ``fsdp_mesh`` fixture in
+``conftest.py`` skips the whole file when the mesh cannot be opened.
+
+NOTE: placements on the underlying ttnn tensors are NOT a reliable
+indicator of shard state in TTML right now — several CCL ops drop or
+fail to update them. The tests below intentionally do not assert on
+``tensor_topology().placements()``; they rely on the ``_fsdp_managed``
+marker and on actual data-level checks via host-side numpy gathers.
+"""
+
+from __future__ import annotations
+
+from typing import Dict, List
+
+import numpy as np
+import pytest
+
+import ttnn
+import ttml
+from ttml.modules import AbstractModuleBase, LinearLayer, ModuleList
+
+
+pytestmark = pytest.mark.requires_device
+
+
+# ---------------------------------------------------------------------------
+# Numpy <-> distributed tensor helpers
+# ---------------------------------------------------------------------------
+
+
+def _replicated_mapper():
+    """A mesh mapper that replicates a tensor on every mesh axis."""
+    device = ttml.autograd.AutoContext.get_instance().get_device()
+    mesh = ttml.mesh()
+    placements = [ttnn.PlacementReplicate() for _ in mesh.shape]
+    return ttnn.create_mesh_mapper(device, ttnn.MeshMapperConfig(placements))
+
+
+def _read_replicated_to_numpy(autograd_tensor, mesh, *, dtype=ttnn.DataType.FLOAT32):
+    """Read a tensor identical on every mesh device into canonical numpy.
+
+    Compose along an unused tensor dim per mesh axis (the first ``n_axes``
+    dims), then slice each stacking dim back to the per-device size.
+    Works for any tensor of rank >= ``len(mesh.shape)``.
+    """
+    device = ttml.autograd.AutoContext.get_instance().get_device()
+    n_axes = len(mesh.shape)
+    composer_dims = list(range(n_axes))
+    composer = ttnn.create_mesh_composer(device, ttnn.MeshComposerConfig(composer_dims))
+    full_np = autograd_tensor.to_numpy(dtype, composer=composer)
+    slicer = [slice(None)] * full_np.ndim
+    for d in range(n_axes):
+        per_dev_size = full_np.shape[d] // mesh.shape[d]
+        slicer[d] = slice(0, per_dev_size)
+    return full_np[tuple(slicer)]
+
+
+def _read_fsdp_sharded_to_numpy(autograd_tensor, mesh, shard_dim, *, dtype=ttnn.DataType.FLOAT32):
+    """Gather an FSDP-sharded tensor across the ``"fsdp"`` axis into numpy.
+
+    The "fsdp" axis composes along ``shard_dim`` (concat the shards);
+    every other axis (replicated) gets a scratch tensor dim that we slice
+    back to its per-device size afterwards.
+    """
+    device = ttml.autograd.AutoContext.get_instance().get_device()
+    fsdp_axis = mesh.axis_index("fsdp")
+    rank = autograd_tensor.get_rank()
+
+    composer_dims = []
+    scratch_iter = iter(d for d in range(rank) if d != shard_dim)
+    scratch_axes = []
+    for ax_idx in range(len(mesh.shape)):
+        if ax_idx == fsdp_axis:
+            composer_dims.append(shard_dim)
+        else:
+            d = next(scratch_iter)
+            composer_dims.append(d)
+            scratch_axes.append((ax_idx, d))
+
+    composer = ttnn.create_mesh_composer(device, ttnn.MeshComposerConfig(composer_dims))
+    full_np = autograd_tensor.to_numpy(dtype, composer=composer)
+
+    if scratch_axes:
+        slicer = [slice(None)] * full_np.ndim
+        for ax_idx, d in scratch_axes:
+            per_dev_size = full_np.shape[d] // mesh.shape[ax_idx]
+            slicer[d] = slice(0, per_dev_size)
+        full_np = full_np[tuple(slicer)]
+    return full_np
+
+
+def _set_param_replicated(autograd_tensor, full_np, *, dtype=ttnn.DataType.BFLOAT16) -> None:
+    """Overwrite a parameter's value with a freshly built replicated tensor."""
+    mapper = _replicated_mapper()
+    new_t = ttml.autograd.Tensor.from_numpy(full_np.astype(np.float32), ttnn.Layout.TILE, dtype, mapper)
+    autograd_tensor.set_value(new_t.get_value())
+
+
+# ---------------------------------------------------------------------------
+# Tiny test models
+# ---------------------------------------------------------------------------
+
+
+class _TinyBlock(AbstractModuleBase):
+    """Two-linear-layer block with biases."""
+
+    def __init__(self, in_features: int, hidden: int, out_features: int) -> None:
+        super().__init__()
+        self.fc1 = LinearLayer(in_features, hidden, has_bias=True)
+        self.fc2 = LinearLayer(hidden, out_features, has_bias=True)
+
+    def forward(self, x):
+        return self.fc2(self.fc1(x))
+
+
+class _TinyModel(AbstractModuleBase):
+    """A few blocks + a head, used to exercise FSDP2-root wrapping semantics."""
+
+    def __init__(self, in_features: int, hidden: int, out_features: int, num_blocks: int = 2) -> None:
+        super().__init__()
+        self.blocks = ModuleList([_TinyBlock(in_features, hidden, out_features) for _ in range(num_blocks)])
+        self.head = LinearLayer(out_features, out_features, has_bias=False)
+
+    def forward(self, x):
+        for blk in self.blocks:
+            x = blk(x)
+        return self.head(x)
+
+
+class _TiedPair(AbstractModuleBase):
+    """Two linears sharing one weight, the way ``tok_emb``/``fc`` are tied in Llama."""
+
+    def __init__(self, features: int) -> None:
+        super().__init__()
+        self.fc1 = LinearLayer(features, features, has_bias=False)
+        self.fc2 = LinearLayer(features, features, has_bias=False)
+        self.fc2.weight = self.fc1.weight
+
+    def forward(self, x):
+        return self.fc2(self.fc1(x))
+
+
+def _build_block_with_known_weights(in_features: int, hidden: int, out_features: int, *, seed: int = 42) -> _TinyBlock:
+    """Build a ``_TinyBlock`` whose parameters are deterministic and replicated.
+
+    LinearLayer's default uniform init is non-deterministic across processes;
+    we overwrite every param with seeded random data so the reference run
+    and the FSDP run start from the exact same numbers on every device.
+    """
+    rng = np.random.default_rng(seed)
+    block = _TinyBlock(in_features, hidden, out_features)
+    for _, t in block.named_parameters():
+        shape = tuple(t.shape())
+        data = rng.standard_normal(shape).astype(np.float32) * 0.1
+        _set_param_replicated(t, data)
+    return block
+
+
+# ---------------------------------------------------------------------------
+# fully_shard mechanics on a single LinearLayer
+# ---------------------------------------------------------------------------
+
+
+class TestFullyShardLinear:
+    """``fully_shard`` mechanics on a single ``LinearLayer``."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, fsdp_mesh):
+        self.mesh = fsdp_mesh
+        self.axis_size = fsdp_mesh.axis_size("fsdp")
+        ttml.autograd.AutoContext.get_instance().set_seed(42)
+        np.random.seed(42)
+
+    def test_shard_changes_local_shape(self):
+        """After ``fully_shard``, the per-device shape collapses along the chosen dim.
+
+        Auto picks ``rank-2`` for weight (the typical "O" dim in
+        ``[1,1,O,I]``). Bias has ``shape[rank-2] == 1`` so auto falls
+        through to ``rank-1``.
+        """
+        in_features, out_features = 64, 128
+        linear = LinearLayer(in_features, out_features, has_bias=True)
+
+        assert linear.weight.tensor.shape() == [1, 1, out_features, in_features]
+        assert linear.bias.tensor.shape() == [1, 1, 1, out_features]
+
+        ttml.fsdp.fully_shard(linear)
+
+        assert linear.weight.tensor.shape() == [1, 1, out_features // self.axis_size, in_features]
+        assert linear.bias.tensor.shape() == [1, 1, 1, out_features // self.axis_size]
+
+        assert ttml.fsdp.is_fsdp_managed(linear.weight.tensor)
+        assert ttml.fsdp.is_fsdp_managed(linear.bias.tensor)
+        assert ttml.fsdp.fsdp_axis_of(linear.weight.tensor) == self.mesh.axis_index("fsdp")
+
+    def test_shard_preserves_dtype(self):
+        """``fully_shard`` does not change the parameter dtype (bf16 stays bf16)."""
+        linear = LinearLayer(64, 128, has_bias=True)
+        weight_dtype_before = linear.weight.tensor.get_value().dtype
+        bias_dtype_before = linear.bias.tensor.get_value().dtype
+
+        ttml.fsdp.fully_shard(linear)
+
+        assert linear.weight.tensor.get_value().dtype == weight_dtype_before
+        assert linear.bias.tensor.get_value().dtype == bias_dtype_before
+
+    def test_shard_gather_matches_original(self):
+        """Set known random weights, shard, gather across mesh, compare to source.
+
+        The gather is bit-exact against the bf16-quantised pre-shard
+        snapshot: FSDP's shard step is a redistribute through host, so it
+        must not perturb values, only their layout.
+        """
+        in_features, out_features = 64, 128
+        linear = LinearLayer(in_features, out_features, has_bias=True)
+
+        rng = np.random.default_rng(0)
+        weight_np = rng.standard_normal((1, 1, out_features, in_features)).astype(np.float32) * 0.1
+        bias_np = rng.standard_normal((1, 1, 1, out_features)).astype(np.float32) * 0.1
+        _set_param_replicated(linear.weight.tensor, weight_np)
+        _set_param_replicated(linear.bias.tensor, bias_np)
+
+        # Snapshot the bf16-quantised baseline AFTER set_value, so the
+        # comparison below isn't fighting bf16 rounding from the
+        # fp32 -> bf16 host -> device hop.
+        weight_bf16 = _read_replicated_to_numpy(linear.weight.tensor, self.mesh)
+        bias_bf16 = _read_replicated_to_numpy(linear.bias.tensor, self.mesh)
+
+        ttml.fsdp.fully_shard(linear)
+
+        weight_shard_dim = int(linear.weight.tensor._fsdp_shard_dim)
+        bias_shard_dim = int(linear.bias.tensor._fsdp_shard_dim)
+        gathered_w = _read_fsdp_sharded_to_numpy(linear.weight.tensor, self.mesh, weight_shard_dim)
+        gathered_b = _read_fsdp_sharded_to_numpy(linear.bias.tensor, self.mesh, bias_shard_dim)
+
+        assert gathered_w.shape == weight_bf16.shape
+        assert gathered_b.shape == bias_bf16.shape
+        np.testing.assert_array_equal(gathered_w, weight_bf16)
+        np.testing.assert_array_equal(gathered_b, bias_bf16)
+
+    def test_shard_unshard_round_trip_preserves_values(self):
+        """``shard -> unshard`` returns the parameter to its full shape and values."""
+        in_features, out_features = 64, 128
+        linear = LinearLayer(in_features, out_features, has_bias=True)
+
+        rng = np.random.default_rng(123)
+        weight_np = rng.standard_normal((1, 1, out_features, in_features)).astype(np.float32) * 0.1
+        _set_param_replicated(linear.weight.tensor, weight_np)
+        weight_before = _read_replicated_to_numpy(linear.weight.tensor, self.mesh)
+        dtype_before = linear.weight.tensor.get_value().dtype
+
+        ttml.fsdp.fully_shard(linear)
+        assert linear.weight.tensor.shape() == [1, 1, out_features // self.axis_size, in_features]
+
+        linear.unshard()
+        assert linear.weight.tensor.shape() == [1, 1, out_features, in_features]
+        assert linear.weight.tensor.get_value().dtype == dtype_before
+        weight_after = _read_replicated_to_numpy(linear.weight.tensor, self.mesh)
+        np.testing.assert_array_equal(weight_before, weight_after)
+
+    def test_double_wrap_raises(self, expect_error):
+        """Calling ``fully_shard`` twice on the same module raises."""
+        linear = LinearLayer(64, 128, has_bias=False)
+        ttml.fsdp.fully_shard(linear)
+        with expect_error(RuntimeError, "already wrapped with fully_shard"):
+            ttml.fsdp.fully_shard(linear)
+
+    def test_replicate_patterns_keep_params_replicated(self):
+        """Params matching ``replicate`` are left unsharded."""
+        linear = LinearLayer(64, 48, has_bias=True)
+        ttml.fsdp.fully_shard(linear, replicate=["bias"])
+
+        assert linear.bias.tensor.shape() == [1, 1, 1, 48]
+        assert not ttml.fsdp.is_fsdp_managed(linear.bias.tensor)
+        assert ttml.fsdp.is_fsdp_managed(linear.weight.tensor)
+        assert ttml.fsdp.replicated_parameters(linear) == {"bias": ["bias"]}
+        assert ttml.fsdp.unmatched_replicate_patterns(linear, ["bias", "no_such_param"]) == ["no_such_param"]
+
+    def test_replicate_keeps_a_lazy_param_replicated(self):
+        """A lazy param built without a mapper has no placements yet; it is replicated, so the pattern holds."""
+        with ttml.lazy_init():
+            linear = LinearLayer(64, 48, has_bias=True)
+        ttml.fsdp.fully_shard(linear, replicate=["bias"])
+        ttml.materialize_module(linear)
+
+        assert linear.bias.tensor.shape() == [1, 1, 1, 48]
+        assert not ttml.fsdp.is_fsdp_managed(linear.bias.tensor)
+        assert ttml.fsdp.is_fsdp_managed(linear.weight.tensor)
+        assert ttml.fsdp.replicated_parameters(linear) == {"bias": ["bias"]}
+
+    def test_unmatched_patterns_empty_without_fully_shard(self):
+        """If nothing was wrapped, no pattern was applied, so none is reported."""
+        linear = LinearLayer(64, 48, has_bias=True)
+        assert ttml.fsdp.unmatched_replicate_patterns(linear, ["no_such_param"]) == []
+
+    def test_replicate_rejects_a_bare_string(self, expect_error):
+        linear = LinearLayer(64, 48, has_bias=True)
+        with expect_error(TypeError, "replicate must be a list of regex patterns"):
+            ttml.fsdp.fully_shard(linear, replicate="bias")
+
+    def test_replicate_rejects_an_invalid_regex(self, expect_error):
+        linear = LinearLayer(64, 48, has_bias=True)
+        with expect_error(ValueError, "invalid pattern"):
+            ttml.fsdp.fully_shard(linear, replicate=["bias("])
+        assert not hasattr(linear, "_fsdp_state"), "a rejected pattern must not leave the module half-wrapped"
+
+    def test_replicate_matches_any_alias_of_a_tied_param(self):
+        """A pattern naming the second alias of a tied weight still keeps it replicated."""
+        model = _TiedPair(64)
+        ttml.fsdp.fully_shard(model, replicate=[r"^fc2\.weight$"])
+
+        assert model.fc1.weight is model.fc2.weight
+        assert model.fc1.weight.tensor.shape() == [1, 1, 64, 64]
+        assert not ttml.fsdp.is_fsdp_managed(model.fc1.weight.tensor)
+        assert ttml.fsdp.replicated_parameters(model) == {"fc1.weight": [r"^fc2\.weight$"]}
+
+    def test_outer_wrapper_skips_a_tied_param_an_inner_wrapper_replicated(self):
+        """The root sees the tied weight through ``fc2`` but must not shard what ``fc1``'s wrapper replicated."""
+        model = _TiedPair(64)
+        ttml.fsdp.fully_shard(model.fc1, replicate=["weight"])
+        ttml.fsdp.fully_shard(model)
+
+        assert model.fc2.weight.tensor.shape() == [1, 1, 64, 64]
+        assert not ttml.fsdp.is_fsdp_managed(model.fc2.weight.tensor)
+        assert ttml.fsdp.replicated_parameters(model) == {"fc1.weight": ["weight"]}
+
+    def test_replicate_rejects_a_param_already_sharded_on_the_axis(self, expect_error):
+        """A param already sharded on the FSDP axis can't be reported as replicated."""
+        linear = LinearLayer(64, 128, has_bias=False)
+        data = np.zeros(tuple(linear.weight.tensor.shape()), dtype=np.float32)
+        sharded = ttml.autograd.Tensor.from_numpy(
+            data, ttnn.Layout.TILE, ttnn.DataType.BFLOAT16, self.mesh.axis_mapper("fsdp", tdim=2)
+        )
+        linear.weight.tensor.set_value(sharded.get_value())
+        with expect_error(RuntimeError, "already sharded on mesh axis 'fsdp'"):
+            ttml.fsdp.fully_shard(linear, replicate=["weight"])
+
+    def test_invalid_axis_raises(self, expect_error):
+        """Sharding on an axis the mesh doesn't have raises before any state change."""
+        linear = LinearLayer(64, 128, has_bias=False)
+        with expect_error(RuntimeError, "Mesh has no axis named"):
+            ttml.fsdp.fully_shard(linear, mesh_axis="this_axis_does_not_exist")
+
+    def test_prefers_tile_aligned_shard_dim(self):
+        """``[1,1,24k,32k]`` over ``k``: rows would split into 24 (sub-tile), so columns (32) are sharded."""
+        in_features, out_features = 32 * self.axis_size, 24 * self.axis_size
+        linear = LinearLayer(in_features, out_features, has_bias=False)
+        ttml.fsdp.fully_shard(linear)
+
+        assert linear.weight.tensor.shape() == [1, 1, out_features, 32]
+        assert linear.weight.tensor._fsdp_shard_dim == 3
+
+    def test_warns_once_per_shape_when_no_dim_is_tile_aligned(self, monkeypatch):
+        """Bias ``[1,1,1,24k]`` has no aligned dim: still sharded, warned once per shape."""
+        monkeypatch.setattr(ttml.fsdp, "_warned_misaligned", set())
+        in_features, out_features = 32 * self.axis_size, 24 * self.axis_size
+        first = LinearLayer(in_features, out_features, has_bias=True)
+        second = LinearLayer(in_features, out_features, has_bias=True)
+        with pytest.warns(UserWarning, match="composite path") as record:
+            ttml.fsdp.fully_shard(first)
+            ttml.fsdp.fully_shard(second)
+
+        assert sum("composite path" in str(w.message) for w in record) == 1
+        for linear in (first, second):
+            assert ttml.fsdp.is_fsdp_managed(linear.bias.tensor)
+            assert linear.bias.tensor.shape() == [1, 1, 1, 24]
+
+
+# ---------------------------------------------------------------------------
+# Root-wrapping semantics
+# ---------------------------------------------------------------------------
+
+
+class TestFullyShardRoot:
+    """``fully_shard`` on a multi-block model in FSDP2-root style."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, fsdp_mesh):
+        self.mesh = fsdp_mesh
+        ttml.autograd.AutoContext.get_instance().set_seed(7)
+        np.random.seed(7)
+
+    def test_root_wrapper_excludes_block_params(self):
+        """Per-block wrappers manage their own params; the root manages only ``head``."""
+        model = _TinyModel(64, 128, 64, num_blocks=2)
+
+        for blk in model.blocks:
+            ttml.fsdp.fully_shard(blk)
+        ttml.fsdp.fully_shard(model)
+
+        # Every block's parameters are FSDP-managed (by the block wrapper).
+        for blk in model.blocks:
+            assert ttml.fsdp.is_fsdp_managed(blk.fc1.weight.tensor)
+            assert ttml.fsdp.is_fsdp_managed(blk.fc1.bias.tensor)
+            assert ttml.fsdp.is_fsdp_managed(blk.fc2.weight.tensor)
+            assert ttml.fsdp.is_fsdp_managed(blk.fc2.bias.tensor)
+
+        # The head, owned only by the root, is FSDP-managed too.
+        assert ttml.fsdp.is_fsdp_managed(model.head.weight.tensor)
+
+
+# ---------------------------------------------------------------------------
+# Forward / backward equivalence vs replicated reference
+# ---------------------------------------------------------------------------
+
+
+class TestFSDPEquivalence:
+    """Equivalence vs a replicated (non-FSDP) reference run.
+
+    Both runs use the *same* multi-device mesh and the *same* replicated
+    input on every device, so for the reference the forward output and
+    every parameter's grad are identical on every rank — which means we
+    can compare a single device's view to the full FSDP gather.
+
+    With identical replicated inputs the reduce-scatter mean inside
+    ``backward_post`` collapses to the per-device full grad sliced to
+    the local shard, so the gathered FSDP grad equals the full reference
+    grad.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, fsdp_mesh):
+        self.mesh = fsdp_mesh
+        ttml.autograd.AutoContext.get_instance().set_seed(0)
+        np.random.seed(0)
+
+    @staticmethod
+    def _make_input(batch_size: int, seq_len: int, features: int, *, seed: int = 0) -> np.ndarray:
+        rng = np.random.default_rng(seed)
+        return rng.standard_normal((batch_size, 1, seq_len, features)).astype(np.float32) * 0.1
+
+    @pytest.mark.parametrize("replicate", [(), ("fc1.bias",)], ids=["sharded", "bias_replicated"])
+    @pytest.mark.parametrize("hidden", [128, 48], ids=["tile_aligned", "misaligned"])
+    def test_forward_matches_reference(self, replicate, hidden):
+        """FSDP forward output ≈ replicated-reference forward output."""
+        in_features, out_features = 64, 64
+        batch_size, seq_len = 2, 32
+        input_np = self._make_input(batch_size, seq_len, in_features, seed=0)
+        mapper = _replicated_mapper()
+
+        # ---- Reference: replicated model, no fully_shard.
+        ref_model = _build_block_with_known_weights(in_features, hidden, out_features, seed=42)
+        ref_model.eval()
+        x_ref = ttml.autograd.Tensor.from_numpy(input_np, ttnn.Layout.TILE, ttnn.DataType.BFLOAT16, mapper)
+        out_ref = ref_model(x_ref)
+        out_ref_np = _read_replicated_to_numpy(out_ref, self.mesh)
+        ttml.autograd.AutoContext.get_instance().reset_graph()
+
+        # ---- FSDP: same initial weights, fully_shard, same input.
+        fsdp_model = _build_block_with_known_weights(in_features, hidden, out_features, seed=42)
+        fsdp_model.eval()
+        ttml.fsdp.fully_shard(fsdp_model, replicate=replicate)
+        x_fsdp = ttml.autograd.Tensor.from_numpy(input_np, ttnn.Layout.TILE, ttnn.DataType.BFLOAT16, mapper)
+        out_fsdp = fsdp_model(x_fsdp)
+        out_fsdp_np = _read_replicated_to_numpy(out_fsdp, self.mesh)
+        ttml.autograd.AutoContext.get_instance().reset_graph()
+
+        assert out_fsdp_np.shape == out_ref_np.shape
+        np.testing.assert_array_equal(out_fsdp_np, out_ref_np)
+
+    @pytest.mark.parametrize("replicate", [(), ("fc1.bias",)], ids=["sharded", "bias_replicated"])
+    @pytest.mark.parametrize("hidden", [128, 48], ids=["tile_aligned", "misaligned"])
+    def test_backward_matches_reference(self, replicate, hidden):
+        """FSDP gathered gradients ≈ replicated-reference gradients (``hidden=48`` shards ``fc1.bias`` sub-tile)."""
+        in_features, out_features = 64, 64
+        batch_size, seq_len = 2, 32
+        input_np = self._make_input(batch_size, seq_len, in_features, seed=1)
+        mapper = _replicated_mapper()
+
+        # ---- Reference backward
+        ref_model = _build_block_with_known_weights(in_features, hidden, out_features, seed=42)
+        ref_model.train()
+        x_ref = ttml.autograd.Tensor.from_numpy(input_np, ttnn.Layout.TILE, ttnn.DataType.BFLOAT16, mapper)
+        out_ref = ref_model(x_ref)
+        loss_ref = ttml.ops.unary.mean(out_ref)
+        loss_ref.backward(False)
+
+        ref_grads: Dict[str, np.ndarray] = {}
+        for name, t in ref_model.named_parameters():
+            if not t.is_grad_initialized():
+                continue
+            grad_t = t.get_grad_tensor()
+            ref_grads[name] = _read_replicated_to_numpy(grad_t, self.mesh)
+        ttml.autograd.AutoContext.get_instance().reset_graph()
+
+        assert ref_grads, "Reference run should have produced gradients for at least one parameter"
+
+        # ---- FSDP backward
+        fsdp_model = _build_block_with_known_weights(in_features, hidden, out_features, seed=42)
+        fsdp_model.train()
+        ttml.fsdp.fully_shard(fsdp_model, replicate=replicate)
+        x_fsdp = ttml.autograd.Tensor.from_numpy(input_np, ttnn.Layout.TILE, ttnn.DataType.BFLOAT16, mapper)
+        out_fsdp = fsdp_model(x_fsdp)
+        loss_fsdp = ttml.ops.unary.mean(out_fsdp)
+        loss_fsdp.backward(False)
+
+        fsdp_grads: Dict[str, np.ndarray] = {}
+        unmanaged: List[str] = []
+        for name, t in fsdp_model.named_parameters():
+            if not t.is_grad_initialized():
+                continue
+            grad_t = t.get_grad_tensor()
+            if ttml.fsdp.is_fsdp_managed(t):
+                fsdp_grads[name] = _read_fsdp_sharded_to_numpy(grad_t, self.mesh, int(t._fsdp_shard_dim))
+            else:
+                # Replicated: every rank got the same input, so the grads already match.
+                unmanaged.append(name)
+                fsdp_grads[name] = _read_replicated_to_numpy(grad_t, self.mesh)
+        ttml.autograd.AutoContext.get_instance().reset_graph()
+
+        # Exactly the params named by ``replicate`` stayed replicated; everything else was sharded.
+        assert ttml.fsdp.replicated_parameters(fsdp_model) == {p: [p] for p in replicate}
+        assert len(unmanaged) == len(replicate), f"unexpectedly unsharded: {unmanaged}"
+
+        assert set(fsdp_grads.keys()) == set(
+            ref_grads.keys()
+        ), f"FSDP grad keys {sorted(fsdp_grads)} != reference keys {sorted(ref_grads)}"
+        for name in ref_grads:
+            assert fsdp_grads[name].shape == ref_grads[name].shape, (
+                f"Grad shape mismatch for {name}: "
+                f"FSDP gathered {fsdp_grads[name].shape} vs reference {ref_grads[name].shape}"
+            )
+            np.testing.assert_array_equal(fsdp_grads[name], ref_grads[name])
+
+    def test_sync_gradients_averages_replicated_grads(self):
+        """With a different batch slice on each rank, ``sync_gradients`` averages a replicated grad."""
+        in_features, hidden, out_features = 64, 128, 64
+        batch_size, seq_len = 2 * self.mesh.axis_size("fsdp"), 32
+        input_np = self._make_input(batch_size, seq_len, in_features, seed=2)
+
+        # ---- Reference: full batch on every device.
+        ref_model = _build_block_with_known_weights(in_features, hidden, out_features, seed=42)
+        ref_model.train()
+        x_ref = ttml.autograd.Tensor.from_numpy(
+            input_np, ttnn.Layout.TILE, ttnn.DataType.BFLOAT16, _replicated_mapper()
+        )
+        ttml.ops.unary.mean(ref_model(x_ref)).backward(False)
+        ref_grad = _read_replicated_to_numpy(ref_model.fc1.weight.tensor.get_grad_tensor(), self.mesh)
+        ttml.autograd.AutoContext.get_instance().reset_graph()
+
+        # ---- FSDP with fc1.weight replicated, batch sharded over the fsdp axis.
+        fsdp_model = _build_block_with_known_weights(in_features, hidden, out_features, seed=42)
+        fsdp_model.train()
+        ttml.fsdp.fully_shard(fsdp_model, replicate=["fc1.weight"])
+        x_fsdp = ttml.autograd.Tensor.from_numpy(
+            input_np, ttnn.Layout.TILE, ttnn.DataType.BFLOAT16, self.mesh.axis_mapper("fsdp", tdim=0)
+        )
+        ttml.ops.unary.mean(fsdp_model(x_fsdp)).backward(False)
+        weight = fsdp_model.fc1.weight.tensor
+        local_grad = _read_replicated_to_numpy(weight.get_grad_tensor(), self.mesh)  # rank 0's slice only
+        ttml.sync_gradients(fsdp_model.parameters(), axis_names=("fsdp",))
+        synced_grad = _read_replicated_to_numpy(weight.get_grad_tensor(), self.mesh)
+        ttml.autograd.AutoContext.get_instance().reset_graph()
+
+        tol = {"rtol": 1e-2, "atol": 1e-2 * float(np.abs(ref_grad).max())}
+        assert not np.allclose(local_grad, ref_grad, **tol), "each rank should start with its own slice's grad"
+        np.testing.assert_allclose(synced_grad, ref_grad, **tol)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

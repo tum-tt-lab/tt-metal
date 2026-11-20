@@ -1,0 +1,295 @@
+# SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+# SPDX-License-Identifier: Apache-2.0
+
+from typing import List
+
+import pytest
+from helpers.data_format_inference import unpacks_to_dest
+from helpers.format_config import DataFormat, FormatConfig, InputOutputFormat
+from helpers.golden_generators import UntilizeGolden, get_golden_generator
+from helpers.llk_params import (
+    DestAccumulation,
+    PerfRunType,
+)
+from helpers.param_config import (
+    flat_axes,
+    generate_perf_input_dimensions,
+    generate_unary_input_dimensions,
+    input_output_formats,
+    parametrize,
+    quasar_dest_sync_modes,
+    select_perf_tile_sizes,
+)
+from helpers.perf.core import create_test_or_perf_config
+from helpers.stimuli_config import StimuliConfig
+from helpers.stimuli_generator import StimuliSpec, generate_stimuli
+from helpers.test_variant_parameters import (
+    DEST_SYNC,
+    LOOP_FACTOR,
+    NUM_FACES,
+    NUM_FACES_C_DIM,
+    NUM_FACES_R_DIM,
+    TEST_FACE_DIMS,
+    TILE_COUNT,
+    UNPACKER_ENGINE_SEL,
+    generate_input_dim,
+)
+from helpers.tile_constants import (
+    MX_SUPPORTED_TILE_SIZES,
+    is_mx_unsupported_tile_dims,
+)
+from helpers.tile_shape import construct_tile_shape
+from helpers.utils import passed_test, result_tensor
+
+PACK_UNTILIZE_TILE_SIZES = [
+    (32, 32),
+    (1, 32),
+    (2, 32),
+]
+
+
+def pack_untilize_perf_input_dimensions(dest_acc, dest_sync, tile_shape):
+    return generate_perf_input_dimensions(
+        dest_acc, dest_sync, tile_shape, use_largest_fallback=True
+    )
+
+
+def generate_pack_untilize_combinations(
+    formats_list: List[FormatConfig],
+    *,
+    is_perf=False,
+):
+    """
+    Generate pack_untilize combinations.
+
+    Args:
+        formats_list: List of input-output format pairs
+        is_perf: Restrict combinations to performance-test dimensions, tile
+            sizes, and destination synchronization modes.
+
+    Returns: List of (format, dest_acc, dest_sync, input_dimensions, tile_dimensions) tuples
+    """
+
+    def is_supported_format_conversion(in_fmt, out_fmt):
+        # Skip if mixing integer and non-integer formats
+        if in_fmt.is_integer() ^ out_fmt.is_integer():
+            return False
+        # If input format is Int16, output format must also be Int16, and vice versa
+        if (in_fmt == DataFormat.Int16) ^ (out_fmt == DataFormat.Int16):
+            return False
+        return True
+
+    def get_dest_acc_modes(in_fmt):
+        # Int16 requires 16bit mode dest register
+        if in_fmt == DataFormat.Int16:
+            return (DestAccumulation.No,)
+        # Int32, Float32 (unpack_to_dest) requires 32bit mode dest register
+        if in_fmt.is_32_bit():
+            return (DestAccumulation.Yes,)
+        return (DestAccumulation.No, DestAccumulation.Yes)
+
+    dest_sync_modes = quasar_dest_sync_modes(is_perf=is_perf)
+    combinations = []
+    for fmt in formats_list:
+        in_fmt, out_fmt = fmt.input_format, fmt.output_format
+
+        if not is_supported_format_conversion(in_fmt, out_fmt):
+            continue
+
+        # MX as output format produces flaky results on Quasar.
+        if out_fmt.is_mx_format():
+            continue
+
+        for dest_acc in get_dest_acc_modes(in_fmt):
+            for dest_sync in dest_sync_modes:
+                tile_sizes = (
+                    select_perf_tile_sizes(PACK_UNTILIZE_TILE_SIZES)
+                    if is_perf
+                    else PACK_UNTILIZE_TILE_SIZES
+                )
+                for tile_dims in tile_sizes:
+                    if is_mx_unsupported_tile_dims(in_fmt, out_fmt, tile_dims):
+                        continue
+                    if (
+                        unpacks_to_dest(in_fmt, dest_acc)
+                        and tile_dims not in MX_SUPPORTED_TILE_SIZES
+                    ):
+                        continue
+                    tile_shape = construct_tile_shape(tile_dims)
+                    dimensions_list = (
+                        pack_untilize_perf_input_dimensions(
+                            dest_acc, dest_sync, tile_shape
+                        )
+                        if is_perf
+                        else generate_unary_input_dimensions(
+                            dest_acc, dest_sync=dest_sync, tile_shape=tile_shape
+                        )
+                    )
+                    for dimensions in dimensions_list:
+                        combinations.append(
+                            (
+                                fmt,
+                                dest_acc,
+                                dest_sync,
+                                dimensions,
+                                tile_dims,
+                            )
+                        )
+
+    return combinations
+
+
+PACK_UNTILIZE_FORMATS = input_output_formats(
+    [
+        DataFormat.Float16_b,
+        DataFormat.Int16,
+        DataFormat.Int32,
+        DataFormat.MxFp4,
+        DataFormat.MxInt8,
+        DataFormat.MxInt4,
+        DataFormat.MxInt2,
+    ],
+)
+# Column names of the tuples ``generate_pack_untilize_combinations`` returns.
+PACK_UNTILIZE_FLAT_NAMES = (
+    "formats",
+    "dest_acc",
+    "dest_sync",
+    "input_dimensions",
+    "tile_dimensions",
+)
+ALL_PACK_UNTILIZE_COMBINATIONS = generate_pack_untilize_combinations(
+    PACK_UNTILIZE_FORMATS
+)
+PERF_PACK_UNTILIZE_COMBINATIONS = generate_pack_untilize_combinations(
+    PACK_UNTILIZE_FORMATS,
+    is_perf=True,
+)
+# Float32 unpacks straight to a 32-bit Dest, then packs untilized to Float32 or Float16_b.
+PACK_UNTILIZE_FLOAT32_COMBINATIONS = generate_pack_untilize_combinations(
+    [
+        InputOutputFormat(DataFormat.Float32, DataFormat.Float32),
+        InputOutputFormat(DataFormat.Float32, DataFormat.Float16_b),
+    ]
+)
+
+
+@pytest.mark.quasar
+@parametrize(
+    **flat_axes(PACK_UNTILIZE_FLAT_NAMES, ALL_PACK_UNTILIZE_COMBINATIONS),
+    run_types=[[PerfRunType.L1_TO_L1]],
+    loop_factor=[1],
+)
+def test_pack_untilize_quasar(
+    formats,
+    dest_acc,
+    dest_sync,
+    input_dimensions,
+    tile_dimensions,
+    run_types,
+    loop_factor,
+    *,
+    is_perf=False,
+    perf_report=None,
+):
+    tile_shape = construct_tile_shape(tile_dimensions)
+
+    sequential_spec = StimuliSpec.sequential()
+    src_A, tile_cnt_A, src_B, _ = generate_stimuli(
+        stimuli_format_A=formats.input_format,
+        input_dimensions_A=input_dimensions,
+        stimuli_format_B=formats.input_format,
+        input_dimensions_B=input_dimensions,
+        tile_dimensions=tile_dimensions,
+        spec_A=sequential_spec,
+        spec_B=sequential_spec,
+    )
+
+    generate_golden = get_golden_generator(UntilizeGolden)
+    if not is_perf:
+        golden_tensor = generate_golden(
+            src_A,
+            formats.output_format,
+            input_dimensions,
+            input_format=formats.input_format,
+            tile_dimensions=tile_dimensions,
+        )
+
+    num_faces = tile_shape.total_num_faces()
+
+    if is_perf and perf_report is None:
+        raise ValueError("perf_report must be provided when is_perf=True")
+
+    test_config_kwargs = {
+        "test_name": "sources/quasar/pack_untilize_quasar_test.cpp",
+        "formats": formats,
+        "templates": [
+            generate_input_dim(
+                input_dimensions, input_dimensions, tile_dimensions=tile_dimensions
+            ),
+            DEST_SYNC(dest_sync),
+            UNPACKER_ENGINE_SEL(),
+        ],
+        "runtimes": [
+            TEST_FACE_DIMS(tile_shape.face_r_dim),
+            NUM_FACES(num_faces),
+            TILE_COUNT(tile_cnt_A),
+            LOOP_FACTOR(loop_factor),
+            NUM_FACES_R_DIM(tile_shape.num_faces_r_dim),
+            NUM_FACES_C_DIM(tile_shape.num_faces_c_dim),
+        ],
+        "variant_stimuli": StimuliConfig(
+            src_A,
+            formats.input_format,
+            src_B,
+            formats.input_format,
+            formats.output_format,
+            tile_count_A=tile_cnt_A,
+            tile_count_B=tile_cnt_A,
+            tile_count_res=tile_cnt_A,
+            num_faces=num_faces,
+            face_r_dim=tile_shape.face_r_dim,
+            tile_dimensions=tile_dimensions,
+            use_dense_tile_dimensions=True,
+        ),
+        "unpack_to_dest": unpacks_to_dest(formats.input_format, dest_acc),
+        "dest_acc": dest_acc,
+    }
+
+    configuration = create_test_or_perf_config(
+        is_perf=is_perf,
+        run_types=run_types,
+        test_config_kwargs=test_config_kwargs,
+    )
+    if is_perf:
+        configuration.run(perf_report)
+        return
+
+    res_from_L1 = configuration.run().result
+
+    res_tensor = result_tensor(res_from_L1, formats.output_format, golden_tensor)
+
+    assert passed_test(
+        golden_tensor,
+        res_tensor,
+        formats.output_format,
+        tile_shape=tile_shape,
+    ), "Assert against golden failed"
+
+
+@pytest.mark.quasar
+@parametrize(
+    **flat_axes(PACK_UNTILIZE_FLAT_NAMES, PACK_UNTILIZE_FLOAT32_COMBINATIONS),
+)
+def test_pack_untilize_float32_quasar(
+    formats, dest_acc, dest_sync, input_dimensions, tile_dimensions
+):
+    test_pack_untilize_quasar(
+        formats,
+        dest_acc,
+        dest_sync,
+        input_dimensions,
+        tile_dimensions,
+        [PerfRunType.L1_TO_L1],
+        1,
+    )

@@ -1,0 +1,165 @@
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include "accumulation_device_operation.hpp"
+#include "ttnn/operations/reduction/reduce_op_validation.hpp"
+#include "ttnn/tensor/tensor_ops.hpp"
+#include "ttnn/device_operation.hpp"
+#include <enchantum/enchantum.hpp>
+#include "ttnn/tensor/tensor.hpp"
+
+namespace ttnn::prim {
+
+using namespace tt::tt_metal;
+void AccumulationDeviceOperation::validate_on_program_cache_miss(
+    const operation_attributes_t& attributes, const tensor_args_t& tensor_args) {
+    const auto& input_tensor{tensor_args.input_tensor};
+    const auto& input_shape{input_tensor.logical_shape()};
+    const auto& optional_out{tensor_args.opt_output};
+    auto out_memory_config{optional_out.has_value() ? optional_out->memory_config() : attributes.output_memory_config};
+
+    if (optional_out.has_value()) {
+        const auto& preallocated_output_shape = optional_out.value().logical_shape();
+        TT_FATAL(
+            input_shape == preallocated_output_shape,
+            "The shapes of the input and the preallocated tensors are not equal.\n"
+            "Input tensor's shape: {}\n"
+            "Preallocated tensor's shape: {}",
+            input_shape,
+            preallocated_output_shape);
+    }
+
+    TT_FATAL(
+        input_tensor.storage_type() == StorageType::DEVICE,
+        "ttnn accumulation operations (cumprod, cumsum) require input to be on a Tenstorrent device. "
+        "The input tensor is stored on {}.",
+        enchantum::to_string(input_tensor.storage_type()));
+
+    TT_FATAL(
+        input_tensor.is_allocated(),
+        "ttnn accumulation operations (cumprod, cumsum) require to be allocated in buffers on the device. "
+        "The buffer is null.");
+
+    TT_FATAL(
+        !input_tensor.is_sharded(),
+        "ttnn accumulation operations (cumprod, cumsum) do not support sharded input tensors.");
+
+    TT_FATAL(
+        input_tensor.layout() == Layout::TILE,
+        "The provided input tensor has a non-tile layout: {}.",
+        enchantum::to_string(input_tensor.layout()));
+
+    TT_FATAL(
+        input_tensor.memory_config().memory_layout() == TensorMemoryLayout::INTERLEAVED,
+        "ttnn accumulation operations (cumprod, cumsum) require the memory layout of the input tensor to be "
+        "interleaved. Instead, it is {}.",
+        enchantum::to_string(input_tensor.memory_config().memory_layout()));
+    ReduceOpDeviceGridValidationOptions acc_grid_opts;
+    acc_grid_opts.shard_grid_contained_in_device_grid = &out_memory_config;
+    acc_grid_opts.memory_config_label = "output";
+    validate_reduce_op_tensor(
+        input_tensor, "Accumulation", "output", &acc_grid_opts, compute_output_specs(attributes, tensor_args));
+    if (optional_out.has_value()) {
+        validate_reduce_op_tensor(optional_out.value(), "Accumulation", "preallocated_output");
+    }
+
+    {
+        const int32_t logical_rank = input_tensor.logical_shape().rank();
+        // Normalize the way the program factory does, so both checks see the dim it will actually use.
+        const int32_t acc_dim = (attributes.dim < 0) ? (attributes.dim + logical_rank) : attributes.dim;
+        TT_FATAL(
+            acc_dim >= 0 && acc_dim < logical_rank,
+            "Accumulation dim {} is out of range for logical rank {}",
+            attributes.dim,
+            logical_rank);
+        // The host permutes any other scan along a tile axis to dim 0 before reaching the device.
+        TT_FATAL(
+            acc_dim < logical_rank - 2 ||
+                is_tile_axis_accumulation(input_tensor, acc_dim, attributes.dtype, attributes.flip, attributes.op),
+            "Accumulation along tile axis {} of a rank-{} tensor is only supported for forward bf16/fp32 cumsum "
+            "and cumprod on 32x32 tiles (only bf16 cumsum on Quasar)",
+            acc_dim,
+            logical_rank);
+    }
+}
+
+bool is_tile_axis_accumulation(
+    const Tensor& input_tensor, int32_t dim, DataType output_dtype, bool flip, AccumulationOp op) {
+    const int32_t rank = input_tensor.logical_shape().rank();
+    if (rank < 2 || (dim != rank - 1 && dim != rank - 2)) {
+        return false;
+    }
+    const auto& tile = input_tensor.tensor_spec().tile();
+    // cumsum_tile and cumprod_tile only scan floats, and only forward.
+    if (flip || input_tensor.layout() != Layout::TILE || input_tensor.dtype() != output_dtype ||
+        tile.get_height() != tt::constants::TILE_HEIGHT || tile.get_width() != tt::constants::TILE_WIDTH) {
+        return false;
+    }
+    // cumprod_tile and the compensated cumsum scan have no Quasar port.
+    // preprocess_input_tensor also calls this on host tensors, which have no device.
+    const bool not_quasar = input_tensor.device() != nullptr && input_tensor.device()->arch() != tt::ARCH::QUASAR;
+    switch (op) {
+        case AccumulationOp::CUMSUM:
+            return output_dtype == DataType::BFLOAT16 || (output_dtype == DataType::FLOAT32 && not_quasar);
+        case AccumulationOp::CUMPROD:
+            return (output_dtype == DataType::BFLOAT16 || output_dtype == DataType::FLOAT32) && not_quasar;
+    }
+    return false;
+}
+
+AccumulationDeviceOperation::spec_return_value_t AccumulationDeviceOperation::compute_output_specs(
+    const operation_attributes_t& attributes, const tensor_args_t& tensor_args) {
+    if (tensor_args.opt_output.has_value()) {
+        return tensor_args.opt_output->tensor_spec();
+    }
+
+    auto output_layout{Layout::TILE};
+    if (attributes.output_memory_config.is_sharded()) {
+        output_layout = tensor_args.input_tensor.layout();
+    }
+
+    const DataType dtype =
+        tensor_args.opt_output
+            ? tensor_args.opt_output->dtype()
+            : ((attributes.dtype == DataType::INVALID) ? tensor_args.input_tensor.dtype() : attributes.dtype);
+
+    const auto output_shape{tensor_args.input_tensor.logical_shape()};
+    return tt::tt_metal::TensorSpec{output_shape, TensorLayout{dtype, output_layout, attributes.output_memory_config}};
+}
+
+AccumulationDeviceOperation::tensor_return_value_t AccumulationDeviceOperation::create_output_tensors(
+    const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
+    if (tensor_args.opt_output.has_value()) {
+        // a copy of a Python object (referencing to the same tensor though) is returned here
+        return *tensor_args.opt_output;
+    }
+    return create_device_tensor(
+        compute_output_specs(operation_attributes, tensor_args), tensor_args.input_tensor.device());
+}
+
+ttnn::Tensor accumulation(
+    const Tensor& input_tensor,
+    const int32_t& dim,
+    const std::optional<DataType>& dtype,
+    const bool& reverse_order,
+    std::optional<Tensor> optional_out,
+    const std::optional<MemoryConfig>& memory_config,
+    AccumulationOp op,
+    bool disable_compensation) {
+    using OperationType = AccumulationDeviceOperation;
+    return ttnn::device_operation::launch<OperationType>(
+        OperationType::operation_attributes_t{
+            (dim < 0) ? (dim + input_tensor.logical_shape().rank()) : dim,
+            dtype.has_value() ? dtype.value()
+                              : (optional_out.has_value() ? optional_out->dtype() : input_tensor.dtype()),
+            memory_config.has_value()
+                ? *memory_config
+                : (optional_out.has_value() ? optional_out->memory_config() : input_tensor.memory_config()),
+            reverse_order,
+            op,
+            disable_compensation},
+        OperationType::tensor_args_t{input_tensor, std::move(optional_out)});
+}
+
+}  // namespace ttnn::prim

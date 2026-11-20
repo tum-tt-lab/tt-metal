@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Usage:
+    check_noc_status.py
+
+Description:
+    This script checks if there are any mismatches between values of number of NOC transactions stored in global
+    variables from risc firmware and NOC status registers. These values should be in sync when the NoC is idle.
+
+Owner:
+    jbaumanTT
+"""
+
+from ttexalens.context import Context, NocId, to_noc_id
+from ttexalens.hardware.risc_debug import RiscDebug
+from ttexalens.memory_access import create_memory_access
+from ttexalens.tt_exalens_lib import read_register
+from dispatcher_data import run as get_dispatcher_data, DispatcherData
+from elfs_cache import run as get_elfs_cache, ElfsCache
+from run_checks import run as get_run_checks
+from triage import ScriptConfig, log_check_location, log_warning, run_script
+from ttexalens.umd_device import TimeoutDeviceRegisterError
+
+
+script_config = ScriptConfig(
+    depends=["run_checks", "dispatcher_data", "elfs_cache"],
+)
+
+
+def check_noc_status(
+    risc_debug: RiscDebug,
+    dispatcher_data: DispatcherData,
+    var_to_reg_map: dict[str, str],
+    elfs_cache: ElfsCache,
+    noc_id: NocId = NocId.NOC0,
+):
+    """
+    Checks for mismatches between variables and registers that store number of NOC transactions
+    and stores them in dictionary creating summary of checking process
+    """
+    risc_name = risc_debug.risc_location.risc_name
+    location = risc_debug.risc_location.location
+
+    dispatcher_core_data = dispatcher_data.get_cached_core_data(risc_debug.risc_location)
+
+    fw_elf_path = dispatcher_core_data.firmware_path
+    fw_elf = elfs_cache[fw_elf_path]
+    kernel_elf = None
+    if dispatcher_core_data.kernel_path is not None:
+        kernel_elf = elfs_cache[dispatcher_core_data.kernel_path]
+
+    message = f"{risc_name} {noc_id.name}: "
+    passed = True
+
+    loc_mem_access = create_memory_access(risc_debug)
+
+    # Skip check when operating in dynamic NOC mode.
+    # DM_DEDICATED_NOC is 0 as defined in dev firmware headers (see dev_msgs.h).
+    DM_DEDICATED_NOC = 0
+    noc_index: int | None = None
+    if risc_name == "brisc":
+        prev_noc_mode = fw_elf.get_global("prev_noc_mode", loc_mem_access).read_value()
+        if prev_noc_mode != DM_DEDICATED_NOC:
+            message += "    Skipping NOC status check: prev_noc_mode != DM_DEDICATED_NOC\n"
+            log_check_location(location, True, message)
+            return
+        noc_index = int(fw_elf.get_global("noc_index", loc_mem_access).read_value())
+    elif kernel_elf is not None:
+        # On erisc, the firmware doesn't necessarily select a NOC, so we need to check the kernel ELF.
+        noc_mode = kernel_elf.get_global("noc_mode", loc_mem_access).read_value()
+        if noc_mode != DM_DEDICATED_NOC:
+            message += "    Skipping NOC status check: noc_mode != DM_DEDICATED_NOC\n"
+            log_check_location(location, True, message)
+            return
+        noc_index = int(kernel_elf.get_global("noc_index", loc_mem_access).read_value())
+
+    # Validate the runtime-selected NOC and that it matches the NOC being checked.
+    if noc_index is not None:
+        try:
+            read_noc_id = to_noc_id(noc_index)
+        except:
+            log_check_location(
+                location,
+                False,
+                f"{message}Read invalid noc_index {noc_index} from core, expected 0 or 1. Value likely corrupted.",
+            )
+            return
+
+        if read_noc_id != noc_id:
+            return
+
+    # Check if variables match with corresponding register
+    for var in var_to_reg_map:
+        reg = var_to_reg_map[var]
+        # If reading fails, write error message and skip to next core
+        try:
+            reg_val = read_register(location=location, register=reg, noc_id=noc_id)
+            var_val = fw_elf.get_global(var, loc_mem_access)[noc_id.value]
+        except TimeoutDeviceRegisterError:
+            raise
+        except Exception as e:
+            message += "    " + str(e) + "\n"
+            passed = False
+            break
+
+        if reg_val != var_val:
+            # Store name of register and variable where mismatch occurred along side their values
+            message += f"    {reg} {var} {reg_val} {var_val}\n"
+            passed = False
+    if not passed:
+        message = (
+            "Mismatched state: \n"
+            + message
+            + "\nEither the device is not idle and is currently processing transactions, the kernel has incorrectly modified the NOC transaction counters, or the NoC is hung."
+        )
+
+    log_check_location(location, passed, message)
+
+
+def run(args, context: Context):
+    BLOCK_TYPES_TO_CHECK = ["tensix", "idle_eth"]
+    RISC_CORES_TO_CHECK = ["brisc", "erisc", "erisc0", "erisc1"]
+    # Dictionary of corresponding variables and registers to check
+    VAR_TO_REG_MAP = {
+        "noc_reads_num_issued": "NIU_MST_RD_RESP_RECEIVED",
+        "noc_nonposted_writes_num_issued": "NIU_MST_NONPOSTED_WR_REQ_SENT",
+        "noc_nonposted_writes_acked": "NIU_MST_WR_ACK_RECEIVED",
+        "noc_nonposted_atomics_acked": "NIU_MST_ATOMIC_RESP_RECEIVED",
+        "noc_posted_writes_num_issued": "NIU_MST_POSTED_WR_REQ_SENT",
+    }
+
+    dispatcher_data = get_dispatcher_data(args, context)
+    elfs_cache = get_elfs_cache(args, context)
+    run_checks = get_run_checks(args, context)
+    for noc_id in (NocId.NOC0, NocId.NOC1):
+        run_checks.run_per_core_check(
+            lambda risc_debug, _noc_id=noc_id: check_noc_status(
+                risc_debug, dispatcher_data, VAR_TO_REG_MAP, elfs_cache, _noc_id
+            ),
+            block_filter=BLOCK_TYPES_TO_CHECK,
+            core_filter=RISC_CORES_TO_CHECK,
+        )
+
+
+if __name__ == "__main__":
+    run_script()

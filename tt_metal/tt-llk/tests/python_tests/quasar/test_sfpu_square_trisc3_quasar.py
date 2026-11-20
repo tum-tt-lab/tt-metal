@@ -1,0 +1,178 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+SFPU square on TRISC3 (isolated). MATH does datacopy when !unpack_to_dest.
+
+Same structure and parameter coverage as test_sfpu_square_quasar but SFPU runs on TRISC3.
+"""
+
+import pytest
+import torch
+from helpers.golden_generators import UnarySFPUGolden, get_golden_generator
+from helpers.llk_params import (
+    DataCopyType,
+    DestSync,
+    MathOperation,
+    UnpackerEngine,
+)
+from helpers.param_config import (
+    QuasarSfpuVariant,
+    flat_axes,
+    generate_dest_depth_input_dimensions,
+    generate_quasar_sfpu_format_variants,
+    parametrize,
+    quasar_sfpu_fpu_route_variants,
+    runtime,
+)
+from helpers.stimuli_config import StimuliConfig
+from helpers.stimuli_generator import generate_stimuli
+from helpers.test_config import TestConfig
+from helpers.test_variant_parameters import (
+    DATA_COPY_TYPE,
+    DEST_INDEX,
+    DEST_SYNC,
+    MATH_OP,
+    NUM_FACES,
+    TEST_FACE_DIMS,
+    TILE_COUNT,
+    UNPACKER_ENGINE_SEL,
+)
+from helpers.tile_constants import MAX_NUM_FACES
+from helpers.utils import passed_test, result_tensor
+
+# Reuse the square input-prep and format list from the consolidated unary-SFPU
+# test (the standalone test_sfpu_square_quasar.py was folded into it).
+from test_eltwise_unary_sfpu_quasar import SFPU_UNARY_FORMATS as SFPU_SQUARE_FORMATS
+from test_eltwise_unary_sfpu_quasar import (
+    prepare_square_inputs,
+)
+
+
+def generate_sfpu_square_combinations(formats_list):
+    """
+    Square-only sweep for the TRISC3 variant: (fmt, dest_acc, dest_sync,
+    input_dimensions) tuples. Uniform dims [32,32]/[64,64]
+    x {Half,Full} sync (the redundant [32,64] dim is dropped, matching the
+    consolidated unary test).
+    """
+    combinations = []
+    dest_sync_modes = (DestSync.Half, DestSync.Full)
+    input_dimension_options = ([32, 32], [64, 64])
+    for format_variant in generate_quasar_sfpu_format_variants(
+        MathOperation.Square, formats_list
+    ):
+        for dest_sync in dest_sync_modes:
+            # Plus runs of 4 and 8 full Dest sections.
+            for input_dimensions in [
+                *input_dimension_options,
+                *generate_dest_depth_input_dimensions(
+                    format_variant.dest_acc, dest_sync
+                ),
+            ]:
+                combinations.append(
+                    (
+                        format_variant,
+                        dest_sync,
+                        runtime(input_dimensions),
+                    )
+                )
+    # The FPU datacopy routes the dedup above drops, at the Dest-depth sizes.
+    same_formats = [
+        fmt for fmt in formats_list if fmt.input_format == fmt.output_format
+    ]
+    for format_variant in quasar_sfpu_fpu_route_variants(same_formats):
+        for dest_sync in dest_sync_modes:
+            for input_dimensions in generate_dest_depth_input_dimensions(
+                format_variant.dest_acc, dest_sync
+            ):
+                combinations.append(
+                    (format_variant, dest_sync, runtime(input_dimensions))
+                )
+    return combinations
+
+
+@pytest.mark.quasar
+@parametrize(
+    **flat_axes(
+        ("format_variant", "dest_sync", "input_dimensions"),
+        generate_sfpu_square_combinations(SFPU_SQUARE_FORMATS),
+    ),
+)
+def test_sfpu_square_trisc3_quasar(
+    format_variant,
+    dest_sync,
+    input_dimensions,
+):
+    """
+    Test square operation on Quasar with SFPU on TRISC3.
+
+    Same parameter coverage as test_sfpu_square_quasar.
+    """
+    assert isinstance(format_variant, QuasarSfpuVariant)
+    formats = format_variant.formats
+    dest_acc = format_variant.dest_acc
+
+    torch.manual_seed(42)
+
+    src_A, tile_cnt_A, src_B, _ = generate_stimuli(
+        stimuli_format_A=formats.input_format,
+        input_dimensions_A=input_dimensions,
+        stimuli_format_B=formats.input_format,
+        input_dimensions_B=input_dimensions,
+    )
+
+    src_A = prepare_square_inputs(
+        src_A, src_B, formats.input_format, formats.output_format
+    )
+
+    num_faces = MAX_NUM_FACES
+
+    generate_golden = get_golden_generator(UnarySFPUGolden)
+    golden_tensor = generate_golden(
+        MathOperation.Square,
+        src_A,
+        formats.output_format,
+        dest_acc,
+        formats.input_format,
+        input_dimensions,
+    )
+
+    unpack_to_dest = format_variant.unpack_to_dest
+    configuration = TestConfig(
+        "sources/quasar/sfpu_square_trisc3_quasar_test.cpp",
+        formats,
+        templates=[
+            MATH_OP(mathop=MathOperation.Square),
+            DATA_COPY_TYPE(DataCopyType.A2D),
+            UNPACKER_ENGINE_SEL(
+                UnpackerEngine.UnpDest if unpack_to_dest else UnpackerEngine.UnpA
+            ),
+            DEST_SYNC(dest_sync),
+        ],
+        runtimes=[
+            TILE_COUNT(tile_cnt_A),
+            NUM_FACES(num_faces),
+            TEST_FACE_DIMS(),
+            DEST_INDEX(0),
+        ],
+        variant_stimuli=StimuliConfig(
+            src_A,
+            formats.input_format,
+            src_B,
+            formats.input_format,
+            formats.output_format,
+            tile_count_A=tile_cnt_A,
+            tile_count_B=tile_cnt_A,
+            tile_count_res=tile_cnt_A,
+            num_faces=num_faces,
+        ),
+        unpack_to_dest=unpack_to_dest,
+        dest_acc=dest_acc,
+    )
+    format_variant.apply_formats(configuration.formats_config)
+
+    res_from_L1 = configuration.run().result
+
+    res_tensor = result_tensor(res_from_L1, formats.output_format, golden_tensor)
+    assert passed_test(golden_tensor, res_tensor, formats.output_format)

@@ -1,0 +1,122 @@
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <cstddef>
+#include <functional>
+#include <span>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <tt-metalium/workload/specification/tensor_parameter.hpp>
+#include <tt-metalium/mesh_coord.hpp>
+#include <tt_stl/small_vector.hpp>
+#include <ttnn/distributed/distributed_configs.hpp>
+
+namespace ttnn {
+class Tensor;
+}  // namespace ttnn
+
+namespace ttnn::command_list {
+struct CmdListBindings;
+}  // namespace ttnn::command_list
+
+namespace tt::tt_metal {
+class MeshTensor;
+class Program;
+class TensorTopology;
+}  // namespace tt::tt_metal
+
+namespace tt::tt_metal::distributed {
+class MeshDevice;
+class MeshWorkload;
+}  // namespace tt::tt_metal::distributed
+
+namespace ttnn::device_operation::detail {
+
+/**
+ * Non-template implementation of output placement and shape computation.
+ *
+ * This function computes the output tensor topology (placements and distribution shape)
+ * from a pre-extracted list of input tensors, avoiding the need to template on the
+ * operation's tensor_args_t type.
+ *
+ * Factored out of the template pipeline to reduce per-operation template instantiation cost.
+ */
+std::pair<
+    ttsl::SmallVector<tt::tt_metal::distributed::MeshMapperConfig::Placement>,
+    tt::tt_metal::distributed::MeshShape>
+compute_output_placements_and_shape(const std::vector<std::reference_wrapper<const ttnn::Tensor>>& tensors);
+
+/**
+ * The same union over TensorTopology labels instead of tensors. The tensor overload above is this function
+ * applied to each tensor's tensor_topology(); it exists so a device operation that knows what one of its
+ * operands WILL be labelled (a collective's result feeding a fused matmul) can take the union of that label
+ * with the labels of its other operands, rather than re-implementing the rule. Semantics: among the labels of
+ * the highest distribution rank, the first Shard seen on a mesh axis wins and a tensor dim already claimed by
+ * another axis reads Replicate; the distribution shape is the per-axis maximum; lower-rank sharded labels are
+ * dropped; fully-replicated labels only decide the rank when nothing is sharded.
+ */
+std::pair<
+    ttsl::SmallVector<tt::tt_metal::distributed::MeshMapperConfig::Placement>,
+    tt::tt_metal::distributed::MeshShape>
+compute_output_placements_and_shape(
+    const std::vector<std::reference_wrapper<const tt::tt_metal::TensorTopology>>& topologies);
+
+/**
+ * Non-template implementation of tensor coordinate extraction.
+ *
+ * Extracts and validates mesh coordinates from a pre-extracted list of input tensors.
+ */
+std::vector<tt::tt_metal::distributed::MeshCoordinate> extract_tensor_coordinates_impl(
+    const std::vector<std::reference_wrapper<const ttnn::Tensor>>& tensors,
+    tt::tt_metal::distributed::MeshDevice* mesh_device);
+
+/**
+ * Fail if `tensor` is per-core allocated. Called by launch() for every tensor in tensor_args when
+ * the operation does not satisfy SupportsPerCoreAllocation.
+ *
+ * `input_index` is the tensor's position in the visit order of tensor_args, reported so the
+ * message names which one of an op's several tensors is at fault.
+ *
+ * tensor_args holds preallocated output tensors as well as inputs, so those are covered too --
+ * an op that cannot resolve per-core addresses cannot write to a per-core output either. What is
+ * *not* covered is the output MemoryConfig requested through operation_attributes: reaching it
+ * would mean walking an attributes struct, and the non-matching overload of
+ * ttsl::reflection::visit_object_of_type_t throws on any leaf that is neither the target type
+ * nor reflectable. Fine for tensor_args, which holds nothing but tensors; not for attributes
+ * structs full of scalars. An op that rebuilds its output MemoryConfig from named fields can
+ * therefore still drop the per-core bit unnoticed; tracked in #51482.
+ */
+void validate_no_per_core_allocation(const ttnn::Tensor& tensor, std::string_view operation_name, size_t input_index);
+
+// True while a ttnn::command_list::CommandListBuilder records on the calling thread (ttnn/command_list.hpp).
+bool is_recording_command_list();
+
+// Throws while recording on the calling thread. For calls whose meaning depends on recorded work, so running them at
+// record time would be wrong.
+void throw_if_recording_command_list(std::string_view call_name);
+
+// True while TTNN command-list parameter binds are pushed on the calling thread (ttnn/command_list_params.hpp).
+bool has_active_cmd_list_binds();
+
+// A program of a workload being recorded, with the bindings its factory stored on the cache miss and the tensor this
+// call binds to each of its TensorParameters.
+struct CmdListProgramBindings {
+    const tt::tt_metal::Program* program;
+    const ttnn::command_list::CmdListBindings* bindings;
+    std::vector<std::pair<tt::tt_metal::TensorParamName, const tt::tt_metal::MeshTensor*>> bound_tensors;
+};
+
+// Adds `workload` to the CommandListBuilder recording on the calling thread instead of enqueueing it, recording as
+// TTNN command-list parameters the active binds that match `programs`.
+void record_to_command_list(
+    std::string_view operation_name,
+    tt::tt_metal::distributed::MeshDevice* mesh_device,
+    tt::tt_metal::distributed::MeshWorkload& workload,
+    std::span<const CmdListProgramBindings> programs = {});
+
+}  // namespace ttnn::device_operation::detail

@@ -1,0 +1,97 @@
+// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+#include <cstdint>
+#include "llk_math_common_api.h"
+#include "llk_math_reduce.h"
+
+/*************************************************************************
+ * LLK REDUCE
+ *************************************************************************/
+
+/**
+ *
+ * @brief Initialize FPU to perform a reduce operation
+ *
+ * @tparam pool_type: Type of reduce pool op, values = [MAX, SUM, AVG]
+ * @tparam reduce_dim: Sets the reduce dimension, values = [REDUCE_ROW, REDUCE_COL, REDUCE_SCALAR]
+ * @tparam EN_32BIT_DEST: Set to true to use 32bit destination register mode
+ * @tparam math_fidelity: Only works for AVG/SUM pool types,  0 = LoFi, 2 = HiFi2, 3 = HiFi3, 4 = HiFi4 - controls
+ * precision of multiplication
+ * @param operandA: The input operand Data Flow Buffer identifier
+ * @param operandB: The scaler input operand Data Flow Buffer identifier
+ *
+ */
+template <PoolType pool_type, ReduceDim reduce_dim, const bool EN_32BIT_DEST, ckernel::MathFidelity math_fidelity>
+inline void llk_math_reduce_init(const std::uint32_t operandA, const std::uint32_t operandB) {
+    const std::uint32_t operandA_id = get_operand_id(operandA);
+    const std::uint32_t operandB_id = get_operand_id(operandB);
+    const ckernel::TensorShape tensor_shape = get_operand_tensor_shape(operandA_id);
+    constexpr bool swap_operands = reduce_swaps_operands<pool_type, reduce_dim>();
+    // Only column SUM and AVG with MxFp4 data and scaler run on MxFp4_2x_B, like matmul.
+    const bool src_2x = pool_type != PoolType::MAX && reduce_dim == ReduceDim::REDUCE_COL &&
+                        get_operand_src_format(operandA_id) == static_cast<std::uint32_t>(DataFormat::MxFp4) &&
+                        get_operand_src_format(operandB_id) == static_cast<std::uint32_t>(DataFormat::MxFp4);
+    const DataFormat data_format = static_cast<DataFormat>(unpack_dst_format[operandA_id]);
+    const DataFormat scaler_format = static_cast<DataFormat>(unpack_dst_format[operandB_id]);
+    const DataFormat srcA_format = src_2x ? DataFormat::MxFp4_2x_B : (swap_operands ? scaler_format : data_format);
+    const DataFormat srcB_format = src_2x ? DataFormat::MxFp4_2x_B : (swap_operands ? data_format : scaler_format);
+
+    // The default path skips the ALU setup when already configured, so set the ALU formats directly when they change.
+    if (src_2x || swap_operands) {
+        const bool en_int32_dest_format = _is_src_fmt_int32_dest_compatible_(srcA_format) &&
+                                          _is_src_fmt_int32_dest_compatible_(srcB_format) && EN_32BIT_DEST;
+        _configure_alu_formats_<EN_32BIT_DEST>(
+            srcA_format, srcB_format, en_int32_dest_format, DataFormat::Invalid /* no dest-format override */);
+        if (swap_operands) {
+            data_format_config_set = DataFormatConfigSet::UNCONFIGURED;
+        }
+    } else {
+        _configure_default_alu_data_format_state_<EN_32BIT_DEST>(srcA_format, srcB_format);
+    }
+    _llk_math_reduce_init_<pool_type, reduce_dim, EN_32BIT_DEST, math_fidelity>(srcA_format, srcB_format, tensor_shape);
+}
+
+/**
+ * @brief Restore the ALU SrcA/SrcB formats after a column reduce that consumed an MxFp4 (2x) operand.
+ *
+ * @param operandA: The srcA (data) operand circular buffer (same as reduce init)
+ *
+ * Both reduce operands of an MxFp4 reduce use operandA's table format, so both ALU sources are restored from it.
+ * Pair with @ref llk_unpack_AB_reduce_uninit.
+ */
+inline void llk_math_reduce_uninit(const std::uint32_t operandA) {
+    const std::uint32_t operandA_id = get_operand_id(operandA);
+    if (static_cast<DataFormat>(get_operand_src_format(operandA_id)) != DataFormat::MxFp4) {
+        return;
+    }
+    const DataFormat table_fmt = static_cast<DataFormat>(unpack_dst_format[operandA_id]);
+    const bool en_int32_dest_format = _is_src_fmt_int32_dest_compatible_(table_fmt) && DST_ACCUM_MODE;
+    _configure_alu_formats_<DST_ACCUM_MODE>(
+        table_fmt, table_fmt, en_int32_dest_format, DataFormat::Invalid /* no dest-format override */);
+}
+
+/**
+ * @brief Perform a reduce operation
+ *
+ * @tparam type: Type of reduce pool op, values = [MAX, SUM, AVG]
+ * @tparam dim: Sets the reduce dimension, values = [REDUCE_ROW, REDUCE_COL, REDUCE_SCALAR]
+ * @param dst_index: Tile index into the destination register.
+ * @param tensor_shape: Tile shape determining face count and dest stride.
+ */
+template <PoolType type, ReduceDim dim>
+inline void llk_math_reduce(const std::uint32_t dst_index, const ckernel::TensorShape tensor_shape) {
+    LLK_ASSERT(
+        (dst_index < get_dest_max_tiles<DST_SYNC_MODE, DST_ACCUM_MODE>()),
+        "llk_math_reduce: dst_index exceeds dest capacity");
+    _llk_math_reduce_<type, dim>(dst_index, tensor_shape);
+}
+
+template <PoolType type, ReduceDim dim>
+inline void llk_math_reduce(const std::uint32_t operandA, const std::uint32_t operandB, const std::uint32_t dst_index) {
+    const std::uint32_t operand_id = get_operand_id(operandA);
+    const ckernel::TensorShape tensor_shape = get_operand_tensor_shape(operand_id);
+    llk_math_reduce<type, dim>(dst_index, tensor_shape);
+}

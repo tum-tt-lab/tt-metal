@@ -1,0 +1,160 @@
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <map>
+#include <optional>
+#include <string>
+#include <span>
+
+#include <tt-umd/types/arch.hpp>
+
+#include "unary_op_types.hpp"
+#include "ttnn/tensor/types.hpp"
+namespace ttnn::operations::unary::utils {
+
+UnaryWithParam string_to_unary_with_param(const std::string& name);
+
+using DataType = tt::tt_metal::DataType;
+
+template <typename T = float>
+std::pair<std::string, std::string> get_op_init_and_func(
+    UnaryOpType op_type,
+    std::span<const T> params = {},
+    const std::string& idst = "0",
+    std::optional<DataType> input_dtype = std::nullopt);
+
+// type_identity_t suppresses template argument deduction
+// this allows get_defines(...) without a template list to use the default type float
+template <typename T = float>
+std::map<std::string, std::string> get_defines(
+    UnaryOpType op_type,
+    std::optional<std::span<const std::type_identity_t<T>>> params = std::nullopt,
+    const std::string& id = "0",
+    const std::string& idst = "0",
+    std::optional<DataType> input_dtype = std::nullopt);
+
+// Target dtype (second parameter) of a TYPECAST/BITCAST op, whichever type backs its parameters.
+std::optional<tt::tt_metal::DataType> typecast_target_dtype(const EltwiseUnaryWithParam& op);
+
+// The SFPU chain defines of a lone op that a generated kernel computes in one pass over BF16
+// DEST, or none when the op runs its own kernel.
+std::optional<std::map<std::string, std::string>> get_bf16_kernel_defines(
+    const std::vector<EltwiseUnaryWithParam>& op_chain,
+    DataType input_dtype,
+    DataType output_dtype,
+    bool fp32_dest_acc_en,
+    tt::ARCH arch);
+
+std::map<std::string, std::string> get_block_defines(
+    const std::vector<EltwiseUnaryWithParam>& op_chain,
+    const std::string& block_id = "0",
+    const std::string& idst = "0",
+    std::optional<DataType> input_dtype = std::nullopt);
+
+// The packer ReLU configuration that computes a lone op as its tile is packed, as a
+// ckernel::ReluConfig expression, or none when the op runs on the SFPU. `sharded`: the input and
+// the output are both sharded, so no tile crosses the NoC.
+std::optional<std::string> get_pack_relu_config(
+    const std::vector<EltwiseUnaryWithParam>& op_chain,
+    DataType input_dtype,
+    DataType output_dtype,
+    bool fp32_dest_acc_en,
+    bool sharded);
+
+template <typename T>
+bool is_parametrized_type(T val) {
+    switch (val) {
+        case UnaryOpType::RELU_MAX:
+        case UnaryOpType::RELU_MIN:
+        case UnaryOpType::POWER:
+        case UnaryOpType::POWER_ITERATIVE:
+        case UnaryOpType::LEAKY_RELU:
+        case UnaryOpType::ELU:
+        case UnaryOpType::GELU:
+        case UnaryOpType::GELU_TANH:
+        case UnaryOpType::RSQRT:
+        case UnaryOpType::SQRT:
+        case UnaryOpType::HEAVISIDE:
+        case UnaryOpType::ERF:
+        case UnaryOpType::RSUB:
+        case UnaryOpType::RDIV:
+        case UnaryOpType::EXP:
+        case UnaryOpType::SOFTPLUS:
+        case UnaryOpType::XIELU:
+        case UnaryOpType::ADD_UNARY_SFPU:
+        case UnaryOpType::SUB_UNARY_SFPU:
+        case UnaryOpType::MUL_UNARY_SFPU:
+        case UnaryOpType::DIV_UNARY_SFPU:
+        case UnaryOpType::UNARY_NE:
+        case UnaryOpType::UNARY_EQ:
+        case UnaryOpType::UNARY_GT:
+        case UnaryOpType::UNARY_LT:
+        case UnaryOpType::UNARY_GE:
+        case UnaryOpType::UNARY_LE:
+        case UnaryOpType::TYPECAST:
+        case UnaryOpType::BITCAST:
+        case UnaryOpType::BITWISE_XOR:
+        case UnaryOpType::BITWISE_AND:
+        case UnaryOpType::BITWISE_OR:
+        case UnaryOpType::RIGHT_SHIFT:
+        case UnaryOpType::LEFT_SHIFT:
+        case UnaryOpType::REMAINDER:
+        case UnaryOpType::FILL:
+        case UnaryOpType::ROUND:
+        case UnaryOpType::SIGMOID:
+        case UnaryOpType::LOGIT:
+        case UnaryOpType::PRELU_SFPU:
+        case UnaryOpType::FMOD:
+        case UnaryOpType::MINIMUM:
+        case UnaryOpType::MAXIMUM:
+        case UnaryOpType::LOG:
+        case UnaryOpType::LOG10:
+        case UnaryOpType::LOG2:
+        case UnaryOpType::LOG1P:
+        case UnaryOpType::TANH:
+        case UnaryOpType::SOFTSHRINK:
+        case UnaryOpType::HARDSHRINK:
+        case UnaryOpType::WHERE_TSS:
+        case UnaryOpType::MAC_TSS:
+        case UnaryOpType::CELU:
+        case UnaryOpType::SOFTCAP:
+        case UnaryOpType::HARDTANH:
+        case UnaryOpType::THRESHOLD:
+        case UnaryOpType::CLAMP_TSS:
+        case UnaryOpType::SELU:
+        case UnaryOpType::RPOW:
+        case UnaryOpType::MISH:
+        case UnaryOpType::POLYGAMMA: return true;
+        default: return false;
+    }
+    return false;
+}
+
+void update_macro_defines(UnaryOpType op_type, std::map<std::string, std::string>& defines);
+
+// INP_FLOAT32 / INP_INT32 / INP_UINT32 / INP_FLOAT: the SFPU kernels select their algorithm on these. Exactly one
+// is set after the call; float32 wins over the bf16-class default when both operands of a fused op contribute.
+void add_input_dtype_defines(DataType dtype, std::map<std::string, std::string>& defines);
+
+std::string_view get_compute_kernel_path(UnaryOpType op_type, std::optional<DataType> input_dtype = std::nullopt);
+
+// True when op_type is compiled by a kernel of its own rather than the generic eltwise_sfpu_metal2.cpp chain
+// kernel. Such an op is not emitted into SFPU_OP_CHAIN_0, so it cannot share a chain with other ops.
+bool uses_dedicated_compute_kernel(UnaryOpType op_type, std::optional<DataType> input_dtype = std::nullopt);
+
+// Whether the compute kernel can take its tiles chunk by chunk, as the DRAM read work queue hands them out.
+bool compute_kernel_supports_work_queue(UnaryOpType op_type, std::optional<DataType> input_dtype);
+
+uint32_t pack_scalar_runtime_arg_impl(float param, DataType dtype);
+uint32_t pack_scalar_runtime_arg_impl(std::uint32_t param, DataType dtype);
+uint32_t pack_scalar_runtime_arg_impl(std::int32_t param, DataType dtype);
+
+uint32_t pack_scalar_runtime_arg(const EltwiseUnaryWithParam& op, size_t index, DataType dtype);
+
+// True when the op's result at 0 is inf or nan. Run on the zero tile padding, such an op leaves a non-finite value in
+// the lanes that share a BFLOAT8_B / BFLOAT4_B block with real lanes, and that value sets the block's exponent.
+bool is_non_finite_at_zero(const EltwiseUnaryWithParam& op);
+}  // namespace ttnn::operations::unary::utils

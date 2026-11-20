@@ -1,0 +1,217 @@
+// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include "common/device_fixture.hpp"
+
+#include <tt-metalium/device.hpp>
+#include <tt-metalium/distributed.hpp>
+#include <tt-metalium/host_api.hpp>
+#include <tt-metalium/mesh_workload.hpp>
+#include <tt-metalium/workload/specification/program_spec.hpp>
+#include <tt-metalium/tt_metal.hpp>
+#include "llrt/rtoptions.hpp"
+#include "tt_metal/impl/dispatch/slow_dispatch.hpp"
+
+#ifndef OVERRIDE_KERNEL_PREFIX
+#define OVERRIDE_KERNEL_PREFIX ""
+#endif
+
+using namespace tt;
+using namespace tt::tt_metal;
+
+// This test requires simulator environment
+TEST_F(QuasarMeshDeviceSingleCardFixture, QuasarComputeKernelMultipleThreads) {
+    // Skip if simulator is not available
+    if (!MetalContext::instance().rtoptions().is_simulator_or_emulated()) {
+        GTEST_SKIP() << "This test can only be run under the simulator or emulator. "
+                        "Set TT_METAL_SIMULATOR or TT_METAL_EMULE_MODE=1.";
+    }
+
+    auto mesh_device = devices_[0];
+
+    if (!MetalContext::instance().rtoptions().get_feature_enabled(tt::llrt::RunTimeDebugFeatureDprint)) {
+        std::cerr << "WARNING: Please set the environment variable TT_METAL_DPRINT_CORES to 0,0 to see the output of "
+                     "the Compute kernels."
+                  << std::endl;
+        std::cerr << "WARNING: For example, export TT_METAL_DPRINT_CORES=0,0" << std::endl;
+    }
+
+    // We are going to use the first device (0) and the first core (0, 0) on the device.
+    const NodeCoord node{0, 0};
+    // Command queue lets us submit work (execute programs and read/write buffers) to the device.
+    distributed::MeshCommandQueue& cq = mesh_device->mesh_command_queue();
+    // Prepare a workload and a device coordinate range that spans the mesh.
+    distributed::MeshWorkload workload;
+    distributed::MeshCoordinateRange device_range = distributed::MeshCoordinateRange(mesh_device->shape());
+
+    const uint32_t l1_address = MetalContext::instance().hal().get_dev_addr(
+        HalProgrammableCoreType::TENSIX, HalL1MemAddrType::DEFAULT_UNRESERVED);
+    std::vector<uint32_t> init_values(16, 0);
+    slow_dispatch::WriteToL1(*mesh_device, node, l1_address, init_values);
+
+    const KernelSpecName COMPUTE_KERNEL{"risc_math"};
+
+    KernelSpec compute_kernel_spec{
+        .unique_id = COMPUTE_KERNEL,
+        .source =
+
+            OVERRIDE_KERNEL_PREFIX "tests/tt_metal/tt_metal/test_kernels/compute/risc_math.cpp",
+        .num_threads = 4,
+        .runtime_arg_schema =
+            {
+                .runtime_arg_names = {"l1_address"},
+            },
+        .hw_config = ComputeHardwareConfig{},
+    };
+
+    WorkUnitSpec main_wu{
+        .name = "main",
+        .kernels = {COMPUTE_KERNEL},
+        .target_nodes = node,
+    };
+
+    ProgramSpec spec{
+        .name = "compute_kernel_multiple_threads",
+        .kernels = {compute_kernel_spec},
+        .work_units = {main_wu},
+    };
+    Program program(*mesh_device, spec);
+
+    ProgramRunArgs params;
+    params.kernel_run_args = {ProgramRunArgs::KernelRunArgs{
+        .kernel = COMPUTE_KERNEL,
+        .runtime_arg_values = MakeRuntimeArgsForSingleNode(node, {{"l1_address", l1_address}}),
+    }};
+    program.set_program_run_args(params);
+
+    workload.add_program(device_range, std::move(program));
+    distributed::EnqueueMeshWorkload(cq, workload, true);
+
+    std::vector<uint32_t> actual_values(16, 0);
+    slow_dispatch::ReadFromL1(*mesh_device, node, l1_address, 16 * sizeof(uint32_t), actual_values);
+
+    const std::vector<uint32_t> expected_values = {4, 6, 5, 9, 8, 10, 9, 13, 12, 14, 13, 17, 16, 18, 17, 21};
+
+    ASSERT_EQ(actual_values, expected_values);
+}
+
+// This test requires simulator environment
+TEST_F(QuasarMeshDeviceSingleCardFixture, QuasarComputeKernelSingleThread) {
+    // Skip if simulator is not available
+    if (!MetalContext::instance().rtoptions().is_simulator_or_emulated()) {
+        GTEST_SKIP() << "This test can only be run under the simulator or emulator. "
+                        "Set TT_METAL_SIMULATOR or TT_METAL_EMULE_MODE=1.";
+    }
+
+    auto mesh_device = devices_[0];
+
+    if (!MetalContext::instance().rtoptions().get_feature_enabled(tt::llrt::RunTimeDebugFeatureDprint)) {
+        std::cerr << "WARNING: Please set the environment variable TT_METAL_DPRINT_CORES to 0,0 to see the output of "
+                     "the Compute kernels."
+                  << std::endl;
+        std::cerr << "WARNING: For example, export TT_METAL_DPRINT_CORES=0,0" << std::endl;
+    }
+
+    // We are going to use the first device (0) and the first core (0, 0) on the device.
+    const NodeCoord node{0, 0};
+    // Command queue lets us submit work (execute programs and read/write buffers) to the device.
+    distributed::MeshCommandQueue& cq = mesh_device->mesh_command_queue();
+    // Prepare a workload and a device coordinate range that spans the mesh.
+    distributed::MeshWorkload workload;
+    distributed::MeshCoordinateRange device_range = distributed::MeshCoordinateRange(mesh_device->shape());
+
+    const uint32_t l1_address = MetalContext::instance().hal().get_dev_addr(
+        HalProgrammableCoreType::TENSIX, HalL1MemAddrType::DEFAULT_UNRESERVED);
+    std::vector<uint32_t> init_values(4, 0);
+    slow_dispatch::WriteToL1(*mesh_device, node, l1_address, init_values);
+
+    const KernelSpecName COMPUTE_KERNEL{"risc_math"};
+
+    KernelSpec compute_kernel_spec{
+        .unique_id = COMPUTE_KERNEL,
+        .source =
+
+            OVERRIDE_KERNEL_PREFIX "tests/tt_metal/tt_metal/test_kernels/compute/risc_math.cpp",
+        .num_threads = 1,
+        .runtime_arg_schema =
+            {
+                .runtime_arg_names = {"l1_address"},
+            },
+        .hw_config = ComputeHardwareConfig{},
+    };
+
+    WorkUnitSpec main_wu{
+        .name = "main",
+        .kernels = {COMPUTE_KERNEL},
+        .target_nodes = node,
+    };
+
+    ProgramSpec spec{
+        .name = "compute_kernel_single_thread",
+        .kernels = {compute_kernel_spec},
+        .work_units = {main_wu},
+    };
+    Program program(*mesh_device, spec);
+
+    ProgramRunArgs params;
+    params.kernel_run_args = {ProgramRunArgs::KernelRunArgs{
+        .kernel = COMPUTE_KERNEL,
+        .runtime_arg_values = MakeRuntimeArgsForSingleNode(node, {{"l1_address", l1_address}}),
+    }};
+    program.set_program_run_args(params);
+
+    workload.add_program(device_range, std::move(program));
+    distributed::EnqueueMeshWorkload(cq, workload, true);
+
+    std::vector<uint32_t> actual_values(4, 0);
+    slow_dispatch::ReadFromL1(*mesh_device, node, l1_address, 4 * sizeof(uint32_t), actual_values);
+
+    const std::vector<uint32_t> expected_values = {4, 6, 5, 9};
+
+    ASSERT_EQ(actual_values, expected_values);
+}
+
+// This test requires simulator environment
+TEST_F(QuasarMeshDeviceSingleCardFixture, QuasarCreateMultipleComputeKernelsSingleCluster) {
+    // Skip if simulator is not available
+    if (!MetalContext::instance().rtoptions().is_simulator_or_emulated()) {
+        GTEST_SKIP() << "This test can only be run under the simulator or emulator. "
+                        "Set TT_METAL_SIMULATOR or TT_METAL_EMULE_MODE=1.";
+    }
+
+    const KernelSpecName COMPUTE_KERNEL_1{"risc_math_1"};
+    const KernelSpecName COMPUTE_KERNEL_2{"risc_math_2"};
+
+    KernelSpec compute_kernel_spec_1{
+        .unique_id = COMPUTE_KERNEL_1,
+        .source =
+
+            OVERRIDE_KERNEL_PREFIX "tests/tt_metal/tt_metal/test_kernels/compute/risc_math.cpp",
+        .num_threads = 1,
+        .hw_config = ComputeHardwareConfig{},
+    };
+
+    KernelSpec compute_kernel_spec_2{
+        .unique_id = COMPUTE_KERNEL_2,
+        .source =
+
+            OVERRIDE_KERNEL_PREFIX "tests/tt_metal/tt_metal/test_kernels/compute/risc_math.cpp",
+        .num_threads = 2,
+        .hw_config = ComputeHardwareConfig{},
+    };
+
+    WorkUnitSpec main_wu{
+        .name = "main",
+        .kernels = {COMPUTE_KERNEL_1, COMPUTE_KERNEL_2},
+        .target_nodes = NodeCoord{0, 0},
+    };
+
+    ProgramSpec spec{
+        .name = "multiple_compute_kernels",
+        .kernels = {compute_kernel_spec_1, compute_kernel_spec_2},
+        .work_units = {main_wu},
+    };
+
+    ASSERT_THROW(tt_metal::Program(this->device(), spec), std::runtime_error);
+}

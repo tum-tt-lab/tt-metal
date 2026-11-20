@@ -1,0 +1,100 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Replicates ttnn tilize compute kernel flow (compute_kernel_hw_startup +
+fast_tilize_init/block/uninit) through the LLK test infra.
+"""
+
+from conftest import blackhole_only
+from helpers.format_config import DataFormat
+from helpers.golden_generators import TilizeGolden, get_golden_generator
+from helpers.llk_params import DestAccumulation
+from helpers.param_config import input_output_formats, parametrize
+from helpers.perf.blaze import execute_llk
+from helpers.stimuli_config import StimuliConfig
+from helpers.stimuli_generator import generate_stimuli
+from helpers.test_variant_parameters import (
+    LOOP_FACTOR,
+    NUM_FACES,
+    TILE_COUNT,
+    generate_input_dim,
+)
+from helpers.utils import passed_test, result_tensor
+
+TILE_R = 32
+TILE_C = 32
+
+FAST_TILIZE_METAL_API_SWEEP = dict(
+    formats=[*input_output_formats([DataFormat.Float16_b], same=True)],
+    dest_acc=[DestAccumulation.No],
+    dimensions=[(1, 2), (1, 4), (1, 8), (2, 4), (2, 8), (10, 12)],
+)
+
+
+def _run_fast_tilize_metal_api(
+    formats,
+    dest_acc,
+    dimensions,
+    *,
+    is_perf=False,
+    perf_report=None,
+    run_types=None,
+    loop_factor=1,
+):
+    rt, ct = dimensions
+    input_dimensions = [rt * TILE_R, ct * TILE_C]
+    tile_count = rt * ct
+
+    src_A, tile_cnt_A, src_B, tile_cnt_B = generate_stimuli(
+        stimuli_format_A=formats.input_format,
+        input_dimensions_A=input_dimensions,
+        stimuli_format_B=formats.input_format,
+        input_dimensions_B=input_dimensions,
+    )
+
+    golden = get_golden_generator(TilizeGolden)(
+        src_A, input_dimensions, formats.output_format
+    )
+
+    outcome = execute_llk(
+        is_perf=is_perf,
+        perf_report=perf_report,
+        run_types=run_types,
+        loop_factor=loop_factor,
+        test_config_kwargs=dict(
+            test_name="sources/fast_tilize_metal_api_test.cpp",
+            formats=formats,
+            templates=[],
+            runtimes=[
+                generate_input_dim(input_dimensions, input_dimensions),
+                TILE_COUNT(tile_count),
+                LOOP_FACTOR(1),
+                NUM_FACES(4),
+            ],
+            variant_stimuli=StimuliConfig(
+                src_A,
+                formats.input_format,
+                src_B,
+                formats.input_format,
+                formats.output_format,
+                tile_count_A=tile_cnt_A,
+                tile_count_B=tile_cnt_B,
+                tile_count_res=tile_count,
+            ),
+            dest_acc=dest_acc,
+            compile_time_formats=True,
+        ),
+    )
+    if is_perf:
+        return
+
+    res = outcome.result
+    res_tensor = result_tensor(res, formats.output_format, golden)
+    assert passed_test(golden, res_tensor, formats.output_format)
+
+
+@blackhole_only
+@parametrize(**FAST_TILIZE_METAL_API_SWEEP)
+def test_fast_tilize_metal_api(formats, dest_acc, dimensions):
+    _run_fast_tilize_metal_api(formats, dest_acc, dimensions)

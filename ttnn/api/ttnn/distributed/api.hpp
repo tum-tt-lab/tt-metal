@@ -1,0 +1,67 @@
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <map>
+#include <memory>
+
+#include <tt-metalium/mesh_device_view.hpp>
+#include "ttnn/tensor/tensor.hpp"
+#include "ttnn/distributed/tensor_topology.hpp"
+#include "ttnn/distributed/types.hpp"
+
+namespace ttnn::distributed {
+
+std::shared_ptr<MeshDevice> open_mesh_device(
+    const MeshShape& mesh_shape,
+    size_t l1_small_size,
+    size_t trace_region_size,
+    size_t num_command_queues,
+    const tt::tt_metal::DispatchCoreConfig& dispatch_core_config,
+    const std::optional<MeshCoordinate>& offset = std::nullopt,
+    const std::vector<int>& physical_device_ids = {},
+    size_t worker_l1_size = DEFAULT_WORKER_L1_SIZE);
+
+// Open a mesh device with optionally-provided mesh shape, defaults to system mesh global shape if not provided.
+std::shared_ptr<MeshDevice> open_mesh_device(
+    size_t l1_small_size,
+    size_t trace_region_size,
+    size_t num_command_queues,
+    const tt::tt_metal::DispatchCoreConfig& dispatch_core_config,
+    const std::optional<MeshShape>& mesh_shape,
+    const std::optional<MeshCoordinate>& offset = std::nullopt,
+    const std::vector<int>& physical_device_ids = {},
+    size_t worker_l1_size = DEFAULT_WORKER_L1_SIZE);
+
+void close_mesh_device(const std::shared_ptr<MeshDevice>& mesh_device);
+
+// Given a multi-device tensor, returns a list of individual per-device tensors.
+std::vector<Tensor> get_device_tensors(const Tensor& tensor);
+
+// Given a list of host shards, returns a multi-device tensor.
+// Tensor specs (including shapes) must match for all shards, and the number of shards must match the mesh size.
+// `shard_dim` is the dimension that was sharded over, which is used to create the tensor topology (assumes sharded
+// along dim 0 if not provided).
+Tensor from_host_shards(const std::vector<Tensor>& tensor_shards, const MeshShape& mesh_shape, int shard_dim = 0);
+
+// Combines tensor shards allocated on individual devices into a single multi-device tensor.
+// All tensors shards must be allocated on the same mesh buffer.
+// `shard_dim` is the dimension that was sharded over, which is used to create the tensor topology (assumes sharded
+// along dim 0 if not provided).
+Tensor combine_device_tensors(const std::vector<Tensor>& tensor_shards, int shard_dim = 0);
+
+// Builds a multi-device host tensor from the shards this host holds, one per coordinate of `topology` local to this
+// host, and labels it with `topology` as given. Unlike `from_host_shards`, it needs no shard for the coordinates that
+// belong to other hosts of a multi-host mesh or that the label does not list (they stay unpopulated, so a tensor can
+// live on part of the mesh) and spells no label of its own. Every shard must be on host with the same tensor spec,
+// every coordinate must be inside the mesh, local to this host and listed by the label, and every local coordinate the
+// label lists must receive a shard. `mesh_device` decides which coordinates are local; on a single-host mesh every
+// coordinate is.
+Tensor from_local_host_shards(
+    const std::map<MeshCoordinate, Tensor>& shards,
+    const MeshDevice& mesh_device,
+    const tt::tt_metal::TensorTopology& topology);
+
+}  // namespace ttnn::distributed

@@ -1,0 +1,87 @@
+// SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+// Isolated SFPU add (binary): UNPACK2 (UNP_S) x2 -> SrcS -> SFPU -> PACK1 -> L1.
+// All logic runs in LLK_TRISC_ISOLATE_SFPU through the AddSrcs op type (float or Int32); UNPACK, MATH, PACK are stubbed.
+
+#include <cstdint>
+
+#include "ckernel.h"
+#include "llk_defs.h"
+#include "llk_memory_checks.h"
+
+#ifdef LLK_TRISC_UNPACK
+
+#include "params.h"
+
+void run_kernel(RUNTIME_PARAMETERS /*params*/)
+{
+}
+
+#endif
+
+#ifdef LLK_TRISC_MATH
+
+#include "params.h"
+
+void run_kernel(RUNTIME_PARAMETERS /*params*/)
+{
+}
+
+#endif
+
+#ifdef LLK_TRISC_ISOLATE_SFPU
+
+#include "llk_sfpu/ckernel_sfpu_add.h"
+#include "llk_sfpu/ckernel_sfpu_srcs.h"
+#include "llk_sfpu_srcs_api.h"
+#include "params.h"
+
+using namespace ckernel;
+using namespace ckernel::sfpu;
+
+void run_kernel(RUNTIME_PARAMETERS params)
+{
+#if defined(RUNTIME_FORMATS) && !defined(SPEED_OF_LIGHT)
+    const volatile FormatConfig& formats = params.formats;
+#endif
+#ifndef SPEED_OF_LIGHT
+    const std::uint32_t TILE_CNT = params.TILE_CNT;
+    const Operand& buffer_A      = params.buffer_A;
+    const Operand& buffer_B      = params.buffer_B;
+    const Operand& buffer_Res    = params.buffer_Res;
+#endif
+
+    // The SrcS layout is known only at runtime; one dispatch picks the op type for init and run.
+    dispatch_sfpu_srcs_op<AddSrcs>(
+        static_cast<DataFormat>(formats.unpack_S_dst),
+        static_cast<DataFormat>(formats.pack_S_src),
+        [&](auto op)
+        {
+            using Op = decltype(op);
+            Op::init(
+                L1_ADDRESS(buffer_A[0]),
+                L1_ADDRESS(buffer_B[0]),
+                static_cast<DataFormat>(formats.unpack_S_src),
+                L1_ADDRESS(buffer_Res[0]),
+                static_cast<DataFormat>(formats.pack_S_dst));
+            Op::run(TILE_CNT);
+        });
+
+    wait_sfpu_idle();
+    wait_unpack_idle();
+    wait_pack_idle();
+}
+
+#endif
+
+#ifdef LLK_TRISC_PACK
+
+#include "params.h"
+
+void run_kernel(RUNTIME_PARAMETERS /*params*/)
+{
+}
+
+#endif

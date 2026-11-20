@@ -1,0 +1,181 @@
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <optional>
+#include <string_view>
+
+#include <fmt/format.h>
+#include <nanobind/nanobind.h>
+#include <nanobind/stl/optional.h>
+#include <nanobind/stl/variant.h>
+
+#include "ttnn-nanobind/bind_function.hpp"
+#include "ttnn-nanobind/small_vector_caster.hpp"
+#include "ttnn/operations/reduction/generic/generic_reductions.hpp"
+
+namespace ttnn::operations::reduction::detail {
+
+namespace nb = nanobind;
+
+inline std::string get_generic_reduction_doc(
+    const char* op_name,
+    const char* qualified_name,
+    bool int32_supported,
+    bool has_output_layout = false,
+    bool has_fast_approximate_mode = false) {
+    // INT32 is supported for sum/min/max via the SFPU reduce path, but not for mean:
+    // the average (sum / N) is usually fractional, so there is no canonical INT32 result to return.
+    // UINT32 sum/min/max take the same SFPU reduce path as INT32 with unsigned compares.
+    const char* int32_row = int32_supported ? R"doc(
+                * - INT32
+                  - ROW_MAJOR, TILE
+                * - UINT32
+                  - ROW_MAJOR, TILE)doc"
+                                            : "";
+    const char* int_scalar_note =
+        int32_supported
+            ? R"doc(For INT32 and UINT32 the scalar multiplies the reduced value in float32. The result is `trunc(float32(value) * scalar)`. It is not exact above 2^24 and is truncated toward zero. INT32 results clamp to the INT32 range and UINT32 results clamp to [0, 2^32 - 1]. The default `scalar=1.0` skips the multiply and is exact.)doc"
+            : "";
+    // All four generic reductions (sum/mean/max/min) expose fast_and_approximate_mode. std/var do
+    // not: Welford already reduces on the SFPU at full fp32, so there is no FPU path to select.
+    // ttnn.sum and ttnn.mean both expose output_layout.
+    const char* output_layout_kwarg = has_output_layout ? R"doc(
+            output_layout (ttnn.Layout, optional): layout of the output tensor. Defaults to `None`, which keeps the layout the chosen path produces naturally (see the Note below). `ttnn.TILE_LAYOUT` or `ttnn.ROW_MAJOR_LAYOUT` is always honored: it is produced directly by the kernel for a -2 reduce of a ROW_MAJOR input, and converted after reducing otherwise. `ttnn.ROW_MAJOR_LAYOUT` is rejected for block-float results (BFLOAT8_B, BFLOAT4_B), which only exist in TILE layout; typecast explicitly if a row-major result is needed.)doc"
+                                                        : "";
+    const char* fast_approx_kwarg = !has_fast_approximate_mode           ? ""
+                                    : std::string_view(op_name) == "min" ? R"doc(
+            fast_and_approximate_mode (bool, optional): must stay `False` (the default) for FLOAT32. The FPU has no min pool, so there is no faster path to select: a FLOAT32 min with `True` is rejected rather than lowered to `-max(-x)`. No effect for non-FLOAT32 inputs.)doc"
+                                                                         : R"doc(
+            fast_and_approximate_mode (bool, optional): FLOAT32 only. `False` (default) uses the accurate SFPU path (full float32 accumulation); `True` uses the faster FPU path (inputs truncated to TF32, higher ULP error). The accurate path requires a compute_kernel_config with `fp32_dest_acc_en=True` and is unavailable on Quasar; in those cases it falls back to the FPU. No effect for non-FLOAT32 inputs.)doc";
+    return fmt::format(
+        R"doc(
+        Computes the {0} of the input tensor :attr:`input_tensor` along the specified dimension(s) :attr:`dim`.
+        If no dimension is provided, {0} is computed over all dimensions yielding a single value.
+
+        Args:
+            input_tensor (ttnn.Tensor): the input tensor. Must be on the device.
+            dim (number or tuple): dimension value(s) to reduce over.
+            keepdim (bool, optional): keep the original dimension size(s). Defaults to `False`.
+
+        Keyword Args:
+            memory_config (ttnn.MemoryConfig, optional): Memory configuration for the operation. Defaults to `None`.
+            compute_kernel_config (ttnn.ComputeKernelConfig, optional): Compute kernel configuration for the operation. Defaults to `None`.
+            scalar (float, optional): A scaling factor to be applied to the input tensor. Defaults to `1.0`.{5}
+            sub_core_grids (ttnn.CoreRangeSet, optional): Subcore grids to use for the operation. Defaults to `None`, which will use all cores.{3}{4}
+
+        Returns:
+            ttnn.Tensor: the output tensor.
+
+        Note:
+            The input tensor supports the following data types and layouts:
+
+            .. list-table:: Input Tensor
+                :header-rows: 1
+
+                * - dtype
+                  - layout
+                * - FLOAT32
+                  - ROW_MAJOR, TILE
+                * - BFLOAT16
+                  - ROW_MAJOR, TILE
+                * - BFLOAT8_B
+                  - TILE{2}
+
+            The output tensor will be in TILE layout and have the same dtype as the :attr:`input_tensor`.
+            Exception: for sum and mean, 4D ROW_MAJOR BFLOAT16/FLOAT32 inputs with INTERLEAVED memory
+            config reduced along the last (-1) or second-to-last (-2) dimension preserve ROW_MAJOR layout.
+
+        Memory Support:
+            - Interleaved: DRAM and L1
+            - Sharded (L1): Width, Height, Block, and ND sharding
+            - Sharded (DRAM): Width, Height, and ND sharding
+            - Output sharding will mirror the input
+            - Not supported: DRAM block sharding; sharded ROW_MAJOR inputs; and sharded
+              reduction along a dimension other than -1 / -2
+        )doc",
+        op_name,
+        qualified_name,
+        int32_row,
+        fast_approx_kwarg,
+        output_layout_kwarg,
+        int_scalar_note);
+}
+
+inline void bind_generic_reductions(nb::module_& mod) {
+    const auto sum_doc = get_generic_reduction_doc(
+        "sum", "ttnn.sum", /*int32_supported=*/true, /*has_output_layout=*/true, /*has_fast_approximate_mode=*/true);
+    ttnn::bind_function<"sum">(
+        mod,
+        sum_doc.c_str(),
+        &ttnn::sum,
+        nb::arg("input_tensor"),
+        nb::arg("dim") = nb::none(),
+        nb::arg("keepdim") = false,
+        nb::kw_only(),
+        nb::arg("memory_config") = nb::none(),
+        nb::arg("compute_kernel_config") = nb::none(),
+        nb::arg("scalar") = 1.0f,
+        nb::arg("sub_core_grids") = nb::none(),
+        nb::arg("fast_and_approximate_mode") = false,
+        nb::arg("output_layout") = nb::none());
+
+    const auto mean_doc = get_generic_reduction_doc(
+        "mean",
+        "ttnn.mean",
+        /*int32_supported=*/false,
+        /*has_output_layout=*/true,
+        /*has_fast_approximate_mode=*/true);
+    ttnn::bind_function<"mean">(
+        mod,
+        mean_doc.c_str(),
+        &ttnn::mean,
+        nb::arg("input_tensor"),
+        nb::arg("dim") = nb::none(),
+        nb::arg("keepdim") = false,
+        nb::kw_only(),
+        nb::arg("memory_config") = nb::none(),
+        nb::arg("compute_kernel_config") = nb::none(),
+        nb::arg("scalar") = 1.0f,
+        nb::arg("sub_core_grids") = nb::none(),
+        // fast_and_approximate_mode=false (default) selects the accurate fp32 SFPU reduce; true selects the FPU. No
+        // effect for non-fp32.
+        nb::arg("fast_and_approximate_mode") = false,
+        nb::arg("output_layout") = nb::none());
+
+    const auto max_doc = get_generic_reduction_doc(
+        "max", "ttnn.max", /*int32_supported=*/true, /*has_output_layout=*/false, /*has_fast_approximate_mode=*/true);
+    ttnn::bind_function<"max">(
+        mod,
+        max_doc.c_str(),
+        &ttnn::max,
+        nb::arg("input_tensor"),
+        nb::arg("dim") = nb::none(),
+        nb::arg("keepdim") = false,
+        nb::kw_only(),
+        nb::arg("memory_config") = nb::none(),
+        nb::arg("compute_kernel_config") = nb::none(),
+        nb::arg("scalar") = 1.0f,
+        nb::arg("sub_core_grids") = nb::none(),
+        nb::arg("fast_and_approximate_mode") = false);
+
+    const auto min_doc = get_generic_reduction_doc(
+        "min", "ttnn.min", /*int32_supported=*/true, /*has_output_layout=*/false, /*has_fast_approximate_mode=*/true);
+    ttnn::bind_function<"min">(
+        mod,
+        min_doc.c_str(),
+        &ttnn::min,
+        nb::arg("input_tensor"),
+        nb::arg("dim") = nb::none(),
+        nb::arg("keepdim") = false,
+        nb::kw_only(),
+        nb::arg("memory_config") = nb::none(),
+        nb::arg("compute_kernel_config") = nb::none(),
+        nb::arg("scalar") = 1.0f,
+        nb::arg("sub_core_grids") = nb::none(),
+        nb::arg("fast_and_approximate_mode") = false);
+}
+
+}  // namespace ttnn::operations::reduction::detail

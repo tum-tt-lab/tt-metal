@@ -1,0 +1,326 @@
+// SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
+//
+// SPDX-License-Identifier: Apache-2.0
+
+/*
+ * Driver for Metal's llk_sfpu/ckernel_sfpu_sdpa.h.
+ *
+ * Those bodies have no LLK API of their own, so each consumer declares its own wrapper. This test
+ * declares one too, dispatching each body at VectorMode::C the way a consumer does, with a minimal
+ * init sufficient to exercise it.
+ *
+ * Every body runs ITERATIONS_HALF_FACE = 4 iterations at a dst_reg stride of 2, on faces 0 and 2
+ * under VectorMode::C. That writes columns {0,2,4,6,8,10,12,14} of all 32 rows and leaves the rest
+ * of the tile alone. Only column 0 carries meaning for the caller, since these operands are
+ * row-reduce outputs broadcast down a column.
+ *
+ * OP_CORRECTION drives the same skeleton over five DEST tiles instead of one, in the order ttnn's
+ * correction_block assigns dst_reg_0..dst_reg_4:
+ *
+ *   tile 0  in: prev_max    out: exp(scale * (prev_max   - cur_max))
+ *   tile 1  in: worker_max  out: exp(scale * (worker_max - cur_max))
+ *   tile 2  in: ignored     out: cur_max = max(prev_max, worker_max)
+ *   tile 3  in: prev_sum    out: exp_worker*worker_sum + exp_prev*prev_sum
+ *   tile 4  in: worker_sum  out: exp_worker * worker_sum
+ *
+ * FP32 half-sync instead loads worker_sum into tile 2 and uses only tiles 0..3.
+ */
+
+#include <cstdint>
+
+#include "ckernel.h"
+#include "counters.h"
+#include "llk_defs.h"
+#include "params.h"
+#include "perf.h"
+#include "profiler.h"
+
+// Globals
+std::uint32_t unp_cfg_context          = 0;
+std::uint32_t pack_sync_tile_dst_ptr   = 0;
+std::uint32_t math_sync_tile_dst_index = 0;
+
+// Which body to drive. Mirrors SdpaOp in helpers/llk_params.py.
+constexpr int OP_RECIP_ITER   = 1; // calculate_recip_first_column, sfpu_reciprocal_iter
+constexpr int OP_EXP_ACCURATE = 2; // calculate_exponential_first_column<true,  EXP_SCALE_BF16>
+constexpr int OP_EXP_POLY     = 3; // calculate_exponential_first_column<false, EXP_SCALE_BF16>
+constexpr int OP_SOFTPLUS     = 4; // calculate_softplus_first_column
+constexpr int OP_CORRECTION   = 5; // calculate_fused_max_sub_exp_add_tile
+
+static_assert(SDPA_OP >= OP_RECIP_ITER && SDPA_OP <= OP_CORRECTION, "unhandled SDPA_OP");
+
+constexpr bool SDPA_OP_IS_EXP = (SDPA_OP == OP_EXP_ACCURATE || SDPA_OP == OP_EXP_POLY);
+
+// Derived from the op rather than passed in, so the tile count cannot disagree with the body.
+// Only the correction body works on more than one tile.
+constexpr bool REUSE_CUR_MAX_TILE     = is_fp32_dest_acc_en && dest_sync == ckernel::DstSync::SyncHalf;
+constexpr std::uint32_t NUM_DST_TILES = (SDPA_OP == OP_CORRECTION) ? (REUSE_CUR_MAX_TILE ? 4 : 5) : 1;
+
+static_assert(
+    NUM_DST_TILES <= ckernel::get_dest_max_tiles<dest_sync, is_fp32_dest_acc_en, ckernel::DstTileShape::Tile32x32>(),
+    "this configuration needs more Dest tiles than the dest_sync / dest_acc pair can hold");
+
+// The dispatch always targets the base tile. The correction body reaches its remaining regions
+// by fixed dst_reg offsets from there (three in the reuse layout, four otherwise).
+constexpr std::uint32_t SDPA_DST_INDEX = 0;
+
+#ifdef LLK_TRISC_UNPACK
+
+#include "llk_lib_unpack_wrappers.h"
+#include "llk_unpack_A.h"
+#include "llk_unpack_common.h"
+
+void run_kernel(RUNTIME_PARAMETERS params)
+{
+#if defined(RUNTIME_FORMATS) && !defined(SPEED_OF_LIGHT)
+    const FormatConfig& formats = params.formats;
+#endif
+#ifndef SPEED_OF_LIGHT
+    const std::uint32_t LOOP_FACTOR = params.LOOP_FACTOR;
+    const Operand& buffer_A         = params.buffer_A;
+#endif
+    const std::uint32_t src_handshake_iters = LOOP_FACTOR * _perf_src_handshake_iters_(false /* tilize_en */, NUM_DST_TILES, TILE_NUM_FACES);
+    {
+        START_PERF_MEASURE("INIT")
+        _llk_unpack_hw_configure_<is_fp32_dest_acc_en>(
+            formats.unpack_A_src, formats.unpack_B_src, formats.unpack_A_dst, formats.unpack_B_dst, FACE_R_DIM, FACE_R_DIM, TILE_NUM_FACES, TILE_NUM_FACES);
+
+        _llk_unpack_A_init_<BroadcastType::NONE, false, EltwiseBinaryReuseDestType::NONE, unpack_to_dest>(
+            0 /* transpose_of_faces */,
+            0 /* within_face_16x16_transpose */,
+            ckernel::make_tensor_shape_from_legacy(FACE_R_DIM, TILE_NUM_FACES),
+            formats.unpack_A_src,
+            formats.unpack_A_dst);
+        PROFILER_SYNC();
+    }
+    {
+        START_PERF_MEASURE("TILE_LOOP")
+        if constexpr (PERF_RUN_TYPE == PerfRunType::PACK_ISOLATE)
+        {
+        }
+        else if constexpr (PERF_RUN_TYPE == PerfRunType::MATH_ISOLATE && unpack_to_dest)
+        {
+            // Stand in for direct unpack: service math's mailbox/semaphore handshake without moving data.
+            for (std::uint32_t tile = 0; tile < LOOP_FACTOR * NUM_DST_TILES; ++tile)
+            {
+                (void)mailbox_read(ThreadId::MathThreadId);
+                wait_for_dest_available();
+                t6_semaphore_post<p_stall::UNPACK0>(semaphore::UNPACK_TO_DEST);
+            }
+        }
+        else if constexpr (PERF_RUN_TYPE == PerfRunType::MATH_ISOLATE)
+        {
+            _perf_unpack_stream_set_valid<true /* set_a */, true /* set_b */, PERF_RUN_TYPE>(src_handshake_iters);
+        }
+        else
+        {
+            for (std::uint32_t loop = 0; loop < LOOP_FACTOR; ++loop)
+            {
+                for (std::uint32_t tile = 0; tile < NUM_DST_TILES; ++tile)
+                {
+                    _llk_unpack_A_<BroadcastType::NONE, false, EltwiseBinaryReuseDestType::NONE, unpack_to_dest>(
+                        L1_ADDRESS(buffer_A[tile]), formats.unpack_A_src, formats.unpack_A_dst);
+                }
+            }
+        }
+        PROFILER_SYNC();
+    }
+    _llk_unpack_A_uninit_<BroadcastType::NONE>();
+}
+
+#endif
+
+#ifdef LLK_TRISC_MATH
+
+#include "ckernel_sfpu.h"
+#include "llk_lib_math_wrappers.h"
+#include "llk_lib_unpack_wrappers.h"
+#include "llk_math_eltwise_unary_sfpu.h"
+#include "llk_math_eltwise_unary_sfpu_params.h"
+
+// ckernel_sfpu_sdpa.h needs these.
+static constexpr bool DST_ACCUM_MODE = is_fp32_dest_acc_en;
+static constexpr bool APPROX         = APPROX_MODE;
+#ifndef ALWI
+#define ALWI inline __attribute__((always_inline))
+#endif
+
+#include "experimental/llk_sfpu/ckernel_sfpu_sdpa.h"
+#include "llk_sfpu/ckernel_sfpu_exp.h"
+#include "llk_sfpu/ckernel_sfpu_recip.h"
+
+using namespace ckernel;
+
+inline void sdpa_op_init()
+{
+    if constexpr (SDPA_OP == OP_RECIP_ITER)
+    {
+        sfpu::recip_init<APPROX_MODE, is_fp32_dest_acc_en>();
+    }
+    else if constexpr (SDPA_OP_IS_EXP || SDPA_OP == OP_CORRECTION)
+    {
+        sfpu::exp_init<SDPA_OP != OP_EXP_POLY /* APPROXIMATION_MODE */, 0x3F800000 /* scale, unused here */, true /* CLAMP_NEGATIVE */, is_fp32_dest_acc_en>();
+    }
+    else
+    {
+        _llk_math_eltwise_unary_sfpu_init_once_();
+        sfpu::softplus_init();
+    }
+}
+
+inline void sdpa_op(const std::uint32_t dst_index)
+{
+    if constexpr (SDPA_OP == OP_RECIP_ITER)
+    {
+        _llk_math_eltwise_unary_sfpu_params_(sfpu::calculate_recip_first_column<is_fp32_dest_acc_en>, dst_index, VectorMode::C);
+    }
+    else if constexpr (SDPA_OP == OP_EXP_ACCURATE)
+    {
+        _llk_math_eltwise_unary_sfpu_params_(
+            sfpu::calculate_exponential_first_column<true /* SDPA_EXP_APPROX_MODE */, EXP_SCALE_BF16, is_fp32_dest_acc_en>, dst_index, VectorMode::C);
+    }
+    else if constexpr (SDPA_OP == OP_EXP_POLY)
+    {
+        _llk_math_eltwise_unary_sfpu_params_(
+            sfpu::calculate_exponential_first_column<false /* SDPA_EXP_APPROX_MODE */, EXP_SCALE_BF16, is_fp32_dest_acc_en>, dst_index, VectorMode::C);
+    }
+    else if constexpr (SDPA_OP == OP_SOFTPLUS)
+    {
+        _llk_math_eltwise_unary_sfpu_params_(
+            sfpu::calculate_softplus_first_column<is_fp32_dest_acc_en>,
+            dst_index,
+            VectorMode::C,
+            SOFTPLUS_BETA_BITS,
+            SOFTPLUS_BETA_RECIPROCAL_BITS,
+            SOFTPLUS_THRESHOLD_BITS);
+    }
+    else
+    {
+        _llk_math_eltwise_unary_sfpu_params_(
+            sfpu::calculate_fused_max_sub_exp_add_tile<is_fp32_dest_acc_en, REUSE_CUR_MAX_TILE>, dst_index, VectorMode::C, static_cast<int>(EXP_SCALE_BF16));
+    }
+}
+
+void run_kernel(RUNTIME_PARAMETERS params)
+{
+#if defined(RUNTIME_FORMATS) && !defined(SPEED_OF_LIGHT)
+    const FormatConfig& formats = params.formats;
+#endif
+#ifndef SPEED_OF_LIGHT
+    const std::uint32_t LOOP_FACTOR = params.LOOP_FACTOR;
+#endif
+    const std::uint32_t src_handshake_iters = LOOP_FACTOR * _perf_src_handshake_iters_(false /* tilize_en */, NUM_DST_TILES, TILE_NUM_FACES);
+    {
+        START_PERF_MEASURE("INIT")
+        _llk_math_eltwise_unary_datacopy_init_wrapper_<
+            DataCopyType::A2D,
+            is_fp32_dest_acc_en,
+            BroadcastType::NONE,
+            false /* is_int_fpu_en */,
+            PackMode::Default>(ckernel::DEFAULT_TENSOR_SHAPE, formats.math);
+        _llk_math_hw_configure_<is_fp32_dest_acc_en>(formats.math, formats.math);
+        _llk_math_pack_sync_init_<dest_sync, is_fp32_dest_acc_en>();
+        sdpa_op_init();
+        PROFILER_SYNC();
+    }
+    {
+        START_PERF_MEASURE("TILE_LOOP")
+        if constexpr (PERF_RUN_TYPE == PerfRunType::PACK_ISOLATE)
+        {
+        }
+        else if constexpr (PERF_RUN_TYPE == PerfRunType::UNPACK_ISOLATE && unpack_to_dest)
+        {
+            // Stand in for math's side of direct unpack without running the measured SFPU body.
+            for (std::uint32_t loop = 0; loop < LOOP_FACTOR; ++loop)
+            {
+                for (std::uint32_t tile = 0; tile < NUM_DST_TILES; ++tile)
+                {
+                    math::math_unpack_to_dest_math_ready();
+                    math::set_dst_write_addr<DstTileShape::Tile32x32, UnpackDestination::DestReg>(tile);
+                    math::math_unpack_to_dest_tile_ready();
+                }
+            }
+        }
+        else if constexpr (PERF_RUN_TYPE == PerfRunType::UNPACK_ISOLATE)
+        {
+            _perf_math_stream_clear_valid<true /* clear_a */, true /* clear_b */, PERF_RUN_TYPE>(src_handshake_iters);
+        }
+        else
+        {
+            constexpr bool sync_with_pack = PERF_RUN_TYPE == PerfRunType::L1_TO_L1;
+            for (std::uint32_t loop = 0; loop < LOOP_FACTOR; ++loop)
+            {
+                if constexpr (sync_with_pack)
+                {
+                    _llk_math_wait_for_dest_available_<dest_sync>();
+                }
+                // MATH_ISOLATE's unpack stand-in supplies the required input handshake.
+                for (std::uint32_t tile = 0; tile < NUM_DST_TILES; ++tile)
+                {
+                    _llk_math_eltwise_unary_datacopy_<DataCopyType::A2D, dest_sync, is_fp32_dest_acc_en, BroadcastType::NONE, unpack_to_dest>(
+                        tile, formats.math, formats.math);
+                }
+                sdpa_op(SDPA_DST_INDEX);
+                if constexpr (sync_with_pack)
+                {
+                    _llk_math_dest_section_done_<dest_sync, is_fp32_dest_acc_en>();
+                }
+            }
+        }
+        PROFILER_SYNC();
+    }
+}
+
+#endif
+
+#ifdef LLK_TRISC_PACK
+
+#include "llk_lib_pack_wrappers.h"
+#include "llk_pack_common.h"
+
+void run_kernel(RUNTIME_PARAMETERS params)
+{
+#if defined(RUNTIME_FORMATS) && !defined(SPEED_OF_LIGHT)
+    const FormatConfig& formats = params.formats;
+#endif
+#ifndef SPEED_OF_LIGHT
+    const std::uint32_t LOOP_FACTOR = params.LOOP_FACTOR;
+    const Operand& buffer_Res       = params.buffer_Res;
+#endif
+    {
+        START_PERF_MEASURE("INIT")
+        _llk_pack_hw_configure_wrapper_<is_fp32_dest_acc_en, PackMode::Default>(formats.pack_src, formats.pack_dst, FACE_R_DIM * FACE_C_DIM * TILE_NUM_FACES);
+        _llk_pack_init_wrapper_<PackMode::Default, false /* zero_output */>(formats.pack_dst, FACE_R_DIM, TILE_C_DIM, TILE_NUM_FACES);
+        _llk_pack_dest_init_<dest_sync, is_fp32_dest_acc_en>();
+        PROFILER_SYNC();
+    }
+    {
+        START_PERF_MEASURE("TILE_LOOP")
+        if constexpr (PERF_RUN_TYPE == PerfRunType::UNPACK_ISOLATE || PERF_RUN_TYPE == PerfRunType::MATH_ISOLATE)
+        {
+        }
+        else
+        {
+            constexpr bool sync_with_math = PERF_RUN_TYPE == PerfRunType::L1_TO_L1;
+            for (std::uint32_t loop = 0; loop < LOOP_FACTOR; ++loop)
+            {
+                if constexpr (sync_with_math)
+                {
+                    _llk_packer_wait_for_math_done_();
+                }
+                for (std::uint32_t tile = 0; tile < NUM_DST_TILES; ++tile)
+                {
+                    _llk_pack_<dest_sync, is_fp32_dest_acc_en, ckernel::PackMode::Default>(tile, L1_ADDRESS(buffer_Res[tile]));
+                }
+                // Wormhole PACK_ISOLATE also releases every section to drain the packers.
+                if constexpr (sync_with_math || PERF_PACK_SECTION_RELEASE)
+                {
+                    _llk_pack_dest_section_done_<dest_sync, is_fp32_dest_acc_en>();
+                }
+            }
+        }
+        PROFILER_SYNC();
+    }
+}
+
+#endif

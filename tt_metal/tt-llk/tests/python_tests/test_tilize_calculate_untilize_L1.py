@@ -1,0 +1,96 @@
+# SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+# SPDX-License-Identifier: Apache-2.0
+
+from helpers.format_config import DataFormat
+from helpers.golden_generators import EltwiseBinaryGolden, get_golden_generator
+from helpers.llk_params import (
+    ALL_MATH_FIDELITIES,
+    DestAccumulation,
+    MathOperation,
+)
+from helpers.param_config import input_output_formats, parametrize
+from helpers.stimuli_config import StimuliConfig
+from helpers.stimuli_generator import generate_stimuli
+from helpers.test_config import TestConfig
+from helpers.test_variant_parameters import (
+    MATH_FIDELITY,
+    MATH_OP,
+    NUM_BLOCKS,
+    NUM_TILES_IN_BLOCK,
+    TILE_COUNT,
+    generate_input_dim,
+)
+from helpers.tilize_untilize import tilize_block
+from helpers.utils import passed_test, result_tensor
+
+
+@parametrize(
+    formats=input_output_formats(
+        [
+            DataFormat.Float16_b,
+            DataFormat.Float32,
+        ],  # Unpack Tilize & Pack Untilize does not work on Bfp8_b format
+        same=True,
+    ),
+    mathop=[MathOperation.Elwadd, MathOperation.Elwsub, MathOperation.Elwmul],
+    dest_acc=[DestAccumulation.No, DestAccumulation.Yes],
+    math_fidelity=ALL_MATH_FIDELITIES,
+)
+def test_tilize_calculate_untilize_L1(
+    formats,
+    dest_acc,
+    mathop,
+    math_fidelity,
+):
+    input_dimensions = [32, 32]
+
+    src_A, tile_cnt_A, src_B, tile_cnt_B = generate_stimuli(
+        stimuli_format_A=formats.input_format,
+        input_dimensions_A=input_dimensions,
+        stimuli_format_B=formats.input_format,
+        input_dimensions_B=input_dimensions,
+    )
+
+    generate_golden = get_golden_generator(EltwiseBinaryGolden)
+    golden_tensor = generate_golden(
+        mathop,
+        tilize_block(src_A, input_dimensions).flatten(),
+        tilize_block(src_B, input_dimensions).flatten(),
+        formats.output_format,
+        math_fidelity,
+    )
+    num_blocks = 32
+    golden_tensor = golden_tensor.repeat(num_blocks)
+
+    configuration = TestConfig(
+        "sources/tilize_calculate_untilize_L1.cpp",
+        formats,
+        templates=[
+            generate_input_dim(input_dimensions, input_dimensions),
+            MATH_FIDELITY(math_fidelity),
+            MATH_OP(mathop=mathop),
+        ],
+        runtimes=[
+            TILE_COUNT(tile_cnt_A),
+            NUM_BLOCKS(num_blocks),
+            NUM_TILES_IN_BLOCK(1),
+        ],
+        variant_stimuli=StimuliConfig(
+            src_A,
+            formats.input_format,
+            src_B,
+            formats.input_format,
+            formats.output_format,
+            tile_count_A=tile_cnt_A,
+            tile_count_B=tile_cnt_B,
+            tile_count_res=tile_cnt_A * num_blocks,
+        ),
+        dest_acc=dest_acc,
+        L1_to_L1_iterations=2,
+    )
+
+    res_from_L1 = configuration.run().result
+
+    res_tensor = result_tensor(res_from_L1, formats.output_format, golden_tensor)
+
+    assert passed_test(golden_tensor, res_tensor, formats.output_format)

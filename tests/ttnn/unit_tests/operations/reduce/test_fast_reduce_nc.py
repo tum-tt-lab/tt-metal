@@ -1,0 +1,311 @@
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
+
+# SPDX-License-Identifier: Apache-2.0
+
+import pytest
+import torch
+from loguru import logger
+
+import ttnn
+from tt_py_test_utils_common.utility_functions import comp_allclose_and_pcc, comp_pcc
+from tests.ttnn.utils_for_testing import assert_numeric_metrics, assert_with_ulp
+from tests.ttnn.unit_tests.operations.test_utils import (
+    get_compute_kernel_options,
+    compute_kernel_options,
+    compute_kernel_ids,
+    TILE_HEIGHT,
+    TILE_WIDTH,
+)
+
+
+def get_tensors(input_shape, output_shape, device, *, with_padding=True, use_randint=True, dataformat=ttnn.bfloat16):
+    npu_dtype = dataformat
+    cpu_dtype = torch.bfloat16
+    npu_layout = ttnn.TILE_LAYOUT
+
+    if use_randint:
+        torch_input = torch.randint(-2, 3, input_shape, dtype=cpu_dtype, requires_grad=True)
+        torch_output = torch.randint(-2, 3, output_shape, dtype=cpu_dtype)
+    else:
+        torch_input = torch.rand(input_shape, dtype=cpu_dtype, requires_grad=True)
+        torch_output = torch.rand(output_shape, dtype=cpu_dtype)
+
+    if with_padding:
+        tt_input = ttnn.Tensor(torch_input, npu_dtype).pad_to_tile(float("nan")).to(npu_layout).to(device)
+        tt_output = ttnn.Tensor(torch_output, npu_dtype).pad_to_tile(float("nan")).to(npu_layout).to(device)
+    else:
+        tt_input = ttnn.Tensor(torch_input, npu_dtype).to(npu_layout).to(device)
+        tt_output = ttnn.Tensor(torch_output, npu_dtype).to(npu_layout).to(device)
+
+    return tt_input, tt_output, torch_input
+
+
+@pytest.mark.parametrize(
+    "input_shape",
+    (
+        [1, 8, 128, 4096],
+        [1, 8, 1024, 4096],
+        [8, 1, 128, 4096],
+        [4, 2, 1024, 4096],
+    ),
+    ids=[
+        "mixtral_128",
+        "mixtral_1k",
+        "dim0_reduce",
+        "dim01_reduce",
+    ],
+)
+@pytest.mark.parametrize(
+    "dims",
+    ([0], [1], [0, 1]),
+    ids=["0", "1", "0_1"],
+)
+@pytest.mark.parametrize("compute_kernel_options", compute_kernel_options, ids=compute_kernel_ids)
+@pytest.mark.parametrize("dataformat", [ttnn.bfloat16, ttnn.bfloat8_b], ids=["bfloat16", "bfloat8_b"])
+def test_fast_reduce_nc(input_shape, dims, compute_kernel_options, dataformat, device):
+    torch.manual_seed(2023)
+    output_shape = input_shape.copy()
+
+    for dim in dims:
+        output_shape[dim] = 1
+
+    tt_input, tt_output, torch_input = get_tensors(input_shape, output_shape, device, dataformat=dataformat)
+
+    torch_output = torch.sum(torch_input, dims, True)
+
+    compute_kernel_config = get_compute_kernel_options(compute_kernel_options)
+    cpu_layout = ttnn.ROW_MAJOR_LAYOUT
+    tt_output = ttnn.experimental.fast_reduce_nc(
+        tt_input, dims=dims, output=None, compute_kernel_config=compute_kernel_config
+    )
+    tt_output_cpu = tt_output.cpu().to(cpu_layout).to_torch()
+
+    # test for equivalance
+    assert_numeric_metrics(
+        torch_output,
+        tt_output_cpu,
+        pcc_threshold=0.9999,
+        rtol=1e-06,
+        atol=1e-06,
+        frobenius_threshold=1e-09,
+    )
+
+
+# Program caching test
+@pytest.mark.parametrize(
+    "dims",
+    ([0], [1], [0, 1]),
+    ids=["0", "1", "0_1"],
+)
+def test_fast_reduce_nc_with_prgm_caching(dims, device):
+    torch.manual_seed(2023)
+
+    input_shape_1 = [1, 8, 128, 4096]
+    output_shape_1 = input_shape_1.copy()
+
+    for _ in range(3):
+        # Apply offset in dram and l1 to test program cache
+        # shift input/output tensor by creating very small tensor between loop
+        inp = torch.rand(1, 1, 32, 32)
+        test_tensor = (
+            ttnn.from_torch(inp, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT).to(ttnn.TILE_LAYOUT).to(device)
+        )
+        shard_spec_1_cores_grid = ttnn.CoreRangeSet(
+            {
+                ttnn.CoreRange(
+                    ttnn.CoreCoord(0, 0),
+                    ttnn.CoreCoord(0, 0),
+                ),
+            }
+        )
+        test_mem_cfg = ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+            ttnn.BufferType.L1,
+            ttnn.ShardSpec(
+                shard_spec_1_cores_grid,  # Volume must match # of attn heads
+                [
+                    32,  # Each core has 32 users
+                    32,  # head dim
+                ],
+                ttnn.ShardOrientation.ROW_MAJOR,
+            ),
+        )
+        test_tensor = ttnn.interleaved_to_sharded(test_tensor, test_mem_cfg)
+
+        # Test op
+        for dim in dims:
+            output_shape_1[dim] = 1
+
+        tt_input, tt_output, torch_input = get_tensors(input_shape_1, output_shape_1, device)
+
+        torch_output = torch.sum(torch_input, dims, True)
+
+        cpu_layout = ttnn.ROW_MAJOR_LAYOUT
+        tt_output = ttnn.experimental.fast_reduce_nc(tt_input, dims=dims, output=None)
+        tt_output_cpu = tt_output.cpu().to(cpu_layout).unpad_from_tile(output_shape_1).to_torch()
+
+        # test for equivalance
+        assert_numeric_metrics(
+            torch_output,
+            tt_output_cpu,
+            pcc_threshold=0.9999,
+            rtol=1e-06,
+            atol=1e-06,
+            frobenius_threshold=1e-09,
+            check_ulp=True,
+        )
+
+        assert device.num_program_cache_entries() == len(dims) + 1
+
+    input_shape_2 = [1, 8, 32, 32]
+    output_shape_2 = input_shape_2.copy()
+
+    for _ in range(2):
+        # Test op
+        for dim in dims:
+            output_shape_2[dim] = 1
+
+        tt_input, tt_output, torch_input = get_tensors(input_shape_2, output_shape_2, device)
+
+        torch_output = torch.sum(torch_input, dims, True)
+
+        cpu_layout = ttnn.ROW_MAJOR_LAYOUT
+        tt_output = ttnn.experimental.fast_reduce_nc(tt_input, dims=dims, output=None)
+        tt_output_cpu = tt_output.cpu().to(cpu_layout).unpad_from_tile(output_shape_2).to_torch()
+
+        # test for equivalance
+        assert_numeric_metrics(
+            torch_output,
+            tt_output_cpu,
+            pcc_threshold=0.999,
+            rtol=1e-06,
+            atol=1e-06,
+            frobenius_threshold=1e-09,
+            check_ulp=True,
+        )
+
+        assert device.num_program_cache_entries() == 2 * len(dims) + 1
+
+
+@pytest.mark.parametrize("shape,dim,split", [((1, 4, 640, 576), 1, 512), ((3, 2, 96, 192), 0, 128)])
+@pytest.mark.parametrize("dtype", [ttnn.bfloat16, ttnn.bfloat8_b, ttnn.float32])
+def test_fast_reduce_nc_split_with_prgm_caching(device, shape, dim, split, dtype):
+    device.disable_and_clear_program_cache()
+    device.enable_program_cache()
+    config = ttnn.init_device_compute_kernel_config(
+        device.arch(), math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, math_approx_mode=False
+    )
+    keep_alive = []
+    for seed in (13, 31):
+        torch.manual_seed(seed)
+        output_shape = list(shape)
+        output_shape[dim] = 1
+        x, output_buffer, _ = get_tensors(
+            list(shape), output_shape, device, with_padding=False, use_randint=False, dataformat=dtype
+        )
+        # The split runs on the FPU only, so the full reduction must take the FPU path too to match bit-for-bit.
+        full = ttnn.experimental.fast_reduce_nc(
+            x, dims=[dim], output=output_buffer, compute_kernel_config=config, fast_and_approximate_mode=True
+        )
+        assert full.buffer_address() == output_buffer.buffer_address()
+        ref = ttnn.to_torch(full)
+        left, right = ttnn.experimental.fast_reduce_nc_split(
+            x, dim=dim, split_output_width=split, compute_kernel_config=config
+        )
+        torch.testing.assert_close(ttnn.to_torch(left), ref[..., :split], rtol=0, atol=0)
+        torch.testing.assert_close(ttnn.to_torch(right), ref[..., split:], rtol=0, atol=0)
+        keep_alive.append((x, full, left, right))
+    assert keep_alive[0][2].buffer_address() != keep_alive[1][2].buffer_address()
+    assert keep_alive[0][3].buffer_address() != keep_alive[1][3].buffer_address()
+    assert device.num_program_cache_entries() == 2
+
+
+@pytest.mark.parametrize("split", [0, 17, 256, 288])
+def test_fast_reduce_nc_split_invalid_width(device, split, expect_error):
+    x, _, _ = get_tensors([1, 1, 32, 256], [1, 1, 32, 256], device, with_padding=False)
+    with expect_error(RuntimeError, "tile-aligned"):
+        ttnn.experimental.fast_reduce_nc_split(x, dim=1, split_output_width=split)
+
+
+# dim was bounded only by the rank, so dims=[2] or [3] were accepted and the reader treated shape[dim]
+# as a count of H*W tile planes, reading far past the input.
+@pytest.mark.parametrize("dims", [[2], [3]], ids=["H", "W"])
+def test_fast_reduce_nc_rejects_hw_dims(device, dims, expect_error):
+    x, _, _ = get_tensors([1, 1, 32, 128], [1, 1, 32, 128], device, with_padding=False)
+    with expect_error(RuntimeError, "FastReduceNC reduces only outer dims"):
+        ttnn.experimental.fast_reduce_nc(x, dims=dims)
+
+
+@pytest.mark.parametrize("input_shape", [[1, 8, 128, 4096], [1, 32, 128, 2880]], ids=["dense8", "experts32"])
+def test_fast_reduce_nc_float32_default_config(input_shape, device):
+    torch.manual_seed(0)
+    torch_input = torch.randn(input_shape, dtype=torch.float32)
+    x = ttnn.from_torch(torch_input, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+    out = ttnn.to_torch(ttnn.experimental.fast_reduce_nc(x, dims=[1]))
+    ref = torch.sum(torch_input.double(), dim=1, keepdim=True).float()
+    torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-5)
+
+
+# fp32 sums on the SFPU at full precision by default. Fast mode sums tf32 on the FPU; fp32_dest_acc_en off sums in a
+# 16-bit DEST.
+@pytest.mark.parametrize(
+    "fast_and_approximate_mode, fp32_dest_acc_en",
+    [(False, None), (False, False), (True, None)],
+    ids=["sfpu", "acc_off", "fast"],
+)
+def test_fast_reduce_nc_fp32(device, fast_and_approximate_mode, fp32_dest_acc_en):
+    dims = [0, 1]
+    torch.manual_seed(0)
+    torch_input = torch.rand((8, 16, 64, 64), dtype=torch.float32)
+    expected = torch.sum(torch_input, dim=dims, keepdim=True)
+    config = (
+        None
+        if fp32_dest_acc_en is None
+        else ttnn.init_device_compute_kernel_config(
+            device.arch(), math_fidelity=ttnn.MathFidelity.HiFi3, fp32_dest_acc_en=fp32_dest_acc_en
+        )
+    )
+    x = ttnn.from_torch(torch_input, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+    actual = ttnn.to_torch(
+        ttnn.experimental.fast_reduce_nc(
+            x, dims=dims, compute_kernel_config=config, fast_and_approximate_mode=fast_and_approximate_mode
+        )
+    )
+    if not fast_and_approximate_mode and fp32_dest_acc_en is not False:
+        assert_with_ulp(expected_result=expected, actual_result=actual, ulp_threshold=2)
+    else:
+        torch.testing.assert_close(actual, expected, rtol=5e-2, atol=0)
+
+
+def test_fast_reduce_nc_int32_requires_fp32_dest_acc(device, expect_error):
+    x = ttnn.from_torch(torch.ones((2, 1, 32, 32), dtype=torch.int32), layout=ttnn.TILE_LAYOUT, device=device)
+    config = ttnn.init_device_compute_kernel_config(device.arch(), fp32_dest_acc_en=False)
+    with expect_error(RuntimeError, "requires fp32_dest_acc_en"):
+        ttnn.experimental.fast_reduce_nc(x, dims=[0], compute_kernel_config=config)
+
+
+# The post-multiply factor is a runtime arg, so sum, scaled sum and mean of one tensor share one program,
+# and each cache hit must apply its own factor. (3, 7, 160, 160) dim 1 splits 75 output tiles over two core groups.
+@pytest.mark.parametrize(
+    "shape, dim, dtype",
+    [((8, 16, 128, 128), 0, ttnn.float32), ((3, 7, 160, 160), 1, ttnn.bfloat16)],
+    ids=["fp32", "bf16"],
+)
+def test_fast_reduce_nc_post_mul_shares_program(device, shape, dim, dtype):
+    device.disable_and_clear_program_cache()
+    device.enable_program_cache()
+    torch.manual_seed(0)
+    x = ttnn.from_torch(torch.randn(shape) * 0.25 + 1.0, dtype=dtype, layout=ttnn.TILE_LAYOUT, device=device)
+    torch_sum = torch.sum(ttnn.to_torch(x).double(), dim=dim, keepdim=True)
+    calls = [
+        (lambda: ttnn.sum(x, dim=dim, keepdim=True), 1.0),
+        (lambda: ttnn.sum(x, dim=dim, keepdim=True, scalar=2.0), 2.0),
+        (lambda: ttnn.mean(x, dim=dim, keepdim=True), 1.0 / shape[dim]),
+        (lambda: ttnn.mean(x, dim=dim, keepdim=True, scalar=3.0), 3.0 / shape[dim]),
+    ]
+    entries = None
+    for call, factor in calls:
+        actual = ttnn.to_torch(call()).double()
+        torch.testing.assert_close(actual, torch_sum * factor, rtol=1e-2 if dtype == ttnn.bfloat16 else 1e-6, atol=0)
+        entries = entries or device.num_program_cache_entries()
+        assert device.num_program_cache_entries() == entries

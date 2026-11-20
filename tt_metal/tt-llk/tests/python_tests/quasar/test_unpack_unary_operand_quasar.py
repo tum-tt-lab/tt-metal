@@ -1,0 +1,361 @@
+# SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+# SPDX-License-Identifier: Apache-2.0
+
+from typing import List
+
+import pytest
+import torch
+from helpers.constraints import (
+    is_valid_data_format_conversion,
+    is_valid_quasar_dest_mode_conversion,
+)
+from helpers.data_format_inference import unpacks_to_dest
+from helpers.format_config import DataFormat, FormatConfig
+from helpers.golden_generators import (
+    DataCopyGolden,
+    TransposeGolden,
+    get_golden_generator,
+    quantize_mx_tensor_chunked,
+)
+from helpers.llk_params import (
+    BlocksCalculationAlgorithm,
+    DataCopyType,
+    DestAccumulation,
+    PerfRunType,
+    Transpose,
+    UnpackerEngine,
+)
+from helpers.param_config import (
+    flat_axes,
+    generate_perf_input_dimensions,
+    generate_reduced_input_dimensions,
+    get_num_blocks_and_num_tiles_in_block,
+    input_output_formats,
+    parametrize,
+    quasar_dest_sync_modes,
+    runtime,
+    select_perf_tile_sizes,
+)
+from helpers.perf.core import create_test_or_perf_config
+from helpers.stimuli_config import StimuliConfig
+from helpers.stimuli_generator import (  # generate_stimuli_w_tile_dimensions
+    generate_stimuli,
+)
+from helpers.test_config import BootMode
+from helpers.test_variant_parameters import (
+    DATA_COPY_TYPE,
+    DEST_SYNC,
+    LOOP_FACTOR,
+    NUM_BLOCKS,
+    NUM_FACES,
+    NUM_FACES_C_DIM,
+    NUM_FACES_R_DIM,
+    NUM_TILES_IN_BLOCK,
+    TEST_FACE_DIMS,
+    TILE_COUNT,
+    UNPACK_TRANS_FACES,
+    UNPACK_TRANS_WITHIN_FACE,
+    UNPACKER_ENGINE_SEL,
+    generate_input_dim,
+)
+from helpers.tile_constants import (
+    MX_SUPPORTED_TILE_SIZES,
+    SUPPORTED_TILE_SIZES,
+    is_mx_unsupported_tile_dims,
+)
+from helpers.tile_shape import construct_tile_shape
+from helpers.utils import passed_test, result_tensor
+
+
+def generate_unpack_unary_operand_combinations(
+    formats_list: List[FormatConfig],
+    *,
+    is_perf=False,
+):
+    """
+    Generate unpack_unary_operand combinations.
+
+    Rules:
+    1. When unpacking to dest, transpose is not yet supported.
+
+    Args: List of input-output format pairs
+
+    Returns: List of (format, dest_acc, transpose_en, unpacker_sel, input_dimensions) tuples
+    """
+    combinations = []
+    dest_sync_modes = quasar_dest_sync_modes(is_perf=is_perf)
+
+    for fmt in formats_list:
+        if not is_valid_data_format_conversion(fmt):
+            continue
+        in_fmt = fmt.input_format
+
+        if in_fmt.is_32_bit():
+            dest_acc_modes = (DestAccumulation.Yes,)
+        elif in_fmt == DataFormat.Int16:
+            # Int16 in the source registers cannot land in a 32-bit Dest.
+            dest_acc_modes = (DestAccumulation.No,)
+        else:
+            dest_acc_modes = (DestAccumulation.No, DestAccumulation.Yes)
+        transpose_modes = (
+            (Transpose.No,) if in_fmt.is_32_bit() else (Transpose.No, Transpose.Yes)
+        )
+        unpacker_engines = (
+            (UnpackerEngine.UnpDest,)
+            if in_fmt.is_32_bit()
+            else (UnpackerEngine.UnpA, UnpackerEngine.UnpB)
+        )
+
+        if is_perf:
+            # Same packer constraint as the correctness path: a non-32-bit input cannot
+            # pack to a 32-bit format when dest is in 16-bit mode.
+            if not in_fmt.is_32_bit() and fmt.output_format.is_32_bit():
+                continue
+            dest_acc_modes = (
+                dest_acc_modes if in_fmt.is_32_bit() else (DestAccumulation.No,)
+            )
+
+        for dest_acc in dest_acc_modes:
+            if not is_valid_quasar_dest_mode_conversion(
+                in_fmt, fmt.output_format, dest_acc
+            ):
+                continue
+            for dest_sync in dest_sync_modes:
+                for transpose_en in transpose_modes:
+                    # transpose is not supported for tiny-tiles
+                    functional_tile_sizes = (
+                        ((32, 32),)
+                        if transpose_en == Transpose.Yes
+                        else SUPPORTED_TILE_SIZES
+                    )
+                    tile_sizes = (
+                        select_perf_tile_sizes(functional_tile_sizes)
+                        if is_perf
+                        else functional_tile_sizes
+                    )
+                    for unpacker_sel in unpacker_engines:
+                        for tile_dims in tile_sizes:
+                            if is_mx_unsupported_tile_dims(
+                                in_fmt, fmt.output_format, tile_dims
+                            ):
+                                continue
+                            if (
+                                unpacker_sel == UnpackerEngine.UnpDest
+                                and tile_dims not in MX_SUPPORTED_TILE_SIZES
+                            ):
+                                continue
+                            tile_shape = construct_tile_shape(tile_dims)
+                            dimensions_list = (
+                                generate_perf_input_dimensions(
+                                    dest_acc, dest_sync, tile_shape
+                                )
+                                if is_perf
+                                else generate_reduced_input_dimensions(
+                                    dest_acc, dest_sync=dest_sync, tile_shape=tile_shape
+                                )
+                            )
+                            for dimensions in dimensions_list:
+                                combinations.append(
+                                    (
+                                        fmt,
+                                        dest_acc,
+                                        dest_sync,
+                                        transpose_en,
+                                        unpacker_sel,
+                                        runtime(dimensions),
+                                        runtime(tile_dims),
+                                    )
+                                )
+
+    return combinations
+
+
+UNPACK_FORMATS = input_output_formats(
+    [
+        DataFormat.Float16_b,
+        DataFormat.Float32,
+        DataFormat.Int32,
+        DataFormat.Int8,
+        DataFormat.UInt8,
+        DataFormat.Int4,
+        DataFormat.UInt4,
+        DataFormat.MxFp8R,
+        DataFormat.MxFp8P,
+        DataFormat.MxFp4,
+        DataFormat.MxInt8,
+        DataFormat.MxInt4,
+        DataFormat.MxInt2,
+    ]
+)
+# Column names of the tuples ``generate_unpack_unary_operand_combinations`` returns.
+UNPACK_UNARY_OPERAND_FLAT_NAMES = (
+    "formats",
+    "dest_acc",
+    "dest_sync",
+    "transpose_en",
+    "unpacker_sel",
+    "input_dimensions",
+    "tile_dimensions",
+)
+# Int16 only pairs with itself; it is kept out of the perf sweep below.
+ALL_UNPACK_UNARY_OPERAND_COMBINATIONS = generate_unpack_unary_operand_combinations(
+    UNPACK_FORMATS + input_output_formats([DataFormat.Int16])
+)
+PERF_UNPACK_UNARY_OPERAND_COMBINATIONS = generate_unpack_unary_operand_combinations(
+    UNPACK_FORMATS,
+    is_perf=True,
+)
+
+
+@pytest.mark.quasar
+@parametrize(
+    **flat_axes(UNPACK_UNARY_OPERAND_FLAT_NAMES, ALL_UNPACK_UNARY_OPERAND_COMBINATIONS),
+    run_types=[[PerfRunType.L1_TO_L1]],
+    loop_factor=[1],
+)
+def test_unpack_unary_operand_quasar(
+    formats,
+    dest_acc,
+    dest_sync,
+    transpose_en,
+    unpacker_sel,
+    input_dimensions,
+    tile_dimensions,
+    run_types,
+    loop_factor,
+    boot_mode=BootMode.DEFAULT,
+    *,
+    is_perf=False,
+    perf_report=None,
+):
+    tile_shape = construct_tile_shape(tile_dimensions)
+
+    src_A, tile_cnt_A, src_B, _ = generate_stimuli(
+        stimuli_format_A=formats.input_format,
+        input_dimensions_A=input_dimensions,
+        stimuli_format_B=formats.input_format,
+        input_dimensions_B=input_dimensions,
+        tile_dimensions=tile_dimensions,
+    )
+
+    num_faces = tile_shape.total_num_faces()
+
+    num_blocks, tiles_in_block = get_num_blocks_and_num_tiles_in_block(
+        dest_sync,
+        dest_acc,
+        formats,
+        input_dimensions,
+        tile_dimensions,
+        BlocksCalculationAlgorithm.Standard,
+    )
+
+    golden_src = (
+        src_B if unpacker_sel == UnpackerEngine.UnpB else src_A
+    )  # use A for UnpA and UnpDest
+    if transpose_en == Transpose.Yes:
+        if formats.input_format.is_mx_format():
+            golden_src = quantize_mx_tensor_chunked(golden_src, formats.input_format)
+
+        generate_golden = get_golden_generator(TransposeGolden)
+        golden_tensor = generate_golden.transpose_faces_multi_tile(
+            golden_src,
+            formats.output_format,
+            num_tiles=tile_cnt_A,
+            tilize=False,
+            input_dimensions=input_dimensions,
+        )
+        golden_tensor = generate_golden.transpose_within_faces_multi_tile(
+            golden_tensor,
+            formats.output_format,
+            num_tiles=tile_cnt_A,
+            untilize=False,
+            input_dimensions=input_dimensions,
+        )
+        # TransposeGolden only rearranges; it doesn't round-trip through the
+        # output MX lattice the way DataCopyGolden does. For MxFp4 -> MxInt4
+        # the MxFp4 lattice has 1.5 but MxInt4 (with the realized block scale)
+        # may not, so HW rounds 1.5 -> 2.0 while golden keeps 1.5. Snap golden
+        # to the output lattice here to match.
+        if formats.output_format.is_mx_format():
+            golden_tensor = quantize_mx_tensor_chunked(
+                golden_tensor.to(torch.bfloat16), formats.output_format
+            )
+    else:
+        generate_golden = get_golden_generator(DataCopyGolden)
+        golden_tensor = generate_golden(
+            golden_src,
+            formats.output_format,
+            num_faces=num_faces,
+            input_dimensions=input_dimensions,
+            input_format=formats.input_format,
+            face_r_dim=tile_shape.face_r_dim,
+            tile_shape=tile_shape,
+        )
+
+    if is_perf and perf_report is None:
+        raise ValueError("perf_report must be provided when is_perf=True")
+
+    test_config_kwargs = {
+        "test_name": "sources/quasar/unpack_unary_operand_quasar_test.cpp",
+        "formats": formats,
+        "templates": [
+            UNPACKER_ENGINE_SEL(unpacker_sel),
+            DATA_COPY_TYPE(
+                DataCopyType.B2D
+                if unpacker_sel == UnpackerEngine.UnpB
+                else DataCopyType.A2D
+            ),
+            DEST_SYNC(dest_sync),
+            UNPACK_TRANS_FACES(transpose_en),
+            UNPACK_TRANS_WITHIN_FACE(transpose_en),
+        ],
+        "runtimes": [
+            generate_input_dim(
+                input_dimensions,
+                input_dimensions,
+                tile_dimensions=tile_dimensions,
+            ),
+            TEST_FACE_DIMS(tile_shape.face_r_dim),
+            NUM_FACES(num_faces),
+            TILE_COUNT(tile_cnt_A),
+            NUM_BLOCKS(num_blocks),
+            NUM_TILES_IN_BLOCK(tiles_in_block),
+            NUM_FACES_R_DIM(tile_shape.num_faces_r_dim),
+            NUM_FACES_C_DIM(tile_shape.num_faces_c_dim),
+            LOOP_FACTOR(loop_factor),
+        ],
+        "variant_stimuli": StimuliConfig(
+            src_A,
+            formats.input_format,
+            src_B,
+            formats.input_format,
+            formats.output_format,
+            tile_count_A=tile_cnt_A,
+            tile_count_B=tile_cnt_A,
+            tile_count_res=tile_cnt_A,
+            num_faces=num_faces,
+            face_r_dim=tile_shape.face_r_dim,
+            tile_dimensions=tile_dimensions,
+            use_dense_tile_dimensions=True,
+        ),
+        "unpack_to_dest": unpacks_to_dest(formats.input_format, dest_acc),
+        "dest_acc": dest_acc,
+    }
+
+    configuration = create_test_or_perf_config(
+        is_perf=is_perf,
+        run_types=run_types,
+        test_config_kwargs=test_config_kwargs,
+        boot_mode=boot_mode,
+    )
+    if is_perf:
+        configuration.run(perf_report)
+        return
+
+    res_from_L1 = configuration.run().result
+
+    res_tensor = result_tensor(res_from_L1, formats.output_format, golden_tensor)
+
+    assert passed_test(
+        golden_tensor, res_tensor, formats.output_format, tile_shape=tile_shape
+    ), "Assert against golden failed"

@@ -1,0 +1,657 @@
+# SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
+
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import re
+from typing import TYPE_CHECKING
+
+import torch
+
+import ttnn
+
+from ..parallel.config import vae_all_gather
+from ..parallel.manager import CCLManager
+from .module import Module, Parameter
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from typing_extensions import Self
+
+
+# TODO: Add support for coll and row parallel conv2d
+class Conv2d(Module):
+    """
+    Conv2d with support for tensor parallelism. Data and Sequence Parallelism TBD.
+
+    """
+
+    compute_config = ttnn.WormholeComputeKernelConfig(
+        math_fidelity=ttnn.MathFidelity.HiFi4,
+        math_approx_mode=False,
+        fp32_dest_acc_en=True,
+        packer_l1_acc=False,
+    )
+
+    # Keep each conv's halo/reader config tensors in DRAM instead of L1_SMALL. They stay allocated
+    # with every cached program, so a model that runs many input sizes fills L1_SMALL without it.
+    config_tensors_in_dram: bool = False
+
+    # Mesh shape -> (input height, input width, in channels, out channels) -> number of DRAM width
+    # slices; 1 runs the conv on the whole input in L1. A shape missing here gets no slice config,
+    # so ttnn picks the slicing from the L1 free at call time. Models can extend the table for their
+    # own convs with configure_conv2d.
+    slice_params = {
+        (1, 4): {
+            (512, 512, 512, 64): 16,
+            (128, 128, 16, 512): 4,  # max = ceil(128/32) = 4 for TILE DRAM_WIDTH
+            (128, 128, 512, 512): 4,
+            (256, 256, 512, 512): 8,
+            (512, 512, 512, 512): 16,
+            (512, 512, 512, 256): 16,
+            (512, 512, 256, 256): 4,
+            (512, 512, 128, 3): 4,
+            (1024, 1024, 256, 256): 16,
+            (1024, 1024, 256, 128): 16,
+            (1024, 1024, 128, 128): 16,
+            (1024, 1024, 128, 3): 8,
+            (128, 128, 16, 16): 1,
+            (128, 128, 16, 384): 1,
+            (128, 128, 384, 384): 1,
+            (256, 256, 192, 384): 2,
+            (256, 256, 384, 192): 2,
+            (256, 256, 384, 384): 4,
+            (512, 512, 192, 192): 4,
+            (512, 512, 384, 192): 8,
+            (1024, 1024, 96, 3): 8,
+            (1024, 1024, 96, 96): 8,
+            (1024, 1024, 192, 96): 16,
+            (128, 128, 32, 512): 1,
+            # Flux2 VAE shapes for 2048x2048, 4096x4096, 8192x8192
+            (256, 256, 32, 512): 4,
+            (512, 512, 32, 512): 8,
+            (1024, 1024, 32, 512): 16,
+            (1024, 1024, 512, 512): 32,
+            (1024, 1024, 512, 256): 32,
+            (2048, 2048, 256, 256): 64,
+            (2048, 2048, 256, 128): 64,
+            (2048, 2048, 128, 128): 64,
+            (2048, 2048, 128, 3): 32,
+            (2048, 2048, 512, 512): 64,
+            (2048, 2048, 512, 256): 64,
+            (4096, 4096, 512, 512): 128,
+            (4096, 4096, 512, 256): 128,
+            (4096, 4096, 256, 256): 128,
+            (4096, 4096, 256, 128): 128,
+            (4096, 4096, 128, 128): 128,
+            (4096, 4096, 128, 3): 64,
+            (8192, 8192, 256, 256): 256,
+            (8192, 8192, 256, 128): 256,
+            (8192, 8192, 128, 128): 256,
+            (8192, 8192, 128, 3): 128,
+            (64, 64, 48, 1024): 2,
+            (64, 64, 1024, 1024): 2,
+            (128, 128, 1024, 1024): 4,
+            (256, 256, 1024, 1024): 8,
+            (256, 256, 1024, 512): 8,
+            (512, 512, 256, 12): 4,
+        },
+        (1, 8): {
+            (512, 512, 512, 64): 16,
+            (128, 128, 16, 512): 8,
+            (128, 128, 512, 512): 4,
+            (256, 256, 512, 512): 8,
+            (512, 512, 512, 512): 16,
+            (512, 512, 512, 256): 16,
+            (512, 512, 256, 256): 4,
+            (1024, 1024, 256, 256): 16,
+            (1024, 1024, 256, 128): 16,
+            (1024, 1024, 128, 128): 16,
+            (1024, 1024, 128, 3): 8,
+            (128, 128, 16, 16): 1,
+            (128, 128, 16, 384): 1,
+            (128, 128, 384, 384): 1,
+            (256, 256, 192, 384): 2,
+            (256, 256, 384, 192): 2,
+            (256, 256, 384, 384): 4,
+            (512, 512, 192, 192): 4,
+            (512, 512, 384, 192): 8,
+            (1024, 1024, 96, 3): 8,
+            (1024, 1024, 96, 96): 8,
+            (1024, 1024, 192, 96): 16,
+            (128, 128, 32, 512): 1,
+            # Flux2 VAE shapes for 2048x2048, 4096x4096, 8192x8192
+            (256, 256, 32, 512): 4,
+            (512, 512, 32, 512): 8,
+            (1024, 1024, 32, 512): 16,
+            (1024, 1024, 512, 512): 32,
+            (1024, 1024, 512, 256): 32,
+            (2048, 2048, 256, 256): 64,
+            (2048, 2048, 256, 128): 64,
+            (2048, 2048, 128, 128): 64,
+            (2048, 2048, 128, 3): 32,
+            (2048, 2048, 512, 512): 64,
+            (2048, 2048, 512, 256): 64,
+            (4096, 4096, 512, 512): 128,
+            (4096, 4096, 512, 256): 128,
+            (4096, 4096, 256, 256): 128,
+            (4096, 4096, 256, 128): 128,
+            (4096, 4096, 128, 128): 128,
+            (4096, 4096, 128, 3): 64,
+            (8192, 8192, 256, 256): 256,
+            (8192, 8192, 256, 128): 256,
+            (8192, 8192, 128, 128): 256,
+            (8192, 8192, 128, 3): 128,
+        },
+        (4, 4): {
+            (512, 512, 512, 64): 16,
+            (128, 128, 16, 512): 4,  # max = ceil(128/32) = 4 for TILE DRAM_WIDTH
+            (128, 128, 512, 512): 4,
+            (256, 256, 512, 512): 8,
+            (512, 512, 512, 512): 16,
+            (512, 512, 512, 256): 16,
+            (512, 512, 256, 256): 4,
+            (512, 512, 128, 3): 4,
+            (1024, 1024, 256, 256): 16,
+            (1024, 1024, 256, 128): 16,
+            (1024, 1024, 128, 128): 16,
+            (1024, 1024, 128, 3): 8,
+            (128, 128, 16, 16): 1,
+            (128, 128, 16, 384): 1,
+            (128, 128, 384, 384): 1,
+            (256, 256, 192, 384): 2,
+            (256, 256, 384, 192): 2,
+            (256, 256, 384, 384): 4,
+            (512, 512, 192, 192): 4,
+            (512, 512, 384, 192): 8,
+            (1024, 1024, 96, 3): 8,
+            (1024, 1024, 96, 96): 8,
+            (1024, 1024, 192, 96): 16,
+            (128, 128, 32, 512): 1,
+            # Flux2 VAE shapes for 2048x2048, 4096x4096, 8192x8192
+            (256, 256, 32, 512): 4,
+            (512, 512, 32, 512): 8,
+            (1024, 1024, 32, 512): 16,
+            (1024, 1024, 512, 512): 32,
+            (1024, 1024, 512, 256): 32,
+            (2048, 2048, 256, 256): 64,
+            (2048, 2048, 256, 128): 64,
+            (2048, 2048, 128, 128): 64,
+            (2048, 2048, 128, 3): 32,
+            (2048, 2048, 512, 512): 64,
+            (2048, 2048, 512, 256): 64,
+            (4096, 4096, 512, 512): 128,
+            (4096, 4096, 512, 256): 128,
+            (4096, 4096, 256, 256): 128,
+            (4096, 4096, 256, 128): 128,
+            (4096, 4096, 128, 128): 128,
+            (4096, 4096, 128, 3): 64,
+            (8192, 8192, 256, 256): 256,
+            (8192, 8192, 256, 128): 256,
+            (8192, 8192, 128, 128): 256,
+            (8192, 8192, 128, 3): 128,
+            (64, 64, 48, 1024): 2,
+            (64, 64, 1024, 1024): 2,
+            (128, 128, 1024, 1024): 4,
+            (256, 256, 1024, 1024): 8,
+            (256, 256, 1024, 512): 8,
+            (512, 512, 256, 12): 4,
+        },
+        (2, 4): {
+            (128, 128, 16, 512): 4,  # max = ceil(128/32) = 4 for TILE DRAM_WIDTH
+            (128, 128, 512, 512): 4,
+            (256, 256, 512, 512): 8,
+            (512, 512, 512, 512): 16,
+            (512, 512, 512, 256): 16,
+            (512, 512, 256, 256): 4,
+            (512, 512, 128, 3): 4,
+            (1024, 1024, 256, 256): 16,
+            (1024, 1024, 256, 128): 16,
+            (1024, 1024, 128, 128): 16,
+            (1024, 1024, 128, 3): 8,
+            (128, 128, 16, 16): 1,
+            (128, 128, 16, 384): 1,
+            (128, 128, 384, 384): 1,
+            (256, 256, 192, 384): 2,
+            (256, 256, 384, 192): 2,
+            (256, 256, 384, 384): 4,
+            (512, 512, 192, 192): 4,
+            (512, 512, 384, 192): 8,
+            (1024, 1024, 96, 3): 8,
+            (1024, 1024, 96, 96): 8,
+            (1024, 1024, 192, 96): 16,
+            (128, 128, 32, 512): 1,
+            # Flux2 VAE shapes for 2048x2048, 4096x4096, 8192x8192
+            (256, 256, 32, 512): 4,
+            (512, 512, 32, 512): 8,
+            (1024, 1024, 32, 512): 16,
+            (1024, 1024, 512, 512): 32,
+            (1024, 1024, 512, 256): 32,
+            (2048, 2048, 256, 256): 64,
+            (2048, 2048, 256, 128): 64,
+            (2048, 2048, 128, 128): 64,
+            (2048, 2048, 128, 3): 32,
+            (2048, 2048, 512, 512): 64,
+            (2048, 2048, 512, 256): 64,
+            (4096, 4096, 512, 512): 128,
+            (4096, 4096, 512, 256): 128,
+            (4096, 4096, 256, 256): 128,
+            (4096, 4096, 256, 128): 128,
+            (4096, 4096, 128, 128): 128,
+            (4096, 4096, 128, 3): 64,
+            (8192, 8192, 256, 256): 256,
+            (8192, 8192, 256, 128): 256,
+            (8192, 8192, 128, 128): 256,
+            (8192, 8192, 128, 3): 128,
+            (64, 64, 48, 1024): 2,
+            (64, 64, 1024, 1024): 2,
+            (128, 128, 1024, 1024): 4,
+            (256, 256, 1024, 1024): 8,
+            (256, 256, 1024, 512): 8,
+            (512, 512, 256, 12): 4,
+        },
+    }
+    slice_default = {
+        (512, 512, 512, 64): 16,
+        (128, 128, 16, 512): 4,  # max = ceil(128/32) = 4 for TILE DRAM_WIDTH
+        (128, 128, 512, 512): 4,
+        (256, 256, 512, 512): 8,
+        (512, 512, 512, 512): 16,
+        (512, 512, 512, 256): 16,
+        (512, 512, 256, 256): 4,
+        (512, 512, 128, 3): 4,
+        (1024, 1024, 256, 256): 16,
+        (1024, 1024, 256, 128): 16,
+        (1024, 1024, 128, 128): 16,
+        (1024, 1024, 128, 3): 8,
+        (128, 128, 16, 16): 1,
+        (128, 128, 16, 384): 1,
+        (128, 128, 384, 384): 1,
+        (256, 256, 192, 384): 2,
+        (256, 256, 384, 192): 2,
+        (256, 256, 384, 384): 4,
+        (512, 512, 192, 192): 4,
+        (512, 512, 384, 192): 8,
+        (1024, 1024, 96, 3): 8,
+        (1024, 1024, 96, 96): 8,
+        (1024, 1024, 192, 96): 16,
+        (128, 128, 32, 512): 1,
+        # Flux2 VAE shapes for 2048x2048, 4096x4096, 8192x8192
+        (256, 256, 32, 512): 4,
+        (512, 512, 32, 512): 8,
+        (1024, 1024, 32, 512): 16,
+        (1024, 1024, 512, 512): 32,
+        (1024, 1024, 512, 256): 32,
+        (2048, 2048, 256, 256): 64,
+        (2048, 2048, 256, 128): 64,
+        (2048, 2048, 128, 128): 64,
+        (2048, 2048, 128, 3): 32,
+        (2048, 2048, 512, 512): 64,
+        (2048, 2048, 512, 256): 64,
+        (4096, 4096, 512, 512): 128,
+        (4096, 4096, 512, 256): 128,
+        (4096, 4096, 256, 256): 128,
+        (4096, 4096, 256, 128): 128,
+        (4096, 4096, 128, 128): 128,
+        (4096, 4096, 128, 3): 64,
+        (8192, 8192, 256, 256): 256,
+        (8192, 8192, 256, 128): 256,
+        (8192, 8192, 128, 128): 256,
+        (8192, 8192, 128, 3): 128,
+        (64, 64, 48, 1024): 2,
+        (64, 64, 1024, 1024): 2,
+        (128, 128, 1024, 1024): 4,
+        (256, 256, 1024, 1024): 8,
+        (256, 256, 1024, 512): 8,
+        (512, 512, 256, 12): 4,
+        # FIBO VAE entries (z_dim=48, decoder_base_dim=256, dims=[1024,1024,1024,512,256])
+        # Spatial dims: conv_in @ (h,w), then 3 upsamples to (2h,2w), (4h,4w), (8h,8w)
+        # 1MP tier - 1152x768 (latent 48x72)
+        (48, 72, 48, 1024): 2,  # conv_in
+        (48, 72, 1024, 1024): 2,  # mid_block, up_block 0
+        (96, 144, 1024, 1024): 4,  # up_block 1
+        (192, 288, 1024, 1024): 8,  # up_block 2 resnets
+        (192, 288, 1024, 512): 8,  # up_block 2 channel transition
+        (192, 288, 512, 512): 8,  # up_block 2 conv2 after transition
+        (384, 576, 512, 512): 16,  # up_block 3 resnets
+        (384, 576, 512, 256): 16,  # up_block 3 channel transition
+        (384, 576, 256, 256): 8,  # up_block 3 resnets
+        (384, 576, 256, 12): 8,  # conv_out (patch_size=2, 3*4=12)
+        # 1MP tier - 1024x768 (latent 48x64)
+        (48, 64, 48, 1024): 2,
+        (48, 64, 1024, 1024): 2,
+        (96, 128, 1024, 1024): 4,
+        (192, 256, 1024, 1024): 8,
+        (192, 256, 1024, 512): 8,
+        (192, 256, 512, 512): 8,  # up_block 2 conv2 after transition
+        (384, 512, 512, 512): 16,
+        (384, 512, 512, 256): 16,
+        (384, 512, 256, 256): 8,
+        (384, 512, 256, 12): 8,
+        # 1MP tier - 960x768 (latent 48x60)
+        (48, 60, 48, 1024): 2,
+        (48, 60, 1024, 1024): 2,
+        (96, 120, 1024, 1024): 4,
+        (192, 240, 1024, 1024): 8,
+        (192, 240, 1024, 512): 8,
+        (192, 240, 512, 512): 8,  # up_block 2 conv2 after transition
+        (384, 480, 512, 512): 8,  # reduced from 16 (max 15 for this dim)
+        (384, 480, 512, 256): 8,
+        (384, 480, 256, 256): 8,
+        (384, 480, 256, 12): 8,
+        # 1MP tier - 1024x576 (latent 36x64)
+        (36, 64, 48, 1024): 2,
+        (36, 64, 1024, 1024): 2,
+        (72, 128, 1024, 1024): 4,
+        (144, 256, 1024, 1024): 8,
+        (144, 256, 1024, 512): 8,
+        (144, 256, 512, 512): 8,  # up_block 2 conv2 after transition
+        (288, 512, 512, 512): 16,
+        (288, 512, 512, 256): 16,
+        (288, 512, 256, 256): 8,
+        (288, 512, 256, 12): 8,
+    }
+
+    # TODO: Allow weight initialization?
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        *,
+        kernel_size: Sequence[int] | int,
+        stride: Sequence[int] | int = 1,
+        padding: Sequence[int] | int = 0,
+        dilation: Sequence[int] | int = 1,
+        mesh_device: ttnn.MeshDevice,
+        in_mesh_axis: int | None = None,
+        out_mesh_axis: int | None = None,
+        ccl_manager: CCLManager | None = None,
+        use_barrier: bool = True,
+    ) -> None:
+        """
+        Initialize the Conv2d layer. Set mesh_axis to None to disable mesh parallelism. Only TP is supported currently.
+
+        Args:
+            in_channels: Number of input channels.
+            out_channels: Number of output channels.
+            kernel_size: Size of the kernel.
+            stride: Stride of the convolution.
+            padding: Padding of the convolution.
+            dilation: Dilation of the convolution.
+            mesh_device: Mesh device to use.
+            in_mesh_axis: Axis to shard input channels across mesh devices.
+            out_mesh_axis: Axis to shard output channels across mesh devices.
+            ccl_manager: CCL manager to use.
+            torch_ref: Reference to the torch layer. Parameters from this will be used to initialize the layer
+
+        The arguments in_mesh_axis and out_mesh_axis control how weights and biases are sharded
+        across the mesh devices and how the input and output tensors are sharded.
+        """
+        super().__init__()
+
+        if in_mesh_axis is not None:
+            if out_mesh_axis is not None:
+                msg = "only one of in_mesh_axis and out_mesh_axis can be set"
+                raise ValueError(msg)
+
+            if ccl_manager is None:
+                msg = "ccl_manager must be provided if in_mesh_axis is not None"
+                raise ValueError(msg)
+
+        in_mesh_axis_size = mesh_device.shape[in_mesh_axis] if in_mesh_axis is not None else 1
+        out_mesh_axis_size = mesh_device.shape[out_mesh_axis] if out_mesh_axis is not None else 1
+
+        kernel_size = (kernel_size,) * 2 if isinstance(kernel_size, int) else tuple(kernel_size)
+        stride = (stride,) * 2 if isinstance(stride, int) else tuple(stride)
+        padding = (padding,) * 2 if isinstance(padding, int) else tuple(padding)
+        dilation = (dilation,) * 2 if isinstance(dilation, int) else tuple(dilation)
+
+        assert dilation == (1, 1), "dilation other than 1 is not supported"
+
+        self.weight = Parameter(
+            total_shape=[out_channels, in_channels, *kernel_size],
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=mesh_device,
+            mesh_axes=[out_mesh_axis, in_mesh_axis, None, None],
+            on_host=True,
+        )
+
+        self.bias = Parameter(
+            total_shape=[in_mesh_axis_size, 1, 1, out_channels],
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=mesh_device,
+            mesh_axes=[in_mesh_axis, None, None, out_mesh_axis],
+            on_host=True,
+        )
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.mesh_device = mesh_device
+        self.out_mesh_axis = out_mesh_axis
+        self.in_mesh_axis = in_mesh_axis
+        self.in_mesh_axis_size = in_mesh_axis_size
+        self.out_mesh_axis_size = out_mesh_axis_size
+        self.ccl_manager = ccl_manager
+        self.use_barrier = use_barrier
+
+        # (batch, height, width, num_slices) -> device (weight, bias) prepared for that input.
+        self._prepared: dict[tuple, tuple[ttnn.Tensor, ttnn.Tensor | None]] = {}
+
+    @classmethod
+    def from_torch(
+        cls,
+        torch_ref: torch.nn.Conv2d,
+        *,
+        mesh_device: ttnn.MeshDevice,
+        in_mesh_axis: int | None = None,
+        out_mesh_axis: int | None = None,
+        ccl_manager: CCLManager | None,
+    ) -> Self:
+        assert not isinstance(torch_ref.padding, str)
+
+        model = cls(
+            in_channels=torch_ref.in_channels,
+            out_channels=torch_ref.out_channels,
+            kernel_size=torch_ref.kernel_size,
+            stride=torch_ref.stride,
+            padding=torch_ref.padding,
+            dilation=torch_ref.dilation,
+            mesh_device=mesh_device,
+            out_mesh_axis=out_mesh_axis,
+            in_mesh_axis=in_mesh_axis,
+            ccl_manager=ccl_manager,
+        )
+
+        model.load_torch_state_dict(torch_ref.state_dict())
+
+        return model
+
+    def _release_prepared(self) -> None:
+        for weight, bias in self._prepared.values():
+            ttnn.deallocate(weight)
+            if bias is not None:
+                ttnn.deallocate(bias)
+        self._prepared.clear()
+
+    def _prepare_torch_state(self, state: dict[str, torch.Tensor]) -> None:
+        self._release_prepared()
+
+        bias = state.pop("bias", None)
+        if bias is not None:
+            (out_dim,) = bias.shape
+            bias = bias.reshape([1, 1, 1, out_dim])
+            bias_zeros = torch.zeros([self.in_mesh_axis_size - 1, 1, 1, out_dim])
+            state["bias"] = torch.cat([bias, bias_zeros])
+
+    def deallocate_weights(self) -> None:
+        self._release_prepared()
+        super().deallocate_weights()
+
+    def forward(self, x: ttnn.Tensor, /, *, use_persistent_buffer: bool = True) -> ttnn.Tensor:
+        """Forward pass of the Conv2d layer with support for tensor parallelism.
+
+        Args:
+            x: Input tensor with shape (batch, height, width, channels).
+
+        Returns:
+            Output tensor with shape (batch, out_height, out_width, out_channels).
+
+        Tensor sharding behavior:
+
+        **No parallelism (in_mesh_axis=None, out_mesh_axis=None):**
+            - Input is replicated
+            - Output is replicated
+
+        **Input channel parallelism (in_mesh_axis is set, out_mesh_axis=None):**
+            - Input: sharded on channel dimension along in_mesh_axis
+            - Output: sharded on channel dimension along in_mesh_axis
+
+        **Output channel parallelism (in_mesh_axis=None, out_mesh_axis is set):**
+            - Input can be either:
+                - replicated, or
+                - sharded on channel dimension along out_mesh_axis
+            - Output: sharded on channel dimension along out_mesh_axis
+        """
+        b, h, w, c = x.shape
+
+        # allow sharded input for output parallelism
+        if (
+            self.in_mesh_axis is None
+            and self.out_mesh_axis_size != 1
+            and c == self.in_channels // self.out_mesh_axis_size
+        ):
+            x = vae_all_gather(self.ccl_manager, x, cluster_axis=self.out_mesh_axis, use_barrier=self.use_barrier)
+        else:
+            expected_c = self.in_channels // self.in_mesh_axis_size
+            if c != expected_c:
+                msg = f"expected input channel dimension to be {expected_c}, but got {c}"
+                raise ValueError(msg)
+
+        slice_params = self.slice_params.get(tuple(self.mesh_device.shape), self.slice_default)
+        num_slices = slice_params.get((h, w, self.in_channels, self.out_channels))
+        slice_config = (
+            ttnn.Conv2dSliceConfig(num_slices=num_slices, slice_type=ttnn.Conv2dDRAMSliceWidth)
+            if num_slices is not None
+            else None
+        )
+
+        in_channels = self.in_channels // self.in_mesh_axis_size
+        out_channels = self.weight.data.shape[0]
+        conv_config = ttnn.Conv2dConfig(
+            act_block_h_override=32,
+            weights_dtype=self.weight.dtype,
+            config_tensors_in_dram=self.config_tensors_in_dram,
+        )
+
+        # The prepared layout depends on the input size and the slice config. The input memory config,
+        # layout and dtype also reach prepare_conv_weights but are not in the key: this assumes each
+        # Conv2d instance always gets inputs with the same memory config, layout and dtype.
+        prepared_key = (b, h, w, num_slices)
+        prepared_weight, prepared_bias = self._prepared.get(prepared_key, (None, None))
+        if prepared_weight is None:
+            base_kwargs = {
+                "in_channels": in_channels,
+                "out_channels": out_channels,
+                "batch_size": b,
+                "input_height": h,
+                "input_width": w,
+                "kernel_size": self.kernel_size,
+                "stride": self.stride,
+                "padding": self.padding,
+                "dilation": self.dilation,
+                "groups": 1,
+                "device": self.mesh_device,
+                "conv_config": conv_config,
+            }
+            prepared_weight = ttnn.prepare_conv_weights(
+                weight_tensor=self.weight.data,
+                weights_format="OIHW",
+                input_memory_config=x.memory_config(),
+                input_layout=x.get_layout(),
+                has_bias=self.bias is not None,
+                input_dtype=x.dtype,
+                slice_config=slice_config,
+                **base_kwargs,
+            )
+            prepared_weight = ttnn.to_device(prepared_weight, self.mesh_device)
+            if self.bias is not None:
+                prepared_bias = ttnn.prepare_conv_bias(
+                    bias_tensor=self.bias.data,
+                    input_memory_config=x.memory_config(),
+                    input_layout=x.get_layout(),
+                    input_dtype=x.dtype,
+                    **base_kwargs,
+                )
+                prepared_bias = ttnn.to_device(prepared_bias, self.mesh_device)
+
+        try:
+            x, (out_height, out_width), (prepared_weight, prepared_bias) = ttnn.conv2d(
+                input_tensor=x,
+                weight_tensor=prepared_weight,
+                bias_tensor=prepared_bias,
+                in_channels=in_channels,
+                out_channels=out_channels,
+                device=self.mesh_device,
+                kernel_size=self.kernel_size,
+                stride=self.stride,
+                padding=self.padding,
+                batch_size=b,
+                input_height=h,
+                input_width=w,
+                conv_config=conv_config,
+                compute_config=self.compute_config,
+                slice_config=slice_config,
+                return_output_dim=True,
+                return_weights_and_bias=True,
+            )
+        except RuntimeError as e:
+            m = re.search(r"Out of Memory: (.*)", str(e))
+            if m is None:
+                raise
+
+            msg = (
+                f"conv2d out of memory with (height, width, in_channels, out_channels) = "
+                f"{(h, w, self.in_channels, self.out_channels)} and mesh_shape = "
+                f"{tuple(self.mesh_device.shape)}: {m.group(1)}"
+            )
+            raise RuntimeError(msg) from e
+        self._prepared[prepared_key] = (prepared_weight, prepared_bias)
+
+        x = ttnn.reshape(x, (b, out_height, out_width, -1))
+
+        if self.in_mesh_axis is not None:
+            x = self.ccl_manager.reduce_scatter(
+                x, dim=-1, mesh_axis=self.in_mesh_axis, use_persistent_buffer=use_persistent_buffer
+            )
+
+        return x
+
+
+def configure_conv2d(
+    module: Module,
+    *,
+    slice_params: dict[tuple[int, ...], dict[tuple[int, int, int, int], int]] | None = None,
+    config_tensors_in_dram: bool | None = None,
+) -> None:
+    """Configure every Conv2d in ``module``'s tree.
+
+    ``slice_params`` (same layout as ``Conv2d.slice_params``) is added on top of the shared table for
+    each mesh shape it names, for these instances only. ``config_tensors_in_dram`` overrides the
+    class default for them.
+    """
+    if isinstance(module, Conv2d):
+        if slice_params is not None:
+            table = dict(Conv2d.slice_params)
+            for mesh_shape, entries in slice_params.items():
+                table[mesh_shape] = {**Conv2d.slice_params.get(mesh_shape, Conv2d.slice_default), **entries}
+            module.slice_params = table
+        if config_tensors_in_dram is not None:
+            module.config_tensors_in_dram = config_tensors_in_dram
+    for _, child in module.named_children():
+        configure_conv2d(child, slice_params=slice_params, config_tensors_in_dram=config_tensors_in_dram)

@@ -1,0 +1,17 @@
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+///
+
+#pragma once
+
+#include <tt-metalium/core_coord.hpp>
+
+namespace llama_specific {
+
+tt::tt_metal::CoreRangeSet get_custom_cores(uint32_t num_workers, bool row_wise = true);
+
+std::tuple<tt::tt_metal::CoreRangeSet, std::vector<tt::tt_metal::CoreCoord>> get_custom_worker_core_placement(
+    uint32_t num_links);
+
+}  // namespace llama_specific

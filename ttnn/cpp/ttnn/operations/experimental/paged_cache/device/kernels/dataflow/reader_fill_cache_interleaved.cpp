@@ -1,0 +1,48 @@
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include <stdint.h>
+#include "api/dataflow/dataflow_api.h"
+#include "api/dataflow/noc.h"
+#include "api/dataflow/dataflow_buffer.h"
+#include "api/core_local_mem.h"
+#include "api/tensor/noc_traits.h"
+#include "experimental/kernel_args.h"
+
+void kernel_main() {
+    Noc noc;
+
+    constexpr auto Wt = get_arg(args::Wt);
+
+    const auto start_tile_id = get_arg(args::start_tile_id);
+    const auto num_rows = get_arg(args::num_rows);
+    const auto noop = get_arg(args::noop);
+
+    if (noop == 1) {
+        return;  // Early exit, no work done
+    }
+
+    const auto s = TensorAccessor(tensor::input);
+
+    DataflowBuffer dfb_in(dfb::in);
+
+    // get_entry_size() reads THIS DFB's live per-program entry size; get_tile_size() reads a global
+    // descriptor array that intervening ops clobber on Quasar DM kernels (stale -> wrong tile_bytes on a
+    // later invocation). Byte-identical to get_tile_size() on WH/BH. See writer_fill_cache_interleaved.cpp.
+    const uint32_t tile_bytes = dfb_in.get_entry_size();
+
+    // read a ublock of tiles from src to the buffer, and then push the ublock to unpacker
+    uint32_t tile_id = start_tile_id;
+    for (uint32_t row_num = 0; row_num < num_rows; ++row_num) {
+        dfb_in.reserve_back(Wt);
+        uint32_t l1_write_addr = dfb_in.get_write_ptr();
+        for (uint32_t w = 0; w < Wt; ++w) {
+            noc.async_read(s, CoreLocalMem<uint32_t>(l1_write_addr), tile_bytes, {.page_id = tile_id}, {});
+            l1_write_addr += tile_bytes;
+            tile_id++;
+        }
+        noc.async_read_barrier();
+        dfb_in.push_back(Wt);
+    }
+}

@@ -1,0 +1,347 @@
+# SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
+
+# SPDX-License-Identifier: Apache-2.0
+
+
+import pytest
+import torch
+
+import ttnn
+
+from ...layers.linear import ColParallelLinear, Linear, RowParallelLinear
+from ...parallel.manager import CCLManager
+from ...utils.check import assert_quality
+from ...utils.matmul import get_matmul_config, get_matmul_core_grid
+from ...utils.tensor import bf16_tensor, to_torch
+from ...utils.test import mesh_device_config_to_string
+
+
+@pytest.mark.parametrize(
+    "mesh_device",
+    [(1, 1), (1, 2), (2, 1)],
+    ids=mesh_device_config_to_string,
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    ("B, M, K, N"),
+    [
+        (1, 1, 256, 2432),  # SD3.5 timestep_embedder
+        (1, 1, 2432, 2432),  # SD3.5 timestep_embedder
+        (1, 333, 2048, 2432),  # SD3.5 text_embedder
+        (1, 333, 2432, 2432),  # SD3.5 text_embedder
+        (1, 4096, 2432, 2432 * 3),  # SD3.5 spatial qkv
+        (1, 333, 2432, 2432 * 3),  # SD3.5 text qkv
+        (1, 4096, 2432, 2432),  # SD3.5 spatial out_proj
+        (1, 333, 2432, 2432),  # SD3.5 text out_proj
+        (1, 4096, 2432, 9728),  # SD3.5 spatial FF
+        (1, 4096, 9728, 2432),  # SD3.5 spatial FF
+        (1, 333, 2432, 9728),  # SD3.5 text FF
+        (1, 333, 9728, 2432),  # SD3.5 text FF
+        (1, 1, 2432, 14592),  # SD3.5 context
+        (1, 1, 2432, 4864),  # SD3.5 final context
+        (1, 4096, 2432, 64),  # SD3.5 proj_out
+        # Flux2 M=32 shapes — exercise the 1D matmul branch (M ≤ 64)
+        (1, 1, 256, 6144),  # timestep/guidance embed linear_1
+        (1, 1, 6144, 6144),  # timestep/guidance embed linear_2
+        (1, 1, 6144, 4608),  # double_stream_mod img / txt
+        (1, 1, 6144, 2304),  # single_stream_mod
+        (1, 1, 6144, 1536),  # spatial_time_embed_out
+    ],
+)
+@pytest.mark.parametrize(
+    ("bias"),
+    [
+        True,
+        # False,
+    ],
+)
+def test_linear(
+    mesh_device: ttnn.MeshDevice,
+    B: int,
+    M: int,
+    K: int,
+    N: int,
+    bias: bool,
+) -> None:
+    torch_dtype = torch.bfloat16
+    torch_model = torch.nn.Linear(K, N, bias=bias).to(dtype=torch_dtype)
+    torch_model.eval()
+
+    tt_model = Linear(K, N, bias=bias, mesh_device=mesh_device)
+    tt_model.load_torch_state_dict(torch_model.state_dict())
+
+    torch_input_tensor = torch.randn((1, B, M, K), dtype=torch_dtype)
+
+    tt_input_tensor = bf16_tensor(torch_input_tensor, device=mesh_device)
+
+    with torch.no_grad():
+        torch_output = torch_model(torch_input_tensor)
+
+    tt_output = tt_model(tt_input_tensor)
+
+    for t in ttnn.get_device_tensors(tt_output):
+        t = ttnn.to_torch(t)
+        assert_quality(torch_output, t, pcc=0.999_500)
+
+
+@pytest.mark.parametrize(
+    "mesh_device, device_params",
+    [
+        (
+            shape,
+            {
+                "fabric_config": None if shape == (1, 1) else ttnn.FabricConfig.FABRIC_1D,
+                "require_exact_physical_num_devices": False if shape == (1, 1) else True,
+            },
+        )
+        for shape in [(1, 1), (1, 2), (2, 1), (2, 2), (2, 4), (4, 2)]
+    ],
+    ids=mesh_device_config_to_string,
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    ("tp_mesh_axis"),
+    [
+        0,
+        1,
+    ],
+)
+@pytest.mark.parametrize("is_fsdp", [True, False], ids=["yes_fsdp", "no_fsdp"])
+@pytest.mark.parametrize(
+    ("B, M, K, N"),
+    [
+        (1, 1, 256, 2432),  # SD3.5 timestep_embedder
+        (1, 1, 2432, 2432),  # SD3.5 timestep_embedder
+        (1, 333, 2048, 2432),  # SD3.5 text_embedder
+        (1, 333, 2432, 2432),  # SD3.5 text_embedder
+        (1, 4096, 2432, 2432 * 3),  # SD3.5 spatial qkv
+        (1, 333, 2432, 2432 * 3),  # SD3.5 text qkv
+        (1, 4096, 2432, 2432),  # SD3.5 spatial out_proj
+        (1, 333, 2432, 2432),  # SD3.5 text out_proj
+        (1, 4096, 2432, 9728),  # SD3.5 spatial FF
+        (1, 4096, 9728, 2432),  # SD3.5 spatial FF
+        (1, 333, 2432, 9728),  # SD3.5 text FF
+        (1, 333, 9728, 2432),  # SD3.5 text FF
+        (1, 1, 2432, 14592),  # SD3.5 context
+        (1, 1, 2432, 4864),  # SD3.5 final context
+        (1, 1, 3072, 12288),  # Mochi timestep norm1 linear
+        (1, 1, 3072, 6144),  # Mochi timestep norm1_context linear
+        (1, 44520, 3072, 3072),  # Mochi spatial Q, K, V and out_proj
+        (1, 118, 1536, 3072),  # Mochi text Q, K, V
+        (1, 118, 3072, 1536),  # Mochi text out_proj
+    ],
+    ids=[
+        "sd35_timestep_embedder",
+        "sd35_timestep_embedder_2",
+        "sd35_text_embedder",
+        "sd35_text_embedder_2",
+        "sd35_spatial_qkv",
+        "sd35_text_qkv",
+        "sd35_spatial_out_proj",
+        "sd35_text_out_proj",
+        "sd35_spatial_FF",
+        "sd35_spatial_FF_2",
+        "sd35_text_FF",
+        "sd35_text_FF_2",
+        "sd35_context",
+        "sd35_final_context",
+        "mochi_timestep_norm1_linear",
+        "mochi_timestep_norm1_context_linear",
+        "mochi_spatial_qkv_and_out_proj",
+        "mochi_text_qkv",
+        "mochi_text_out_proj",
+    ],
+)
+@pytest.mark.parametrize(
+    ("bias"),
+    [
+        True,
+        # False,
+    ],
+)
+def test_col_parallel_linear(
+    mesh_device: ttnn.MeshDevice,
+    B: int,
+    M: int,
+    K: int,
+    N: int,
+    bias: bool,
+    tp_mesh_axis: int,
+    is_fsdp: bool,
+) -> None:
+    torch_dtype = torch.bfloat16
+    torch_model = torch.nn.Linear(K, N, bias=bias).to(dtype=torch_dtype)
+    torch_model.eval()
+
+    if is_fsdp:
+        fsdp_mesh_axis = 1 - tp_mesh_axis
+        ccl_manager = CCLManager(mesh_device, topology=ttnn.Topology.Linear)
+        tt_model = ColParallelLinear(
+            K,
+            N,
+            bias=bias,
+            mesh_device=mesh_device,
+            mesh_axis=tp_mesh_axis,
+            fsdp_mesh_axis=fsdp_mesh_axis,
+            ccl_manager=ccl_manager,
+        )
+    else:
+        tt_model = ColParallelLinear(K, N, bias=bias, mesh_device=mesh_device, mesh_axis=tp_mesh_axis)
+    tt_model.load_torch_state_dict(torch_model.state_dict())
+
+    torch_input_tensor = torch.randn((1, B, M, K), dtype=torch_dtype)
+
+    tt_input_tensor = bf16_tensor(torch_input_tensor, device=mesh_device)
+
+    with torch.no_grad():
+        torch_output = torch_model(torch_input_tensor)
+
+    tt_output = tt_model(tt_input_tensor)
+
+    shard_dims = [None, None]
+    shard_dims[tp_mesh_axis] = -1
+    shard_dims[1 - tp_mesh_axis] = 0
+    tt_output = ttnn.to_torch(
+        tt_output,
+        mesh_composer=ttnn.ConcatMesh2dToTensor(mesh_device, dims=shard_dims, mesh_shape=tuple(mesh_device.shape)),
+    )
+    for i in range(tt_output.shape[0]):
+        assert_quality(torch_output.squeeze(), tt_output[i].squeeze(), pcc=0.999_500)
+
+
+@pytest.mark.parametrize(
+    "mesh_device, device_params",
+    [
+        (
+            shape,
+            {
+                "fabric_config": None if shape == (1, 1) else ttnn.FabricConfig.FABRIC_1D,
+                "require_exact_physical_num_devices": False if shape == (1, 1) else True,
+            },
+        )
+        for shape in [(1, 1), (1, 2), (2, 1), (2, 2), (2, 4), (4, 2)]
+    ],
+    ids=mesh_device_config_to_string,
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    ("tp_mesh_axis"),
+    [
+        0,
+        1,
+    ],
+)
+@pytest.mark.parametrize("is_fsdp", [True, False], ids=["yes_fsdp", "no_fsdp"])
+@pytest.mark.parametrize(
+    ("B, M, K, N"),
+    [
+        (1, 1, 256, 2432),  # SD3.5 timestep_embedder
+        (1, 1, 2432, 2432),  # SD3.5 timestep_embedder
+        (1, 333, 2048, 2432),  # SD3.5 text_embedder
+        (1, 333, 2432, 2432),  # SD3.5 text_embedder
+        (1, 4096, 2432, 2432 * 3),  # SD3.5 spatial qkv
+        (1, 333, 2432, 2432 * 3),  # SD3.5 text qkv
+        (1, 4096, 2432, 2432),  # SD3.5 spatial out_proj
+        (1, 333, 2432, 2432),  # SD3.5 text out_proj
+        (1, 4096, 2432, 9728),  # SD3.5 spatial FF
+        (1, 4096, 9728, 2432),  # SD3.5 spatial FF
+        (1, 333, 2432, 9728),  # SD3.5 text FF
+        (1, 333, 9728, 2432),  # SD3.5 text FF
+        (1, 1, 2432, 14592),  # SD3.5 context
+        (1, 1, 2432, 4864),  # SD3.5 final context
+    ],
+)
+@pytest.mark.parametrize(
+    ("bias"),
+    [
+        True,
+        # False,
+    ],
+)
+def test_row_parallel_linear(
+    mesh_device: ttnn.MeshDevice,
+    B: int,
+    M: int,
+    K: int,
+    N: int,
+    bias: bool,
+    tp_mesh_axis: int,
+    is_fsdp: bool,
+) -> None:
+    torch_dtype = torch.bfloat16
+    torch_model = torch.nn.Linear(K, N, bias=bias).to(dtype=torch_dtype)
+    torch_model.eval()
+
+    fsdp_mesh_axis = 1 - tp_mesh_axis if is_fsdp else None
+    ccl_manager = CCLManager(mesh_device, topology=ttnn.Topology.Linear)
+    tt_model = RowParallelLinear(
+        K,
+        N,
+        bias=bias,
+        mesh_device=mesh_device,
+        mesh_axis=tp_mesh_axis,
+        fsdp_mesh_axis=fsdp_mesh_axis,
+        ccl_manager=ccl_manager,
+    )
+    tt_model.load_torch_state_dict(torch_model.state_dict())
+
+    torch_input_tensor = torch.randn((1, B, M, K), dtype=torch_dtype)
+
+    tt_input_tensor = bf16_tensor(torch_input_tensor, device=mesh_device, mesh_axis=tp_mesh_axis, shard_dim=-1)
+
+    with torch.no_grad():
+        torch_output = torch_model(torch_input_tensor)
+
+    tt_output = tt_model(tt_input_tensor)
+
+    shard_dims = [None, None]
+    shard_dims[tp_mesh_axis] = -1
+    shard_dims[1 - tp_mesh_axis] = 0
+    tt_output = ttnn.to_torch(
+        tt_output,
+        mesh_composer=ttnn.ConcatMesh2dToTensor(mesh_device, dims=shard_dims, mesh_shape=tuple(mesh_device.shape)),
+    )
+    for i in range(tt_output.shape[0]):
+        assert_quality(torch_output.squeeze(), tt_output[i].squeeze(), pcc=0.999_500)
+
+
+@pytest.mark.parametrize("mesh_device", [(1, 1)], indirect=True)
+@pytest.mark.parametrize(
+    ("layer", "in_features", "out_features"),
+    [(ColParallelLinear, 5120, 2560), (RowParallelLinear, 6400, 5120)],
+    ids=["qkv", "down"],
+)
+def test_pinned_projection(mesh_device: ttnn.MeshDevice, layer, in_features: int, out_features: int) -> None:
+    """A pinned config keeps one program on both sides of the 128-row switch to `ttnn.linear`."""
+    torch.manual_seed(0)
+    compute_kernel_config = ttnn.init_device_compute_kernel_config(
+        mesh_device.arch(),
+        math_fidelity=ttnn.MathFidelity.HiFi4,
+        math_approx_mode=False,
+        fp32_dest_acc_en=True,
+        packer_l1_acc=True,
+    )
+    torch_model = torch.nn.Linear(in_features, out_features, bias=False)
+    tt_model = layer(
+        in_features,
+        out_features,
+        bias=False,
+        mesh_device=mesh_device,
+        mesh_axis=None,
+        compute_kernel_config=compute_kernel_config,
+    )
+    tt_model.load_torch_state_dict(torch_model.state_dict())
+    row_capacity = 640
+    pin = get_matmul_config(row_capacity, in_features, out_features, get_matmul_core_grid(mesh_device))
+
+    added = 0
+    # Long, short, long: a program compiled at one row count must serve a larger and a smaller one.
+    for rows in (320, 32, 64, 96, row_capacity, 128, 160):
+        x = torch.randn(1, rows, in_features)
+        tt_x = bf16_tensor(x, device=mesh_device)
+        entries = mesh_device.num_program_cache_entries()
+        actual = to_torch(tt_model.forward(tt_x, matmul_config=pin))
+        added += mesh_device.num_program_cache_entries() - entries
+        with torch.no_grad():
+            assert_quality(torch_model(x), actual, pcc=0.9999)
+    assert added == 1, f"{added} projection programs"

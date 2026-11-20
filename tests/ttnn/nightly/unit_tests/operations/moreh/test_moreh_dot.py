@@ -1,0 +1,201 @@
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
+
+# SPDX-License-Identifier: Apache-2.0
+
+import pytest
+import torch
+from loguru import logger
+
+import ttnn
+from tt_py_test_utils_common.utility_functions import comp_allclose_and_pcc
+from tests.ttnn.unit_tests.operations.test_utils import (
+    get_compute_kernel_options,
+    compute_kernel_options,
+    compute_kernel_ids,
+    to_ttnn,
+)
+
+# Module-scoped device: opens once per file instead of once per test case.
+pytestmark = pytest.mark.use_module_device
+
+
+def get_torch_dtype(dtype):
+    if dtype == ttnn.int32:
+        return torch.int32
+    else:
+        return torch.bfloat16
+
+
+def run_moreh_dot_test(input_shape, ttnn_dtype, device, use_optional_output=False):
+    # TODO @thanhnguyen-moreh: Support bfloat8_b in kernel
+    if ttnn_dtype == ttnn.bfloat8_b:
+        pytest.skip(f"bfloat8_b is not supported in the kernel")
+    torch_dtype = get_torch_dtype(ttnn_dtype)
+    output_shape = [1, 1, 1, 1]
+
+    if ttnn_dtype == ttnn.int32:
+        torch_input = torch.randint(-2, 3, input_shape, dtype=torch_dtype)
+        torch_other = torch.randint(-2, 3, input_shape, dtype=torch_dtype)
+        torch_optional_output = torch.randint(-2, 3, output_shape, dtype=torch_dtype)
+
+        tt_input = ttnn.from_torch(
+            torch_input, device=device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT
+        )  # Input dtype must be of bfloat16 or bfloat8_b
+        tt_other = ttnn.from_torch(
+            torch_other, device=device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT
+        )  # Input dtype must be of bfloat16 or bfloat8_b
+
+    else:
+        torch_input = torch.rand(input_shape, dtype=torch_dtype)
+        torch_other = torch.rand(input_shape, dtype=torch_dtype)
+        torch_optional_output = torch.rand(output_shape, dtype=torch_dtype)
+
+        tt_input = ttnn.from_torch(torch_input, device=device, dtype=ttnn_dtype, layout=ttnn.TILE_LAYOUT)
+        tt_other = ttnn.from_torch(torch_other, device=device, dtype=ttnn_dtype, layout=ttnn.TILE_LAYOUT)
+
+    optional_output = (
+        ttnn.from_torch(torch_optional_output, device=device, dtype=ttnn_dtype, layout=ttnn.TILE_LAYOUT)
+        if use_optional_output
+        else None
+    )
+
+    tt_out = ttnn.operations.moreh.dot(tt_input, tt_other, dtype=ttnn_dtype, output=optional_output)
+    tt_out = ttnn.to_torch(tt_out).to(torch_dtype)
+
+    # torch matmul
+    torch_input = torch.reshape(torch_input, (torch_input.shape[-1],))
+    torch_other = torch.reshape(torch_other, (torch_other.shape[-1],))
+    torch_out = torch.matmul(torch_input, torch_other)
+
+    # test for equivalance
+    rtol = atol = 0.1
+    passing, output_pcc = comp_allclose_and_pcc(torch_out, tt_out[0][0][0][0], pcc=0.999, rtol=rtol, atol=atol)
+    logger.debug(f"Out passing={passing}")
+    logger.debug(f"Output pcc={output_pcc}")
+
+    assert passing
+
+
+@pytest.mark.parametrize(
+    "input_shape",
+    (
+        [1, 1, 1, 10],  # test not mutiple of 32 case
+        [1, 1, 1, 32],  # test single tile
+        [1, 1, 1, 352],  # test multiple tiles
+        [1, 1, 1, 323],  # test multiple tiles, not a multiple of 32
+    ),
+)
+@pytest.mark.parametrize(
+    "dtype",
+    (
+        ttnn.bfloat16,
+        ttnn.int32,
+        ttnn.bfloat8_b,
+    ),
+)
+def test_moreh_dot(input_shape, dtype, device):
+    torch.manual_seed(3072)
+    run_moreh_dot_test(input_shape, dtype, device)
+
+
+@pytest.mark.parametrize(
+    "input_shape",
+    (
+        [1, 1, 1, 10],  # test not mutiple of 32 case
+        [1, 1, 1, 32],  # test single tile
+        [1, 1, 1, 352],  # test multiple tiles
+        [1, 1, 1, 323],  # test multiple tiles, not a multiple of 32
+    ),
+)
+@pytest.mark.parametrize(
+    "dtype",
+    (
+        ttnn.bfloat16,
+        ttnn.int32,
+        None,
+    ),
+)
+def test_moreh_matmul_1d_callback(input_shape, dtype, device):
+    torch.manual_seed(3072)
+
+    # Start from an empty cache: the module-scoped device carries entries over from earlier tests in this file.
+    device.clear_program_cache()
+    for i in range(2):
+        run_moreh_dot_test(input_shape, dtype, device)
+        torch_dummy = torch.randn([32, 32])
+        tt_dummy = ttnn.from_torch(torch_dummy, device=device)
+        if i == 0:
+            num_program_cache_entries = device.num_program_cache_entries()
+            assert num_program_cache_entries > 0
+        else:
+            assert device.num_program_cache_entries() == num_program_cache_entries
+
+
+@pytest.mark.parametrize(
+    "input_shape",
+    ([1, 1, 1, 10],),  # test not mutiple of 32 case
+)
+@pytest.mark.parametrize(
+    "dtype",
+    (ttnn.bfloat16,),
+)
+def test_moreh_dot_optional_output_tensor(input_shape, dtype, device):
+    torch.manual_seed(3072)
+    run_moreh_dot_test(input_shape, dtype, device, use_optional_output=True)
+
+
+@pytest.mark.parametrize(
+    "dtype_a, dtype_b",
+    (
+        (ttnn.bfloat8_b, ttnn.bfloat8_b),
+        (ttnn.bfloat16, ttnn.bfloat8_b),
+        (ttnn.bfloat8_b, ttnn.bfloat16),
+    ),
+)
+@pytest.mark.parametrize("input_shape", ([1, 1, 1, 10], [1, 1, 1, 323]))
+def test_moreh_dot_rejects_unsupported_input_dtype(input_shape, dtype_a, dtype_b, device, expect_error):
+    torch.manual_seed(3072)
+    tt_input = ttnn.from_torch(torch.rand(input_shape), device=device, dtype=dtype_a, layout=ttnn.TILE_LAYOUT)
+    tt_other = ttnn.from_torch(torch.rand(input_shape), device=device, dtype=dtype_b, layout=ttnn.TILE_LAYOUT)
+    with expect_error(RuntimeError, "only BFLOAT16 is supported|must match input_a dtype"):
+        ttnn.operations.moreh.dot(tt_input, tt_other)
+
+
+@pytest.mark.parametrize("dtype", (ttnn.int32, ttnn.float32))
+@pytest.mark.parametrize("use_optional_output", (False, True))
+@pytest.mark.parametrize("input_shape", ([1, 1, 1, 32], [1, 1, 1, 323]))
+def test_moreh_dot_output_dtype(input_shape, dtype, use_optional_output, device):
+    torch.manual_seed(3072)
+    torch_input = torch.randint(-2, 3, input_shape).to(torch.bfloat16)
+    torch_other = torch.randint(-2, 3, input_shape).to(torch.bfloat16)
+    tt_input = ttnn.from_torch(torch_input, device=device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+    tt_other = ttnn.from_torch(torch_other, device=device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+
+    if use_optional_output:
+        torch_out_dtype = torch.int32 if dtype == ttnn.int32 else torch.float32
+        optional_output = ttnn.from_torch(
+            torch.zeros([1, 1, 1, 1], dtype=torch_out_dtype), device=device, dtype=dtype, layout=ttnn.TILE_LAYOUT
+        )
+        tt_out = ttnn.operations.moreh.dot(tt_input, tt_other, output=optional_output)
+        tt_results = [tt_out, optional_output]
+    else:
+        tt_out = ttnn.operations.moreh.dot(tt_input, tt_other, dtype=dtype)
+        tt_results = [tt_out]
+
+    expected = torch.matmul(torch_input.float().reshape(-1), torch_other.float().reshape(-1)).item()
+    for tt_result in tt_results:
+        assert tt_result.dtype == dtype
+        actual = ttnn.to_torch(tt_result).reshape(-1)[0].item()
+        logger.debug(f"actual={actual} expected={expected}")
+        assert abs(actual - expected) <= 1.0 + 0.02 * abs(expected)
+
+
+def test_moreh_dot_dtype_conflicts_with_optional_output(device, expect_error):
+    input_shape = [1, 1, 1, 32]
+    tt_input = ttnn.from_torch(torch.rand(input_shape), device=device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+    tt_other = ttnn.from_torch(torch.rand(input_shape), device=device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+    optional_output = ttnn.from_torch(
+        torch.zeros([1, 1, 1, 1], dtype=torch.int32), device=device, dtype=ttnn.int32, layout=ttnn.TILE_LAYOUT
+    )
+    with expect_error(RuntimeError, "does not match the output tensor dtype"):
+        ttnn.operations.moreh.dot(tt_input, tt_other, dtype=ttnn.bfloat16, output=optional_output)

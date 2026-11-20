@@ -1,0 +1,84 @@
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <variant>
+#include <optional>
+
+#include "ttnn/distributed/types.hpp"
+#include "ttnn/tensor/tensor.hpp"
+#include "ttnn/core.hpp"
+#include "ttnn/device_operation.hpp"
+#include "ttnn/types.hpp"
+#include <tt-metalium/workload_descriptor.hpp>
+#include <tt-metalium/sub_device.hpp>
+#include <tt-metalium/experimental/fabric/fabric_edm_types.hpp>
+#include "ttnn/operations/experimental/ccl/reduce_scatter_minimal_async/device/reduce_scatter_minimal_async_op_device_operation_types.hpp"
+
+namespace ttnn::operations::ccl {
+
+struct ReduceScatterDeviceOperation {
+    struct operation_attributes_t {
+        const MemoryConfig memory_config;
+        const std::optional<MemoryConfig> optional_intermediate_mem_config;
+        uint32_t dim;
+        const std::optional<uint32_t> cluster_axis;
+        const std::optional<tt::tt_metal::SubDeviceId> subdevice_id;
+        const tt::tt_fabric::Topology topology;
+        const uint32_t num_links;
+        const std::optional<uint32_t> chunks_per_sync;
+        const std::optional<uint32_t> num_workers_per_link;
+        const std::optional<uint32_t> num_buffers_per_channel;
+        const std::optional<ttnn::DeviceComputeKernelConfig> compute_kernel_config;
+        const bool use_l1_small_for_semaphores = false;
+    };
+
+    struct tensor_args_t {
+        const Tensor input_tensor;
+        std::optional<Tensor> optional_output_tensor;
+    };
+
+    using spec_return_value_t = std::vector<tt::tt_metal::TensorSpec>;
+    using tensor_return_value_t = std::vector<Tensor>;
+    using topology_return_value_t = std::vector<tt::tt_metal::TensorTopology>;
+
+    struct ReduceScatterProgram {
+        // Workload-scoped semaphores; one ProgramDescriptor per coord; tensor addresses are Buffer* bindings.
+        static tt::tt_metal::WorkloadDescriptor create_workload_descriptor(
+            const operation_attributes_t& operation_attributes,
+            const tensor_args_t& tensor_args,
+            tensor_return_value_t& tensor_return_value,
+            const ttnn::MeshCoordinateRangeSet& tensor_coords);
+    };
+
+    using program_factory_t = std::variant<ReduceScatterProgram>;
+    static void validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t&);
+    static void validate_on_program_cache_hit(const operation_attributes_t&, const tensor_args_t&);
+
+    static spec_return_value_t compute_output_specs(const operation_attributes_t&, const tensor_args_t&);
+    static tensor_return_value_t create_output_tensors(const operation_attributes_t&, const tensor_args_t&);
+    static topology_return_value_t compute_output_topologies(const operation_attributes_t&, const tensor_args_t&);
+    static tt::tt_metal::operation::OpPerformanceModelGeneral<tensor_return_value_t> create_op_performance_model(
+        const operation_attributes_t&, const tensor_args_t&, tensor_return_value_t&);
+};
+}  // namespace ttnn::operations::ccl
+
+namespace ttnn::prim {
+ttnn::operations::ccl::ReduceScatterDeviceOperation::tensor_return_value_t reduce_scatter(
+    const ttnn::Tensor& input_tensor,
+    uint32_t dim,
+    std::optional<uint32_t> cluster_axis,
+    const std::optional<tt::tt_metal::SubDeviceId>& subdevice_id,
+    const ttnn::MemoryConfig& memory_config,
+    const std::optional<ttnn::MemoryConfig>& optional_intermediate_mem_config,
+    const std::optional<ttnn::Tensor>& optional_output_tensor,
+    uint32_t num_links,
+    tt::tt_fabric::Topology topology,
+    std::optional<uint32_t> chunks_per_sync,
+    std::optional<uint32_t> num_workers_per_link,
+    std::optional<uint32_t> num_buffers_per_channel,
+    const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config = std::nullopt,
+    bool use_l1_small_for_semaphores = false);
+}  // namespace ttnn::prim

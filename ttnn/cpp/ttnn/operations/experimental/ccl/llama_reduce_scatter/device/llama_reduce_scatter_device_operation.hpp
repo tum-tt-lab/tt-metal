@@ -1,0 +1,122 @@
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <variant>
+#include <optional>
+
+#include "ttnn/distributed/types.hpp"
+#include "ttnn/tensor/tensor.hpp"
+#include "ttnn/core.hpp"
+#include "ttnn/device_operation.hpp"
+#include "ttnn/types.hpp"
+#include "ttnn/global_semaphore.hpp"
+#include <tt-metalium/sub_device.hpp>
+#include <tt-metalium/experimental/fabric/fabric_edm_types.hpp>
+#include "ttnn/operations/ccl/ccl_op_fusion.hpp"
+#include <tt-metalium/program_descriptors.hpp>
+
+namespace ttnn::operations::experimental::ccl {
+
+struct LlamaReduceScatterDeviceOperation {
+    struct operation_attributes_t {
+        const uint32_t dim;
+        const std::optional<GlobalSemaphore> cross_device_semaphore;
+        const std::optional<tt::tt_metal::SubDeviceId> subdevice_id;
+        const uint32_t cluster_axis;
+        const std::optional<MemoryConfig> output_mem_config;
+        const uint32_t ring_devices;
+        const uint32_t num_links;
+        tt::tt_fabric::Topology topology;
+        bool use_noc1_only;
+    };
+    struct tensor_args_t {
+        const Tensor input_tensor;
+        Tensor intermediate_packet_buffer;
+    };
+
+    using spec_return_value_t = tt::tt_metal::TensorSpec;
+
+    using tensor_return_value_t = Tensor;
+
+    struct LlamaReduceScatterAdd {
+        // Reader is kernels[0], writer is kernels[1]. Slot 0 of both is the caller semaphore address,
+        // which GlobalSemaphore reflection does not hash, so override_runtime_arguments rewrites it.
+        static constexpr uint32_t kReaderKernelIdx = 0;
+        static constexpr uint32_t kWriterKernelIdx = 1;
+        static constexpr uint32_t kSemaphoreArgIdx = 0;
+
+        static tt::tt_metal::ProgramDescriptor create_descriptor(
+            const operation_attributes_t& operation_attributes,
+            const tensor_args_t& tensor_args,
+            tensor_return_value_t& tensor_return_value,
+            const std::optional<ttnn::MeshCoordinate>& mesh_coordinate);
+
+        static void override_runtime_arguments(
+            tt::tt_metal::Program& program,
+            const operation_attributes_t& operation_attributes,
+            const tensor_args_t& tensor_args,
+            tensor_return_value_t& tensor_return_value,
+            const std::optional<ttnn::MeshCoordinate>& mesh_dispatch_coordinate = std::nullopt);
+
+        struct descriptor_artifacts_t {
+            uint32_t reader_kernel_index = kReaderKernelIdx;
+            uint32_t writer_kernel_index = kWriterKernelIdx;
+        };
+        static descriptor_artifacts_t create_at_program_descriptor_processing(
+            const operation_attributes_t& operation_attributes,
+            const ttnn::MeshCoordinate& mesh_coordinate,
+            const tensor_args_t& tensor_args,
+            tensor_return_value_t& tensor_return_value,
+            tt::tt_metal::ProgramDescriptor& desc,
+            const std::optional<ttnn::experimental::ccl::MatmulFusedOpSignaler>& signaler);
+        static void apply_cross_device_semaphore(
+            tt::tt_metal::Program& program,
+            const descriptor_artifacts_t& artifacts,
+            const operation_attributes_t& operation_attributes,
+            const tensor_args_t& tensor_args);
+    };
+
+    using program_factory_t = std::variant<LlamaReduceScatterAdd>;
+
+    // Mandatory methods
+
+    // Select the program factory based on the operation attributes and tensor args
+    // Validate the operation when it creates a program.
+    static void validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t&);
+
+    // Empty as there doesn't seem to be any complicated hashing requirement
+    static void validate_on_program_cache_hit(const operation_attributes_t&, const tensor_args_t&);
+
+    // Compute the output shapes based on the operation attributes and tensor args
+    static spec_return_value_t compute_output_specs(const operation_attributes_t&, const tensor_args_t&);
+
+    // Create the output tensors based on the operation attributes and tensor args
+    static tensor_return_value_t create_output_tensors(const operation_attributes_t&, const tensor_args_t&);
+    static std::vector<tt::tt_metal::TensorTopology> compute_output_topologies(
+        const operation_attributes_t&, const tensor_args_t&);
+    static std::tuple<CoreRangeSet, CoreRangeSet> get_rs_core_grids(
+        const LlamaReduceScatterDeviceOperation::operation_attributes_t& operation_attributes,
+        const LlamaReduceScatterDeviceOperation::tensor_args_t& tensor_args);
+};
+
+}  // namespace ttnn::operations::experimental::ccl
+
+namespace ttnn::prim {
+
+ttnn::operations::experimental::ccl::LlamaReduceScatterDeviceOperation::tensor_return_value_t llama_reduce_scatter(
+    const ttnn::Tensor& input_tensor,
+    ttnn::Tensor& intermediate_packet_buffer,
+    int32_t dim,
+    const GlobalSemaphore& semaphore,
+    tt::tt_metal::SubDeviceId subdevice_id,
+    uint32_t cluster_axis,
+    uint32_t ring_devices,
+    uint32_t num_links,
+    const std::optional<ttnn::MemoryConfig>& memory_config = std::nullopt,
+    tt::tt_fabric::Topology topology = tt::tt_fabric::Topology::Linear,
+    bool use_noc1_only = false);
+
+}  // namespace ttnn::prim

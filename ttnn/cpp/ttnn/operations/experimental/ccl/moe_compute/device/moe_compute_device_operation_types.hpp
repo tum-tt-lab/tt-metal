@@ -1,0 +1,114 @@
+// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+#include <tt_stl/reflection.hpp>
+
+#include <cstdint>
+#include <optional>
+
+#include <tt-metalium/base_types.hpp>
+
+#include "ttnn/tensor/tensor.hpp"
+#include "ttnn/types.hpp"
+#include "ttnn/operations/experimental/ccl/moe/selective_reduce_combine/device/selective_reduce_combine_device_operation_types.hpp"
+#include "ttnn/operations/experimental/ccl/moe_compute/device/kernels/moe_ring_common.h"
+#include "ttnn/operations/experimental/ccl/moe_compute/device/hostdevcommon/config.hpp"
+
+namespace ttnn::experimental::prim {
+
+// Mode selector for the moe_compute op.
+// - `FullCcl` runs the production multi-device pipeline (matmul + fused
+//   selective_reduce_combine over fabric). Requires a cluster_axis of extent > 1; CCL options apply.
+// - `SingleDevice` runs a single-device fused pipeline (matmul + local combine) with no
+//   CCL/fabric. Used on a 1x1 mesh with cluster_axis=None. Returns 6 tensors like FullCcl.
+// - `SingleCluster` runs on a cluster_axis of extent 1 (a 1x1 mesh with an explicit axis, or axis
+//   0 of a 1xN expert-parallel mesh): there is nothing to combine, so no combine kernels are
+//   built and moe_compute's own writer (dm1) writes each expert's token rows straight into the
+//   final [k, T, H] row-major output (one token row per page: INTERLEAVED or HEIGHT_SHARDED,
+//   DRAM or L1). No fabric; the CCL options are accepted and unused. On a
+//   multi-device mesh the token set and its routing metadata must be replicated and every
+//   coordinate writes only the rows of its own experts, like the combine; a caller that sums the
+//   partials across the other axis passes a zeroed output tensor. Returns 6 tensors like
+//   FullCcl, but slot 4 (the staged matmul output) is not written: nothing is staged.
+//   `combine_params` only describes the output (k, tokens, hidden, memory config, axis).
+// - `ComputeOnly` bypasses the combine path: no combine cores allocated, no fabric setup,
+//   no global semaphores; op emits 5 tensors instead of 6 (matmul_output is the final output).
+enum class MoEComputePath : uint8_t { FullCcl = 0, SingleDevice = 2, ComputeOnly = 1, SingleCluster = 3 };
+
+struct MoEComputeParams {
+    // MoE compute attributes
+    uint32_t layer_id = 0;
+    uint32_t output_height_shard_dim = 0;
+    uint32_t intermediate_size = 0;
+    std::optional<uint32_t> num_shared_experts_per_device;
+    bool has_bias = false;
+
+    // Number of token-parallel and data-parallel cores. These govern matmul output shard layout
+    // even in ComputeOnly mode, so they live at the top level rather than only on combine_params.
+    uint32_t num_token_parallel_cores = 0;
+    uint32_t num_data_parallel_cores = 0;
+
+    MoEComputePath path = MoEComputePath::FullCcl;
+
+    // Ring size in matmul cores. On WH this is always 12 (DRAM banks), so keep the
+    // field initializer at the WH-neutral default. On BH, invoke() resolves this to
+    // the live DRAM-bank count (7 or 8) from the bh_ring_size op kwarg.
+    uint32_t bh_ring_size = 12;
+
+    // nullopt if path == MoEComputePath::ComputeOnly
+    std::optional<SelectiveReduceCombineParams> combine_params;
+
+    ttnn::experimental::prim::detail::MoEActivationFunction activation_type =
+        ttnn::experimental::prim::detail::MoEActivationFunction::SILU;  // Default to SILU
+
+    // CLAMPED_SILU only: silu(min(gate, limit)) * clamp(up, -limit, limit).
+    std::optional<float> activation_limit;
+
+    // Expert matmuls and activation. math_approx_mode and dst_full_sync_en stay fixed by the kernel.
+    tt::tt_metal::MathFidelity math_fidelity = tt::tt_metal::MathFidelity::LoFi;
+    bool fp32_dest_acc_en = false;
+
+    // Same value as combine_params->axis (single source of truth when combine_params is set).
+    // ComputeOnly path returns nullopt; Full-path call-sites must unwrap with .value().
+    std::optional<uint32_t> cluster_axis() const {
+        return combine_params.has_value() ? std::optional<uint32_t>{combine_params->axis} : std::nullopt;
+    }
+
+    auto attributes() const {
+        using ttsl::reflection::Attribute;
+        std::vector<std::tuple<std::string, Attribute>> attrs;
+        attrs.reserve(14);
+        attrs.emplace_back("layer_id", layer_id);
+        attrs.emplace_back("output_height_shard_dim", output_height_shard_dim);
+        attrs.emplace_back("intermediate_size", intermediate_size);
+        attrs.emplace_back("num_shared_experts_per_device", num_shared_experts_per_device);
+        attrs.emplace_back("has_bias", has_bias);
+        attrs.emplace_back("num_token_parallel_cores", num_token_parallel_cores);
+        attrs.emplace_back("num_data_parallel_cores", num_data_parallel_cores);
+        attrs.emplace_back("path", static_cast<uint32_t>(path));
+        attrs.emplace_back("bh_ring_size", bh_ring_size);
+        attrs.emplace_back("combine_params", combine_params);
+        attrs.emplace_back("activation_type", static_cast<uint32_t>(activation_type));
+        attrs.emplace_back("activation_limit", activation_limit);
+        attrs.emplace_back("math_fidelity", static_cast<uint32_t>(math_fidelity));
+        attrs.emplace_back("fp32_dest_acc_en", fp32_dest_acc_en);
+        return attrs;
+    }
+};
+
+// CLAMPED_SILU needs a finite, positive limit; the other activations take none.
+void validate_activation_limit(detail::MoEActivationFunction activation_type, std::optional<float> activation_limit);
+
+struct MoEComputeInputs {
+    const ttnn::Tensor& tilize_input_tensor;
+    const ttnn::Tensor& tilize_expert_indices_tensor;
+    const ttnn::Tensor& tilize_expert_scores_tensor;
+    const ttnn::Tensor& tilize_expert_mapping_tensor;
+    const ttnn::Tensor& matmul_w0_w1_tensor;
+    const ttnn::Tensor& matmul_w2_tensor;
+    const std::optional<ttnn::Tensor>& optional_output_tensor;
+};
+
+}  // namespace ttnn::experimental::prim

@@ -1,0 +1,141 @@
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include "tt-metalium/core_coord.hpp"
+#include "ttnn/operations/eltwise/unary/common/unary_op_types.hpp"
+
+namespace ttnn::operations::matmul {
+
+// TODO: Uplift this to support fused activation and bias
+// TODO: Uplift this to support bcast batch for in1; currently, only allows B=1
+// for in1 iff B=1 for in0 (ie. single core)
+struct MatmulMultiCoreReuseProgramConfig {
+    tt::tt_metal::CoreCoord compute_with_storage_grid_size;
+    std::size_t in0_block_w{};
+    std::size_t out_subblock_h{};
+    std::size_t out_subblock_w{};
+    std::size_t per_core_M{};
+    std::size_t per_core_N{};
+    std::optional<tt::tt_metal::CoreRangeSet> allowed_worker_cores = std::nullopt;
+};
+
+struct MatmulMultiCoreReuseMultiCastProgramConfig {
+    tt::tt_metal::CoreCoord compute_with_storage_grid_size;
+    std::size_t in0_block_w{};
+    std::size_t out_subblock_h{};
+    std::size_t out_subblock_w{};
+    std::size_t out_block_h{};
+    std::size_t out_block_w{};
+    std::size_t per_core_M{};
+    std::size_t per_core_N{};
+    bool transpose_mcast{};
+    std::optional<ttnn::operations::unary::UnaryWithParam> fused_activation;
+    bool fuse_batch = true;
+    std::optional<tt::tt_metal::CoreRangeSet> allowed_worker_cores = std::nullopt;
+};
+
+// 1D mcast matmul program config.
+//
+// When `gather_in0 == false`, `compute_with_storage_grid_size` describes the size of the
+// rectangular grid of worker cores that the multicast paths will use, anchored at (0, 0) on
+// the device, or at the bounding-box start of the active sub-device when `sub_device_id` is
+// set on the op. The 1D mcast factory targets a single bounding-box rectangle for multicast
+// and the per-core index math assumes a single contiguous row-major rectangle, so when
+// `sub_device_id` is provided the sub-device's worker cores must themselves form a single
+// rectangle. Non-rectangular sub-device grids are rejected at validate time.
+//
+// When `gather_in0 == true`, `compute_with_storage_grid_size` is ignored and the gather path
+// can run on any sub-device worker layout, including non-rectangular ones.
+struct MatmulMultiCoreReuseMultiCast1DProgramConfig {
+    tt::tt_metal::CoreCoord compute_with_storage_grid_size;
+    std::size_t in0_block_w{};
+    std::size_t out_subblock_h{};
+    std::size_t out_subblock_w{};
+    std::size_t out_block_h{};
+    std::size_t out_block_w{};
+    std::size_t per_core_M{};
+    std::size_t per_core_N{};
+    bool fuse_batch{};
+    std::optional<ttnn::operations::unary::UnaryWithParam> fused_activation;
+    bool mcast_in0{};
+    bool gather_in0{};
+    tt::tt_metal::CoreRangeSet hop_cores;
+    std::size_t num_global_cb_receivers{};
+    bool untilize_out{};
+    std::optional<tt::tt_metal::CoreRangeSet> allowed_worker_cores = std::nullopt;
+    // Select ring-rotated FIFO delivery for gather_in0 over Tensor prefetcher PrefetcherPipes. The
+    // feeding prefetcher request MUST supply a per-receiver rotation. mcast_in0 instead consumes natural
+    // FIFO order and requires this flag to remain false.
+    bool stream_in1 = false;
+};
+
+struct MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig {
+    std::size_t in0_block_w{};
+    std::size_t per_core_M{};
+    std::size_t per_core_N{};
+    std::optional<ttnn::operations::unary::UnaryWithParam> fused_activation;
+    // Cores per DRAM bank. 1: the single-reader program. 2 or 3 (Blackhole only): the single-reader
+    // program with that many readers per bank (shard width divisible by N), unless
+    // use_multicore_pipeline selects the multi-core pipeline.
+    std::size_t num_workers_per_dram_bank = 1;
+    // Explicit opt-in to the multi-core pipeline. false (the default) keeps the behaviour above for
+    // every value of num_workers_per_dram_bank. true: when num_workers_per_dram_bank >= 2 and the call
+    // qualifies (dram_sharded_helpers::use_dram_sharded_multicore), num_workers_per_dram_bank cores per
+    // bank run the multi-core pipeline; a call that does not qualify keeps the behaviour above and its
+    // validation (num_workers_per_dram_bank > 1 is then Blackhole only).
+    bool use_multicore_pipeline = false;
+};
+
+struct MatmulMultiCoreReuseMultiCastBatchedDRAMShardedProgramConfig {
+    std::size_t in0_block_w{};
+    std::size_t per_core_M{};
+    std::size_t per_core_N{};
+    std::optional<ttnn::operations::unary::UnaryWithParam> fused_activation;
+};
+
+struct MatmulMultiCoreProgramConfig {
+    std::optional<tt::tt_metal::CoreRangeSet> allowed_worker_cores = std::nullopt;
+};
+
+using MatmulProgramConfig = std::variant<
+    MatmulMultiCoreProgramConfig,
+    MatmulMultiCoreReuseProgramConfig,
+    MatmulMultiCoreReuseMultiCastProgramConfig,
+    MatmulMultiCoreReuseMultiCast1DProgramConfig,
+    MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig,
+    MatmulMultiCoreReuseMultiCastBatchedDRAMShardedProgramConfig>;
+
+// Ensures allowed_worker_cores is populated on every config variant that supports it.
+// If allowed_worker_cores is already set, it is left unchanged.  Otherwise it is
+// synthesized from compute_with_storage_grid_size (or from the device grid for
+// MatmulMultiCoreProgramConfig).  After this call, factories can read
+// config.allowed_worker_cores.value() unconditionally.
+inline void normalize_program_config(MatmulProgramConfig& config, const tt::tt_metal::CoreCoord& device_grid) {
+    auto make_crs = [](const tt::tt_metal::CoreCoord& grid) {
+        return tt::tt_metal::CoreRangeSet(
+            tt::tt_metal::CoreRange(tt::tt_metal::CoreCoord(0, 0), tt::tt_metal::CoreCoord(grid.x - 1, grid.y - 1)));
+    };
+    std::visit(
+        [&](auto& c) {
+            using T = std::decay_t<decltype(c)>;
+            if constexpr (
+                std::is_same_v<T, MatmulMultiCoreReuseProgramConfig> ||
+                std::is_same_v<T, MatmulMultiCoreReuseMultiCastProgramConfig> ||
+                std::is_same_v<T, MatmulMultiCoreReuseMultiCast1DProgramConfig>) {
+                if (!c.allowed_worker_cores.has_value()) {
+                    c.allowed_worker_cores = make_crs(c.compute_with_storage_grid_size);
+                }
+            } else if constexpr (std::is_same_v<T, MatmulMultiCoreProgramConfig>) {
+                if (!c.allowed_worker_cores.has_value()) {
+                    c.allowed_worker_cores = make_crs(device_grid);
+                }
+            }
+            // DRAM-sharded configs have no grid fields to normalize.
+        },
+        config);
+}
+
+}  // namespace ttnn::operations::matmul

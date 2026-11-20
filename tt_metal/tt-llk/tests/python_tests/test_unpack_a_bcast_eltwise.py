@@ -1,0 +1,226 @@
+# SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+# SPDX-License-Identifier: Apache-2.0
+
+import pytest
+import torch
+from conftest import skip_for_blackhole
+from helpers.format_config import DataFormat
+from helpers.golden_generators import TILE_DIMENSIONS
+from helpers.llk_params import (
+    DestAccumulation,
+    DestSync,
+    MathFidelity,
+    MathOperation,
+    PerfRunType,
+    format_dict,
+)
+from helpers.param_config import (
+    get_num_blocks_and_num_tiles_in_block,
+    input_output_formats,
+    parametrize,
+)
+from helpers.perf.core import create_test_or_perf_config
+from helpers.stimuli_config import StimuliConfig
+from helpers.stimuli_generator import generate_stimuli
+from helpers.test_variant_parameters import (
+    DEST_SYNC,
+    MATH_FIDELITY,
+    MATH_OP,
+    NUM_BLOCKS,
+    NUM_TILES_IN_BLOCK,
+    SRCA_REUSE_COUNT,
+    TILE_COUNT,
+    generate_input_dim,
+)
+from helpers.tile_constants import MAX_TILE_ELEMENTS
+from helpers.tilize_untilize import tilize_block
+from helpers.utils import passed_test, result_tensor
+
+
+def _skip_unsupported(mathop, math_fidelity, input_dimensions, srca_reuse_count):
+    input_tiles = input_dimensions[0] * input_dimensions[1] // MAX_TILE_ELEMENTS
+    if input_tiles % srca_reuse_count != 0:
+        pytest.skip("Input tiles must be divisible by reuse factor")
+
+    if mathop != MathOperation.Elwmul and math_fidelity != MathFidelity.LoFi:
+        pytest.skip("Fidelity does not affect Elwadd and Elwsub operations")
+
+
+@skip_for_blackhole
+@parametrize(
+    formats=input_output_formats(
+        [
+            DataFormat.Float16_b,
+        ]
+    ),
+    mathop=[MathOperation.Elwsub, MathOperation.Elwadd, MathOperation.Elwmul],
+    dest_acc=[DestAccumulation.No],
+    srca_reuse_count=[2, 4, 8],
+    math_fidelity=[
+        MathFidelity.LoFi,
+    ],
+    input_dimensions=[
+        [128, 32],
+        [32, 128],
+        [64, 128],
+        [128, 256],
+    ],
+)
+def test_unp_bcast_sub_sdpa(
+    formats,
+    mathop,
+    dest_acc,
+    math_fidelity,
+    input_dimensions,
+    srca_reuse_count,
+):
+    _skip_unsupported(mathop, math_fidelity, input_dimensions, srca_reuse_count)
+
+    # Precompute constants
+    input_tiles = input_dimensions[0] * input_dimensions[1] // MAX_TILE_ELEMENTS
+    reuse_factor = input_tiles // srca_reuse_count
+
+    src_A, _, src_B, _ = generate_stimuli(
+        stimuli_format_A=formats.input_format,
+        input_dimensions_A=input_dimensions,
+        stimuli_format_B=formats.input_format,
+        input_dimensions_B=input_dimensions,
+    )
+
+    src_A = src_A[: MAX_TILE_ELEMENTS * reuse_factor]
+
+    reshaped_a = src_A.reshape(64 * reuse_factor, 16)
+
+    b_tiles = [
+        src_B[i : i + MAX_TILE_ELEMENTS].tolist()
+        for i in range(0, len(src_B), MAX_TILE_ELEMENTS)
+    ]
+    b_tiles = b_tiles[:]
+
+    take = []
+    for i in range(0, reshaped_a.shape[0], 64):
+        take.append(reshaped_a[i])
+        take.append(reshaped_a[i + 16])
+
+    # Reconstruct tiles with broadcasted data
+
+    reconstructed_tiles = []
+    for i in range(0, len(take), 2):
+        if i + 1 < len(take):
+            # Combine pair into 1x32 element
+            combined = torch.cat([take[i], take[i + 1]], dim=0)
+            # Replicate to create 32x32 tile
+            tile_32x32 = combined.repeat(32, 1)
+            reconstructed_tiles.append(tile_32x32.flatten())
+
+    tilized_reconstructed_tiles = [
+        tilize_block(tile, TILE_DIMENSIONS).flatten() for tile in reconstructed_tiles
+    ]
+
+    golden = []
+
+    for tile_idx, reconstructed_tile in enumerate(tilized_reconstructed_tiles):
+        start_b_idx = tile_idx * srca_reuse_count
+        for reuse_idx in range(srca_reuse_count):
+            b_tile_idx = start_b_idx + reuse_idx
+            if b_tile_idx < len(b_tiles):
+                b_tile = torch.tensor(b_tiles[b_tile_idx])
+
+                if mathop == MathOperation.Elwadd:
+                    result = reconstructed_tile + b_tile
+                elif mathop == MathOperation.Elwsub:
+                    result = reconstructed_tile - b_tile
+                elif mathop == MathOperation.Elwmul:
+                    result = reconstructed_tile * b_tile
+
+                golden.append(result)
+
+    golden_tensor = torch.cat(golden).to(dtype=format_dict[formats.output_format])
+
+    res_from_L1 = run_unpack_a_bcast_eltwise(
+        formats,
+        mathop,
+        dest_acc=dest_acc,
+        math_fidelity=math_fidelity,
+        input_dimensions=input_dimensions,
+        srca_reuse_count=srca_reuse_count,
+        src_A=src_A,
+        src_B=src_B,
+        tile_count_A=reuse_factor,
+        tile_count_B=input_tiles,
+    )
+
+    res_tensor = result_tensor(res_from_L1, formats.output_format, golden_tensor)
+
+    assert passed_test(
+        golden_tensor, res_tensor, formats.output_format
+    ), "Assert against golden failed"
+
+
+def run_unpack_a_bcast_eltwise(
+    formats,
+    mathop,
+    dest_acc,
+    math_fidelity,
+    input_dimensions,
+    srca_reuse_count,
+    *,
+    src_A=None,
+    src_B=None,
+    tile_count_A=None,
+    tile_count_B=None,
+    is_perf=False,
+    perf_report=None,
+    run_types=None,
+):
+    _skip_unsupported(mathop, math_fidelity, input_dimensions, srca_reuse_count)
+
+    tile_count = input_dimensions[0] * input_dimensions[1] // MAX_TILE_ELEMENTS
+    num_blocks, num_tiles_in_block = get_num_blocks_and_num_tiles_in_block(
+        DestSync.Half, dest_acc, formats, input_dimensions, TILE_DIMENSIONS
+    )
+    tile_count_A = tile_count if tile_count_A is None else tile_count_A
+    tile_count_B = tile_count if tile_count_B is None else tile_count_B
+
+    if is_perf and perf_report is None:
+        raise ValueError("perf_report must be provided when is_perf=True")
+    if run_types is None:
+        run_types = [PerfRunType.L1_TO_L1]
+
+    test_config_kwargs = {
+        "test_name": "sources/unpack_a_bcast_eltwise_test.cpp",
+        "formats": formats,
+        "templates": [
+            generate_input_dim(input_dimensions, input_dimensions),
+            MATH_FIDELITY(math_fidelity),
+            MATH_OP(mathop=mathop),
+            DEST_SYNC(),
+        ],
+        "runtimes": [
+            TILE_COUNT(tile_count),
+            SRCA_REUSE_COUNT(srca_reuse_count),
+            NUM_TILES_IN_BLOCK(num_tiles_in_block),
+            NUM_BLOCKS(num_blocks),
+        ],
+        "variant_stimuli": StimuliConfig(
+            src_A,
+            formats.input_format,
+            src_B,
+            formats.input_format,
+            formats.output_format,
+            tile_count_A=tile_count_A,
+            tile_count_B=tile_count_B,
+            tile_count_res=tile_count,
+        ),
+        "dest_acc": dest_acc,
+    }
+
+    configuration = create_test_or_perf_config(
+        is_perf=is_perf,
+        run_types=run_types,
+        test_config_kwargs=test_config_kwargs,
+    )
+    if is_perf:
+        configuration.run(perf_report, run_count=10)
+        return None
+    return configuration.run().result

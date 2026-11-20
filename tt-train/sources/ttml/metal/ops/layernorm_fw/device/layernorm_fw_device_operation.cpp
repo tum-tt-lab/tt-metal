@@ -1,0 +1,165 @@
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include "layernorm_fw_device_operation.hpp"
+
+#include "layernorm_fw_program_factory.hpp"
+#include "metal/common/tensor_validation.hpp"
+#include "ttnn/device_operation.hpp"
+
+namespace ttml::metal::ops::layernorm_fw::device {
+
+void LayerNormForwardDeviceOperation::validate_on_program_cache_miss(
+    const operation_attributes_t& args, const tensor_args_t& tensor_args) {
+    const auto& input_tensor = tensor_args.input;
+    const auto& gamma_tensor = tensor_args.gamma;
+    const auto& beta_tensor = tensor_args.beta;
+    const auto& preallocated_output_tensor = tensor_args.preallocated_output;
+    const auto& preallocated_mean_tensor = tensor_args.preallocated_mean;
+    const auto& preallocated_rstd_tensor = tensor_args.preallocated_rstd;
+
+    check_device_tensor(input_tensor, "LayerNormForward", "Input", {.buffer_type = tt::tt_metal::BufferType::DRAM});
+    check_device_tensor(gamma_tensor, "LayerNormForward", "Gamma", {.buffer_type = tt::tt_metal::BufferType::DRAM});
+    check_device_tensor(beta_tensor, "LayerNormForward", "Beta", {.buffer_type = tt::tt_metal::BufferType::DRAM});
+    if (preallocated_output_tensor.has_value()) {
+        check_device_tensor(
+            preallocated_output_tensor.value(),
+            "LayerNormForward",
+            "Preallocated output",
+            {.buffer_type = tt::tt_metal::BufferType::DRAM});
+    }
+    if (preallocated_mean_tensor.has_value()) {
+        check_device_tensor(
+            preallocated_mean_tensor.value(),
+            "LayerNormForward",
+            "Preallocated mean",
+            {.buffer_type = tt::tt_metal::BufferType::DRAM});
+    }
+    if (preallocated_rstd_tensor.has_value()) {
+        check_device_tensor(
+            preallocated_rstd_tensor.value(),
+            "LayerNormForward",
+            "Preallocated rstd",
+            {.buffer_type = tt::tt_metal::BufferType::DRAM});
+    }
+}
+
+spec_return_value_t LayerNormForwardDeviceOperation::compute_output_specs(
+    const operation_attributes_t& args, const tensor_args_t& tensor_args) {
+    spec_return_value_t output_specs;
+    output_specs.reserve(3U);
+
+    // output - same shape as input
+    if (tensor_args.preallocated_output.has_value()) {
+        output_specs.push_back(tensor_args.preallocated_output->tensor_spec());
+    } else {
+        auto input_shape = tensor_args.input.logical_shape();
+        output_specs.emplace_back(
+            input_shape,
+            tt::tt_metal::TensorLayout(
+                tensor_args.input.dtype(), tt::tt_metal::Layout::TILE, tensor_args.input.memory_config()));
+    }
+
+    // mean - shape is [B, 1, S, 1]
+    if (args.return_mean_rstd) {
+        if (tensor_args.preallocated_mean.has_value()) {
+            output_specs.push_back(tensor_args.preallocated_mean->tensor_spec());
+        } else {
+            auto mean_shape = tensor_args.input.logical_shape();
+            mean_shape[-1] = 1U;
+            output_specs.emplace_back(
+                mean_shape,
+                tt::tt_metal::TensorLayout(
+                    tensor_args.input.dtype(), tt::tt_metal::Layout::TILE, tensor_args.input.memory_config()));
+        }
+
+        // rstd - same shape as mean [B, H, S, 1]
+        if (tensor_args.preallocated_rstd.has_value()) {
+            output_specs.push_back(tensor_args.preallocated_rstd->tensor_spec());
+        } else {
+            auto rstd_shape = tensor_args.input.logical_shape();
+            rstd_shape[-1] = 1U;
+            output_specs.emplace_back(
+                rstd_shape,
+                tt::tt_metal::TensorLayout(
+                    tensor_args.input.dtype(), tt::tt_metal::Layout::TILE, tensor_args.input.memory_config()));
+        }
+    }
+
+    return output_specs;
+}
+
+tensor_return_value_t LayerNormForwardDeviceOperation::create_output_tensors(
+    const operation_attributes_t& args, const tensor_args_t& tensor_args) {
+    tensor_return_value_t output_tensors;
+    output_tensors.reserve(3U);
+
+    spec_return_value_t output_specs = compute_output_specs(args, tensor_args);
+
+    // output
+    if (tensor_args.preallocated_output.has_value()) {
+        output_tensors.push_back(tensor_args.preallocated_output);
+    } else {
+        output_tensors.push_back(ttnn::create_device_tensor(output_specs[0], tensor_args.input.device()));
+    }
+
+    // mean (optional)
+    if (args.return_mean_rstd) {
+        if (tensor_args.preallocated_mean.has_value()) {
+            output_tensors.push_back(tensor_args.preallocated_mean);
+        } else {
+            output_tensors.push_back(ttnn::create_device_tensor(output_specs[1], tensor_args.input.device()));
+        }
+
+        // rstd (optional)
+        if (tensor_args.preallocated_rstd.has_value()) {
+            output_tensors.push_back(tensor_args.preallocated_rstd);
+        } else {
+            output_tensors.push_back(ttnn::create_device_tensor(output_specs[2], tensor_args.input.device()));
+        }
+    } else {
+        output_tensors.push_back(std::nullopt);
+        output_tensors.push_back(std::nullopt);
+    }
+
+    return output_tensors;
+}
+
+// Hashes what the default key hashes (every attribute, the full spec of every tensor, which optional tensors are
+// passed). It is custom only to skip the canonical key string the default key also builds on every dispatch.
+ttsl::hash::hash_t LayerNormForwardDeviceOperation::compute_program_hash(
+    const operation_attributes_t& args, const tensor_args_t& tensor_args) {
+    return tt::tt_metal::operation::hash_operation<LayerNormForwardDeviceOperation>(args, tensor_args);
+}
+
+}  // namespace ttml::metal::ops::layernorm_fw::device
+
+namespace ttnn::prim {
+
+ttml::metal::ops::layernorm_fw::device::LayerNormForwardDeviceOperation::tensor_return_value_t ttml_layernorm_fw(
+    const ttnn::Tensor& input_tensor,
+    const ttnn::Tensor& gamma_tensor,
+    const ttnn::Tensor& beta_tensor,
+    float epsilon,
+    bool return_mean_rstd,
+    const std::optional<ttnn::Tensor>& preallocated_output,
+    const std::optional<ttnn::Tensor>& preallocated_mean,
+    const std::optional<ttnn::Tensor>& preallocated_rstd) {
+    using OperationType = ttml::metal::ops::layernorm_fw::device::LayerNormForwardDeviceOperation;
+
+    auto operation_attributes =
+        OperationType::operation_attributes_t{.epsilon = epsilon, .return_mean_rstd = return_mean_rstd};
+    auto tensor_args = OperationType::tensor_args_t{
+        .input = input_tensor,
+        .gamma = gamma_tensor,
+        .beta = beta_tensor,
+        .preallocated_output = preallocated_output,
+        .preallocated_mean = preallocated_mean,
+        .preallocated_rstd = preallocated_rstd,
+    };
+
+    return ttnn::device_operation::launch<OperationType>(operation_attributes, tensor_args);
+}
+
+}  // namespace ttnn::prim

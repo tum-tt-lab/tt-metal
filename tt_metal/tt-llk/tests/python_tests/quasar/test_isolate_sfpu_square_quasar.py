@@ -1,0 +1,152 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Isolated SFPU square: UNPACK2 (UNP_S) -> SrcS -> SFPU -> PACK1 -> L1.
+No MATH kernel. Unpack and pack use llk_srcs (unpack to SrcS, pack from SrcS).
+Same structure and parameter coverage as test_sfpu_square_quasar.
+"""
+
+import math
+
+import pytest
+import torch
+from helpers.format_config import DataFormat
+from helpers.golden_generators import UnarySFPUGolden, get_golden_generator
+from helpers.llk_params import MathOperation
+from helpers.param_config import (
+    flat_axes,
+    generate_quasar_srcs_format_dest_acc_combinations,
+    input_output_formats,
+    parametrize,
+    quasar_mx_smoke,
+    runtime,
+)
+from helpers.stimuli_config import StimuliConfig
+from helpers.stimuli_generator import (
+    apply_log_uniform_magnitudes,
+    compute_safe_input_magnitude_range,
+    format_elem_max,
+    generate_stimuli,
+)
+from helpers.test_config import TestConfig
+from helpers.test_variant_parameters import (
+    DEST_INDEX,
+    NUM_FACES,
+    TEST_FACE_DIMS,
+    TILE_COUNT,
+)
+from helpers.utils import passed_test, result_tensor
+
+# Safety factor applied to format maxima when clamping square operands.
+# Keeps x² comfortably within the output format and |x| within the input format.
+SQUARE_RANGE_SAFETY_FACTOR = 0.9
+
+SFPU_SQUARE_FORMATS = input_output_formats(
+    [
+        DataFormat.Float16_b,
+        DataFormat.Float32,
+    ]
+    # The MX pair is on the input side: these operands reach the SFPU through UNP_S
+    # into SrcS, a decode port the unpack test (UnpA/UnpB) does not cover.
+) + quasar_mx_smoke(DataFormat.MxFp8P, DataFormat.Float16_b)
+
+SFPU_SQUARE_COMBINATIONS = [
+    (fmt, dest_acc, runtime(input_dimensions))
+    for fmt, dest_acc in generate_quasar_srcs_format_dest_acc_combinations(
+        SFPU_SQUARE_FORMATS
+    )
+    for input_dimensions in [[32, 32], [64, 64]]
+]
+
+
+SFPU_SQUARE_FLAT_NAMES = ("formats", "dest_acc", "input_dimensions")
+
+
+@pytest.mark.quasar
+@parametrize(**flat_axes(SFPU_SQUARE_FLAT_NAMES, SFPU_SQUARE_COMBINATIONS))
+def test_isolate_sfpu_square_quasar(formats, dest_acc, input_dimensions):
+    """
+    Test isolated SFPU square: UNPACK2 (UNP_S) -> SrcS -> SFPU -> PACK1 -> L1.
+    No MATH kernel (stub only).
+    """
+
+    torch.manual_seed(42)
+
+    src_A, tile_cnt_A, src_B, _ = generate_stimuli(
+        stimuli_format_A=formats.input_format,
+        input_dimensions_A=input_dimensions,
+        stimuli_format_B=formats.input_format,
+        input_dimensions_B=input_dimensions,
+    )
+
+    # Both caps invert the squaring op so x² stays representable. For the input
+    # cap this is because the SFPU squares in the input format's math precision
+    # (except for MX, where squaring uses a wider intermediate and |x| itself
+    # is the binding constraint -- mx_elem_max is already small).
+    input_elem_max = format_elem_max(formats.input_format)
+    input_magnitude_cap = (
+        input_elem_max
+        if formats.input_format.is_mx_format()
+        else math.sqrt(input_elem_max)
+    ) * SQUARE_RANGE_SAFETY_FACTOR
+    output_magnitude_cap = (
+        math.sqrt(format_elem_max(formats.output_format)) * SQUARE_RANGE_SAFETY_FACTOR
+    )
+
+    min_magnitude, max_magnitude = compute_safe_input_magnitude_range(
+        formats.input_format,
+        formats.output_format,
+        input_magnitude_cap=input_magnitude_cap,
+        output_magnitude_cap=output_magnitude_cap,
+    )
+    src_A = apply_log_uniform_magnitudes(
+        src_A,
+        min_magnitude=min_magnitude,
+        max_magnitude=max_magnitude,
+        cast_to_format=formats.input_format,
+        sign_source=src_B,
+    )
+
+    num_faces = 4
+
+    generate_golden = get_golden_generator(UnarySFPUGolden)
+    golden_tensor = generate_golden(
+        MathOperation.Square,
+        src_A,
+        formats.output_format,
+        dest_acc,
+        formats.input_format,
+        input_dimensions,
+        unpack_to_srcs=True,
+    )
+
+    configuration = TestConfig(
+        "sources/quasar/isolate_sfpu_square_quasar_test.cpp",
+        formats,
+        templates=[],
+        runtimes=[
+            TILE_COUNT(tile_cnt_A),
+            NUM_FACES(num_faces),
+            TEST_FACE_DIMS(),
+            DEST_INDEX(),
+        ],
+        variant_stimuli=StimuliConfig(
+            src_A,
+            formats.input_format,
+            src_B,
+            formats.input_format,
+            formats.output_format,
+            tile_count_A=tile_cnt_A,
+            tile_count_B=tile_cnt_A,
+            tile_count_res=tile_cnt_A,
+            num_faces=num_faces,
+        ),
+        unpack_to_srcs=True,
+        dest_acc=dest_acc,
+    )
+
+    res_from_L1 = configuration.run().result
+
+    res_tensor = result_tensor(res_from_L1, formats.output_format, golden_tensor)
+    assert passed_test(golden_tensor, res_tensor, formats.output_format)

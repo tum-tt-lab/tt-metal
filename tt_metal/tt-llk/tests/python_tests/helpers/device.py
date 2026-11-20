@@ -1,0 +1,493 @@
+# SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+# SPDX-License-Identifier: Apache-2.0
+
+import datetime
+import os
+import time
+from enum import Enum, IntEnum
+from pathlib import Path
+
+from helpers.chip_architecture import ChipArchitecture, get_chip_architecture
+from ttexalens.context import Context
+from ttexalens.coordinate import OnChipCoordinate
+from ttexalens.debug_tensix import TensixDebug
+from ttexalens.elf import CallstackEntry
+from ttexalens.tt_exalens_lib import (
+    ElfFile,
+    TTException,
+    arc_msg,
+    callstack,
+    check_context,
+    convert_coordinate,
+    parse_elf,
+    read_from_device,
+    read_word_from_device,
+    write_words_to_device,
+)
+
+from .target_config import TestTargetConfig
+
+
+class _UninitializedMailboxes:
+    """Placeholder mailboxes that fail fast with a clear error message if used before initialization."""
+
+    def __getattr__(self, name):
+        raise RuntimeError(
+            "Mailboxes have not been initialized. "
+            "Ensure TestConfig.setup_build() has been called before using mailbox-dependent helpers."
+        )
+
+
+Mailboxes = _UninitializedMailboxes()
+
+
+class LLKAssertException(Exception):
+    pass
+
+
+KERNEL_COMPLETE = 0xFF
+
+
+class BootMode(Enum):
+    BRISC = "brisc"
+    TRISC = "trisc"
+    EXALENS = "exalens"
+    DEFAULT = "default"
+
+
+CHIP_DEFAULT_BOOT_MODES = {
+    ChipArchitecture.WORMHOLE: BootMode.BRISC,
+    ChipArchitecture.BLACKHOLE: BootMode.BRISC,
+    ChipArchitecture.QUASAR: BootMode.TRISC,
+}
+
+
+# Constant - indicates that the RISC core doesn't exist on the chip
+INVALID_CORE = -1
+
+
+class RiscCore(IntEnum):
+    # These are now just internal identifiers, not the hardware IDs
+    BRISC = 0
+    TRISC0 = 1
+    TRISC1 = 2
+    TRISC2 = 3
+    TRISC3 = 4
+
+    @property
+    def value(self):
+        """Overrides the standard .value to be chip-dependent and lazy."""
+        arch = get_chip_architecture()
+        is_quasar = arch == ChipArchitecture.QUASAR
+
+        mapping = {
+            RiscCore.BRISC: -1 if is_quasar else 11,
+            RiscCore.TRISC0: 11 if is_quasar else 12,
+            RiscCore.TRISC1: 12 if is_quasar else 13,
+            RiscCore.TRISC2: 13 if is_quasar else 14,
+            RiscCore.TRISC3: 14 if is_quasar else -1,
+        }
+        return mapping[self]
+
+    def __repr__(self):
+        # This forces the print output to use your lazy .value property
+        return f"<{self.__class__.__name__}.{self.name}: {self.value}>"
+
+
+def get_all_cores(trisc_only: bool = False):
+    arch = get_chip_architecture()
+    if arch == ChipArchitecture.QUASAR:
+        return [RiscCore.TRISC0, RiscCore.TRISC1, RiscCore.TRISC2, RiscCore.TRISC3]
+
+    if trisc_only:
+        return [RiscCore.TRISC0, RiscCore.TRISC1, RiscCore.TRISC2]
+
+    return [RiscCore.BRISC, RiscCore.TRISC0, RiscCore.TRISC1, RiscCore.TRISC2]
+
+
+# Constant - list of all valid cores on the chip
+ALL_CORES = get_all_cores()
+TRISC_CORES = get_all_cores(trisc_only=True)
+
+
+# Successful enumerations only. A miss must not stick: pytest_configure used to
+# call this before silicon/RTL Exalens init, and caching an empty tuple pinned
+# the session to a fake 8-wide grid.
+_functional_tensix_locations: dict[int, tuple] = {}
+
+
+def get_functional_tensix_locations(device_id: int = 0) -> tuple:
+    """Logical coordinates of every Tensix this card actually has, in a stable order.
+
+    "functional_workers" is the post-harvesting list, so this is what is really on
+    the part rather than what the architecture nominally provides. Logical
+    coordinates are already dense over that set and print as "x,y", which is the
+    form TENSIX_LOCATION carries and OnChipCoordinate.create parses back.
+
+    Raises if Exalens cannot answer. Compile-producer never calls this; a miss
+    here is a device-backed run that failed to find its cores.
+    """
+    cached = _functional_tensix_locations.get(device_id)
+    if cached is not None:
+        return cached
+    try:
+        device = check_context().devices[device_id]
+        locations = [
+            coordinate.to_str("logical")
+            for coordinate in device.get_block_locations("functional_workers")
+        ]
+    except Exception as err:
+        raise RuntimeError(
+            f"Could not enumerate Tensix cores from Exalens: "
+            f"{type(err).__name__}: {err}"
+        ) from err
+    # Every worker derives its own core from this list independently, so the order
+    # has to come out identical in each process; get_block_locations promises none.
+    result = tuple(
+        sorted(locations, key=lambda loc: tuple(int(v) for v in loc.split(",")))
+    )
+    if not result:
+        raise RuntimeError(
+            "Exalens reported no functional Tensix workers on this device."
+        )
+    _functional_tensix_locations[device_id] = result
+    return result
+
+
+def tensix_location_for_worker(worker_index: int, device_id: int = 0) -> str:
+    """The Tensix a worker owns on one shared device.
+
+    Two workers sharing a core would silently corrupt each other's results, so
+    running wider than the card is fatal rather than wrapped. ttsim is outside
+    that map: each xdist process hosts its own chip, and
+    ``resolve_worker_tensix_location`` asks for core 0. Call after Exalens has a
+    context; an enumeration failure is not a reason to invent cores.
+    """
+    locations = get_functional_tensix_locations(device_id)
+    if worker_index >= len(locations):
+        # Also reachable without over-subscribing: xdist numbers a replacement for
+        # a crashed worker above every existing one, so a run that keeps losing
+        # cores climbs into this eventually.
+        raise RuntimeError(
+            f"worker {worker_index} has no Tensix to run on: the card has "
+            f"{len(locations)} functional core(s). Lower --device-jobs, or stop "
+            f"replacing wedged workers, so the total stays under that."
+        )
+    return locations[worker_index]
+
+
+def get_register_store(location="0,0", device_id=0, neo_id=0):
+    CHIP_ARCH = get_chip_architecture()
+    context = check_context()
+    device = context.devices[device_id]
+    chip_coordinate = OnChipCoordinate.create(location, device=device)
+    noc_block = device.get_block(chip_coordinate)
+    if CHIP_ARCH == ChipArchitecture.QUASAR:
+        match neo_id:
+            case 0:
+                register_store = noc_block.neo0.register_store
+            case 1:
+                register_store = noc_block.neo1.register_store
+            case 2:
+                register_store = noc_block.neo2.register_store
+            case 3:
+                register_store = noc_block.neo3.register_store
+            case _:
+                raise ValueError(f"Invalid neo_id {neo_id} for Quasar architecture")
+    else:
+        if neo_id != 0:
+            raise ValueError(f"Invalid non zero neo_id for non Quasar architecture")
+        register_store = noc_block.get_register_store()
+    return register_store
+
+
+def get_soft_reset_mask(cores: list[RiscCore]):
+    if INVALID_CORE in cores:
+        raise ValueError("Attempting to reset a core that doesn't exist on this chip")
+    return sum(1 << core.value for core in cores)
+
+
+def set_tensix_soft_reset(
+    value, cores: list[RiscCore] = ALL_CORES, location="0,0", device_id=0
+):
+    soft_reset = get_register_store(location, device_id).read_register(
+        "RISCV_DEBUG_REG_SOFT_RESET_0"
+    )
+    if value:
+        soft_reset |= get_soft_reset_mask(cores)
+    else:
+        soft_reset &= ~get_soft_reset_mask(cores)
+
+    get_register_store(location, device_id).write_register(
+        "RISCV_DEBUG_REG_SOFT_RESET_0", soft_reset
+    )
+
+
+def commit_tensix_soft_reset(
+    value, cores: list[RiscCore] = ALL_CORES, location="0,0", device_id=0
+):
+    soft_reset = get_register_store(location, device_id).read_register(
+        "RISCV_DEBUG_REG_SOFT_RESET_0"
+    )
+    if value:
+        soft_reset |= get_soft_reset_mask(cores)
+    else:
+        soft_reset &= ~get_soft_reset_mask(cores)
+
+    get_register_store(location, device_id).write_register(
+        "RISCV_DEBUG_REG_SOFT_RESET_0", soft_reset
+    )
+
+    end_time = time.monotonic() + 0.1  # 100ms
+    while True:
+        temp_reg_value = get_register_store(location, device_id).read_register(
+            "RISCV_DEBUG_REG_SOFT_RESET_0"
+        )
+        if temp_reg_value == soft_reset:
+            return
+        if time.monotonic() >= end_time:
+            break
+
+    raise TimeoutError(
+        f"Polling for committed soft reset value times out | Last read value: {temp_reg_value}"
+    )
+
+
+# SOFT_RESET_0 bits of the Tensix pipeline units to reset after a hang:
+#   bits  0-1: unpackers 0-1
+#   bits  2-5: packers 0-3
+#   bits  6-10: mover, search, glue, THCON (bit 9 zeroes the THCON config), FPU (bit 10 resets SFPU LReg/LaneConfig)
+#   bits 15-17: SrcA/SrcB/Dest register banks
+# Bits 11-14 and 18 (the RISCs) are excluded: they are held in reset by the caller via get_soft_reset_mask(ALL_CORES).
+_PIPELINE_RESET_MASK = 0x7FF | (0x7 << 15)
+_SRCA_SRCB = 0b11  # SETDVALID/CLEARDVALID: satisfy and clear both SrcA and SrcB
+_CLOCK_KEEPALIVE_READS = (
+    16  # thread-0 reads that keep unit clocks running while the stall drains
+)
+
+
+def recover_tensix_core(location: str = "0,0", device_id=0):
+    """After a hang: a math op stuck waiting for SrcA/SrcB survives the TRISC soft reset (#64272), so satisfy the wait
+    from thread 0, then clear the flags and reset the pipeline units. Wormhole and Blackhole only.
+    """
+    if get_chip_architecture() == ChipArchitecture.QUASAR:
+        return
+    store = get_register_store(location, device_id)
+    debug_tensix = TensixDebug(
+        OnChipCoordinate.create(location, device=check_context().devices[device_id])
+    )
+    held = store.read_register("RISCV_DEBUG_REG_SOFT_RESET_0") | get_soft_reset_mask(
+        ALL_CORES
+    )
+    store.write_register("RISCV_DEBUG_REG_SOFT_RESET_0", held)
+    ops = debug_tensix.device.instructions
+    debug_tensix.inject_instruction(ops.TT_OP_SETDVALID(_SRCA_SRCB), 0)  # thread 0
+    debug_tensix.inject_instruction(ops.TT_OP_CLEARDVALID(_SRCA_SRCB, 0), 0)  # thread 0
+    # Unit clocks are gated when idle: reads keep them running while the wait drains and the reset is asserted.
+    for _ in range(_CLOCK_KEEPALIVE_READS):
+        store.read_register("RISCV_DEBUG_REG_SOFT_RESET_0")
+    store.write_register("RISCV_DEBUG_REG_SOFT_RESET_0", held | _PIPELINE_RESET_MASK)
+    for _ in range(_CLOCK_KEEPALIVE_READS):
+        store.read_register("RISCV_DEBUG_REG_SOFT_RESET_0")
+    store.write_register("RISCV_DEBUG_REG_SOFT_RESET_0", held)
+
+
+def soft_reset_bits(location: str = "0,0") -> int:
+    """RISCV_DEBUG_REG_SOFT_RESET_0, a register: the host reads it while a kernel runs without touching L1."""
+    return get_register_store(location, 0).read_register("RISCV_DEBUG_REG_SOFT_RESET_0")
+
+
+# Quasar kernels mirror their completion flags into cluster control scratch registers (host_signal in boot.h), so
+# waiting on a kernel never reads its L1. ttsim keeps the L1 path.
+_QUASAR_HOST_SIGNAL_BASE = 0x030000B0  # TT_CLUSTER_CTRL_SCRATCH_28
+
+
+# boot.h host_signal on Wormhole and Blackhole: STREAM_SCRATCH_0 of overlay stream 0, where BRISC marks a launch done.
+_NOC_OVERLAY_START_ADDR = 0xFFB40000
+_HOST_SIGNAL_SCRATCH_INDEX = {
+    ChipArchitecture.WORMHOLE: 248,
+    ChipArchitecture.BLACKHOLE: 36,
+}
+HOST_SIGNAL_MASK = 0xFFFFFF
+
+
+def launch_done_address() -> int | None:
+    """Wormhole and Blackhole: the overlay register BRISC marks a launch done in (None on ttsim, which waits on L1)."""
+    index = _HOST_SIGNAL_SCRATCH_INDEX.get(get_chip_architecture())
+    target = TestTargetConfig._instance
+    if index is None or (target is not None and target.runs_on_ttsim()):
+        return None
+    return _NOC_OVERLAY_START_ADDR + index * 4
+
+
+def host_signal_address(slot: int) -> int | None:
+    """Quasar emulator and RTL simulator: the cluster control register the TRISC at mailbox word `slot` signals done
+    in. None elsewhere: ttsim keeps the L1 mailboxes, and Wormhole and Blackhole use launch_done_address().
+    """
+    if get_chip_architecture() != ChipArchitecture.QUASAR:
+        return None
+    # The emulator models the cluster control registers; ttsim (a shared library) does not
+    target = TestTargetConfig._instance
+    if target is not None and target.runs_on_ttsim():
+        return None
+    return _QUASAR_HOST_SIGNAL_BASE + slot * 4
+
+
+def assert_if_all_in_reset(location: str = "0,0", place: str = ""):
+    soft_reset = get_register_store(location, 0).read_register(
+        "RISCV_DEBUG_REG_SOFT_RESET_0"
+    )
+
+    if (soft_reset & get_soft_reset_mask(ALL_CORES)) != get_soft_reset_mask(ALL_CORES):
+        raise Exception(f"Not all cores are in reset! {place}")
+
+
+def exalens_device_setup(chip_arch, location="0,0", device_id=0):
+    context = check_context()
+    device = context.devices[device_id]
+    chip_coordinate = OnChipCoordinate.create(location, device=device)
+    debug_tensix = TensixDebug(chip_coordinate)
+    ops = debug_tensix.device.instructions
+
+    if chip_arch == ChipArchitecture.BLACKHOLE:
+        get_register_store(location, device_id).write_register(
+            "RISCV_DEBUG_REG_DEST_CG_CTRL", 0
+        )
+        debug_tensix.inject_instruction(ops.TT_OP_ZEROACC(3, 0, 0, 1, 0), 0)
+    else:
+        debug_tensix.inject_instruction(ops.TT_OP_ZEROACC(3, 0, 0), 0)
+
+    debug_tensix.inject_instruction(ops.TT_OP_SFPENCC(3, 0, 0, 10), 0)
+    debug_tensix.inject_instruction(ops.TT_OP_NOP(), 0)
+
+    debug_tensix.inject_instruction(ops.TT_OP_SFPCONFIG(0, 11, 1), 0)
+
+    debug_tensix.inject_instruction(ops.TT_OP_SEMINIT(1, 0, 2), 0)
+    debug_tensix.inject_instruction(ops.TT_OP_SEMINIT(1, 0, 7), 0)
+    debug_tensix.inject_instruction(ops.TT_OP_SEMINIT(1, 0, 4), 0)
+
+
+def is_assert_hit(risc_name, core_loc="0,0", device_id=0):
+    # check if the core is stuck on an EBREAK instruction
+
+    CHIP_ARCH = get_chip_architecture()
+    context = check_context()
+    device = context.devices[device_id]
+    coordinate = convert_coordinate(core_loc, device_id, context)
+    block = device.get_block(coordinate)
+    risc_debug = block.get_risc_debug(
+        risc_name, neo_id=0 if CHIP_ARCH == ChipArchitecture.QUASAR else None
+    )
+
+    is_it = True
+
+    try:
+        is_it = risc_debug.is_ebreak_hit()
+    except:
+        raise Exception("WTF handler")
+
+    return is_it
+
+
+def _print_callstack(risc_name: str, callstack: list[CallstackEntry]) -> str:
+    temp_str = f"\n====== {risc_name.upper()} STACK TRACE =======\n"
+
+    LLK_HOME = Path(os.environ.get("LLK_HOME"))
+    TESTS_DIR = LLK_HOME / "tests"
+
+    for idx, entry in enumerate(callstack):
+        # Format PC hex like Rust does
+        pc = f"0x{entry.pc:016x}" if entry.pc is not None else "0x????????????????"
+        # first line: idx, pc, function
+        temp_str += f"{idx:>4}: {pc} - {entry.function_name}\n"
+        # second line: file, line, column. ttexalens >= 0.3.29 moved these onto a nullable
+        # CallstackEntry.file_info (DwarfFileLine); older versions exposed them directly on the
+        # entry. Support both, and tolerate frames with no DWARF line info at all -- an
+        # AttributeError here would mask the LLK assertion we are trying to report.
+        file_info = getattr(entry, "file_info", entry)
+        source_file = (
+            getattr(file_info, "file", None) if file_info is not None else None
+        )
+        if source_file is None:
+            temp_str += f"{' '*25}| at <no line info>\n"
+            continue
+        file_path = (TESTS_DIR / Path(source_file)).resolve()
+        temp_str += f"{' '*25}| at {file_path}:{file_info.line}:{file_info.column}\n"
+
+    return temp_str
+
+
+def handle_if_assert_hit(elfs: list[str], core_loc="0,0", device_id=0):
+    assertion_hits = []
+    temp_stack_traces = ""
+    for core in TRISC_CORES:
+        risc_name = str(core.name)
+        if is_assert_hit(risc_name, core_loc=core_loc, device_id=device_id):
+            temp_stack_traces += _print_callstack(
+                risc_name,
+                callstack(core_loc, elfs, risc_name=risc_name, device_id=device_id),
+            )
+            assertion_hits.append(risc_name)
+
+    if assertion_hits:
+        raise LLKAssertException(temp_stack_traces)
+
+
+def reset_mailboxes(location: str = "0,0"):
+    """Reset all core mailboxes (Unpacker, Math, Packer, Sfpu for Quasar, Unpacker, Math, Packer for Wormhole/Blackhole) before each test."""
+
+    # Use 0xA3, because it's a non-zero value that we don't use anywhere else - it's good for triaging hangs.
+    MAILBOX_RESET = 0xA3
+    MAILBOX_START_BLOCK = Mailboxes.Unpacker.value
+    # All 4 TRISC mailboxes on Quasar, all 3 on Wormhole/Blackhole
+    write_words_to_device(
+        location=location,
+        addr=MAILBOX_START_BLOCK,
+        data=[MAILBOX_RESET] * len(Mailboxes),
+    )
+    for slot in range(len(Mailboxes)):
+        addr = host_signal_address(slot)
+        if addr is not None:
+            write_words_to_device(
+                location=location, addr=addr, data=[MAILBOX_RESET], safe_mode=False
+            )
+
+
+def pull_coverage_stream_from_tensix(
+    location: str | OnChipCoordinate,
+    elf: str | ElfFile,
+    stream_path: str,
+    device_id: int = 0,
+    context: Context | None = None,
+) -> None:
+
+    coordinate = convert_coordinate(location, device_id, context)
+    context = coordinate.context
+    if isinstance(elf, str):
+        elf = parse_elf(elf, context)
+
+    COVERAGE_REGION_START_SYM = "__coverage_start"
+
+    coverage_start = elf.symbols[COVERAGE_REGION_START_SYM].value
+    if not coverage_start:
+        raise TTException(f"{COVERAGE_REGION_START_SYM} not found")
+
+    length = read_word_from_device(location, addr=coverage_start)
+
+    data = read_from_device(location, coverage_start + 4, num_bytes=length - 4)
+    with open(stream_path, "wb") as f:
+        f.write(data)
+
+
+def _send_arc_message(message_type: str, device_id: int):
+    """Helper to send ARC messages with better abstraction."""
+    ARC_COMMON_PREFIX = 0xAA00
+    message_codes = {"GO_BUSY": 0x52, "GO_IDLE": 0x54}
+
+    arc_msg(
+        device_id=device_id,
+        msg_code=ARC_COMMON_PREFIX | message_codes[message_type],
+        wait_for_done=True,
+        args=[0, 0],
+        timeout=datetime.timedelta(seconds=10),
+    )

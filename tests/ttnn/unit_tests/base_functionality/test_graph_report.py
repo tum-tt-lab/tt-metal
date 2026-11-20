@@ -1,0 +1,7505 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Tests for the C++-based graph capture and offline import workflow.
+
+This tests the decoupled workflow:
+1. C++ captures graph to JSON file
+2. Offline import to SQLite for visualization
+"""
+
+import contextlib
+import gc
+import hashlib
+import json
+import sqlite3
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+# Add local ttnn to path for graph_report module (before importing ttnn)
+_local_ttnn_path = str(Path(__file__).parent.parent.parent.parent.parent / "ttnn" / "ttnn")
+sys.path.insert(0, _local_ttnn_path)
+
+# Import graph_report directly (doesn't need ttnn._ttnn)
+import graph_report
+
+# Now import ttnn for device tests
+import ttnn
+
+from loguru import logger as loguru_logger
+
+from tt_py_test_utils_common.utility_functions import is_wormhole_b0, skip_for_slow_dispatch
+
+
+@pytest.fixture
+def tmp_report_dir(tmp_path):
+    """Create a temporary directory for reports."""
+    report_dir = tmp_path / "reports"
+    report_dir.mkdir()
+    return report_dir
+
+
+def _make_report(
+    graph,
+    devices=None,
+    per_operation_buffers=None,
+    python_io=None,
+    metadata=None,
+):
+    """Build a complete JSON report dict matching C++ output format."""
+    md = dict(metadata) if metadata is not None else {}
+    md.setdefault("rank", 0)
+    report = {"version": 1, "graph": graph, "devices": devices or [], "metadata": md}
+    if per_operation_buffers is not None:
+        report["per_operation_buffers"] = per_operation_buffers
+    if python_io is not None:
+        report["python_io"] = python_io
+    return report
+
+
+def _minimal_single_op_graph(op_name="ttnn.relu"):
+    """Graph with one top-level operation and nothing else."""
+    return [
+        {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1, 3]},
+        {
+            "counter": 1,
+            "node_type": "function_start",
+            "params": {"name": op_name},
+            "connections": [],
+            "input_tensors": [],
+        },
+        {
+            "counter": 2,
+            "node_type": "function_end",
+            "params": {"name": op_name},
+            "connections": [],
+            "duration_ns": 100,
+        },
+        {"counter": 3, "node_type": "capture_end", "params": {}, "connections": []},
+    ]
+
+
+def _write_reports(report_dir, reports):
+    """Write (filename, report dict) pairs as JSON files into report_dir, creating it."""
+    report_dir.mkdir(parents=True, exist_ok=True)
+    for filename, report_dict in reports:
+        with open(report_dir / filename, "w") as f:
+            json.dump(report_dict, f)
+
+
+def _query_db(db_path, sql):
+    """Run one query against an imported DB and return all rows."""
+    conn = sqlite3.connect(db_path)
+    try:
+        return conn.execute(sql).fetchall()
+    finally:
+        conn.close()
+
+
+def _import_to_db(report_dict, tmp_path):
+    """Write report JSON, import via import_report(), return (connection, cursor)."""
+    report_path = tmp_path / "report.json"
+    with open(report_path, "w") as f:
+        json.dump(report_dict, f)
+    db_path = graph_report.import_report(report_path, tmp_path / "output")
+    conn = sqlite3.connect(db_path)
+    return conn, conn.cursor()
+
+
+def _import_to_db_with_comparison_sidecar(report_dict, comparison_sidecar, tmp_path):
+    """Write report plus comparison sidecar, import, return (connection, cursor)."""
+    report_path = tmp_path / "report.json"
+    with open(report_path, "w") as f:
+        json.dump(report_dict, f)
+    sidecar_path = report_path.with_suffix(graph_report.COMPARISON_RECORDS_SIDECAR_SUFFIX)
+    with open(sidecar_path, "w") as f:
+        json.dump(comparison_sidecar, f)
+    db_path = graph_report.import_report(report_path, tmp_path / "output")
+    conn = sqlite3.connect(db_path)
+    return conn, conn.cursor()
+
+
+_SQLITE_TABLES_WITH_RANK = (
+    "devices",
+    "operations",
+    "operation_arguments",
+    "sub_device_managers",
+    "sub_devices",
+    "operation_executions",
+    "execution_sub_devices",
+    "tensors",
+    "device_tensors",
+    "buffers",
+    "captured_graph",
+    "nodes",
+    "edges",
+    "errors",
+    "stack_traces",
+    "input_tensors",
+    "output_tensors",
+    "tensor_lifetime",
+    "tensor_consumers",
+    "tensor_producers",
+    "buffer_chunks",
+    "local_tensor_comparison_records",
+    "global_tensor_comparison_records",
+)
+
+
+def _assert_nonempty_tables_rank_equals(cursor, expected_rank: int) -> None:
+    """For every table that has a rank column, rows must all equal ``expected_rank``."""
+    for table in _SQLITE_TABLES_WITH_RANK:
+        cursor.execute(f"SELECT COUNT(*), COALESCE(MIN(rank), -1), COALESCE(MAX(rank), -1) FROM {table}")
+        cnt, rmin, rmax = cursor.fetchone()
+        if cnt:
+            assert (
+                rmin == rmax == expected_rank
+            ), f"table {table}: expected rank {expected_rank} on all {cnt} row(s), got min={rmin} max={rmax}"
+
+
+class TestSubDeviceExecutionImport:
+    # Sub-device 0 is declared by the manager but never runs an operation; only sub-device 1 does.
+    IDLE_SUB_DEVICE_RANGES = [{"start": {"x": 0, "y": 0}, "end": {"x": 3, "y": 3}}]
+    BUSY_SUB_DEVICE_RANGES = [{"start": {"x": 4, "y": 0}, "end": {"x": 4, "y": 4}}]
+
+    @classmethod
+    def _report_with_program_execution(cls):
+        graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn.add"},
+                "connections": [2, 3],
+                "input_tensors": [],
+                "arguments": ["SubDeviceId(0)"],
+            },
+            {
+                "counter": 2,
+                "node_type": "sub_device_manager",
+                "params": {
+                    "device_id": 5,
+                    "sub_device_manager_id": 7,
+                    "sub_devices": json.dumps(
+                        [
+                            {"sub_device_id": 0, "worker_core_ranges": cls.IDLE_SUB_DEVICE_RANGES},
+                            {"sub_device_id": 1, "worker_core_ranges": cls.BUSY_SUB_DEVICE_RANGES},
+                        ]
+                    ),
+                },
+                "connections": [],
+            },
+            {
+                "counter": 3,
+                "node_type": "program_execution",
+                "params": {
+                    # device_id is the MeshDevice id, physical_device_id the chip it landed on.
+                    # Distinct values here so the importer's device-id remap is actually exercised.
+                    "device_id": 5,
+                    "physical_device_id": 17,
+                    "sub_device_manager_id": 7,
+                    "sub_device_id": 1,
+                    "worker_core_ranges": json.dumps(cls.BUSY_SUB_DEVICE_RANGES),
+                    "runtime_id": 3,
+                    "global_call_count": (3 << 10) | 17,
+                    "command_queue_id": 0,
+                },
+                "connections": [],
+            },
+            {
+                "counter": 4,
+                "node_type": "function_end",
+                "params": {"name": "ttnn.add"},
+                "connections": [],
+                "duration_ns": 1000,
+            },
+            {"counter": 5, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+        return _make_report(graph, devices=[{"device_id": 5}])
+
+    def test_imports_authoritative_program_execution_and_topology(self, tmp_path):
+        report = self._report_with_program_execution()
+        conn, cursor = _import_to_db(report, tmp_path)
+        try:
+            managers = cursor.execute(
+                "SELECT device_id, sub_device_manager_id, rank FROM sub_device_managers"
+            ).fetchall()
+            assert managers == [(0, 7, 0)]
+
+            # Both sub-devices are recorded, including sub-device 0, which ran no operation.
+            sub_devices = cursor.execute(
+                "SELECT device_id, sub_device_manager_id, sub_device_id, worker_core_ranges, rank "
+                "FROM sub_devices ORDER BY sub_device_id"
+            ).fetchall()
+            assert [row[:3] for row in sub_devices] == [(0, 7, 0), (0, 7, 1)]
+            assert json.loads(sub_devices[0][3]) == self.IDLE_SUB_DEVICE_RANGES
+            assert json.loads(sub_devices[1][3]) == self.BUSY_SUB_DEVICE_RANGES
+            assert {row[4] for row in sub_devices} == {0}
+
+            # Only the sub-device that ran is linked to an execution.
+            assert cursor.execute("SELECT sub_device_id FROM execution_sub_devices").fetchall() == [(1,)]
+
+            execution = cursor.execute(
+                "SELECT o.name, e.operation_id, e.device_id, e.physical_device_id, e.runtime_id, "
+                "e.global_call_count, e.command_queue_id, x.sub_device_manager_id, x.sub_device_id "
+                "FROM operation_executions e "
+                "JOIN operations o ON o.operation_id = e.operation_id AND o.rank = e.rank "
+                "JOIN execution_sub_devices x ON x.execution_id = e.execution_id AND x.rank = e.rank"
+            ).fetchone()
+            assert execution == ("ttnn.add", 1, 0, 17, 3, (3 << 10) | 17, 0, 7, 1)
+            assert cursor.execute("SELECT value FROM operation_arguments WHERE operation_id = 1").fetchone() == (
+                "SubDeviceId(0)",
+            )
+
+            # device_id is a remapped MeshDevice id, so it must resolve in the devices table.
+            # Emitting the physical chip id here instead would leave these rows dangling on any
+            # mesh whose chip ids differ from its mesh id.
+            assert (
+                cursor.execute(
+                    "SELECT COUNT(*) FROM operation_executions e "
+                    "LEFT JOIN devices d ON d.device_id = e.device_id AND d.rank = e.rank "
+                    "WHERE d.device_id IS NULL"
+                ).fetchone()[0]
+                == 0
+            )
+
+            # program_execution is a leaf: the op links to it, it links back to nothing. A back-edge
+            # would surface as an op <-> execution cycle in the edges table.
+            assert (
+                cursor.execute(
+                    "SELECT COUNT(*) FROM edges a JOIN edges b "
+                    "ON a.source_unique_id = b.sink_unique_id AND a.sink_unique_id = b.source_unique_id"
+                ).fetchone()[0]
+                == 0
+            )
+        finally:
+            conn.close()
+
+    def test_execution_ids_stay_unique_across_merged_files(self, tmp_path):
+        """Two same-rank files whose executions sit a full stride apart in graph node counters.
+
+        Deriving execution_id from the graph node counter collides here (node counters routinely
+        exceed the per-file operation id stride), and INSERT OR REPLACE would silently drop a row.
+        """
+        stride = graph_report._OPERATION_ID_STRIDE_PER_RANK_FILE
+
+        def graph_with_execution_at(counter_target, physical_device_id):
+            graph = [{"counter": 0, "node_type": "capture_start", "params": {}, "connections": []}]
+            counter = 1
+            while counter < counter_target - 1:
+                graph.append(
+                    {
+                        "counter": counter,
+                        "node_type": "circular_buffer_allocate",
+                        "params": {
+                            "size": "1",
+                            "address": "0",
+                            "core_range_set": "",
+                            "globally_allocated": "0",
+                            "device_id": "5",
+                        },
+                        "connections": [],
+                    }
+                )
+                counter += 1
+            graph.append(
+                {
+                    "counter": counter,
+                    "node_type": "function_start",
+                    "params": {"name": "ttnn.add"},
+                    "connections": [counter + 1],
+                    "input_tensors": [],
+                    "arguments": [],
+                }
+            )
+            graph.append(
+                {
+                    "counter": counter + 1,
+                    "node_type": "program_execution",
+                    "params": {
+                        "device_id": 5,
+                        "physical_device_id": physical_device_id,
+                        "sub_device_manager_id": 7,
+                        "sub_device_id": 1,
+                        "worker_core_ranges": "[]",
+                        "runtime_id": 3,
+                        "global_call_count": (3 << 10) | physical_device_id,
+                        "command_queue_id": 0,
+                    },
+                    "connections": [],
+                }
+            )
+            assert counter + 1 == counter_target
+            graph.append(
+                {
+                    "counter": counter + 2,
+                    "node_type": "function_end",
+                    "params": {"name": "ttnn.add"},
+                    "connections": [],
+                    "duration_ns": 1000,
+                }
+            )
+            graph.append({"counter": counter + 3, "node_type": "capture_end", "params": {}, "connections": []})
+            return graph
+
+        report_dir = tmp_path / "reports_in"
+        report_dir.mkdir()
+        for filename, counter_target, physical_device_id in (
+            ("a.json", stride + 2, 17),
+            ("b.json", 2, 18),
+        ):
+            report = _make_report(
+                graph_with_execution_at(counter_target, physical_device_id), devices=[{"device_id": 5}]
+            )
+            with open(report_dir / filename, "w") as f:
+                json.dump(report, f)
+
+        conn = sqlite3.connect(graph_report.import_report(report_dir, tmp_path / "output"))
+        try:
+            rows = conn.execute(
+                "SELECT execution_id, physical_device_id FROM operation_executions ORDER BY execution_id"
+            ).fetchall()
+            assert len(rows) == 2, f"an execution was dropped by an execution_id collision: {rows}"
+            assert len({execution_id for execution_id, _ in rows}) == 2, rows
+            assert {physical_device_id for _, physical_device_id in rows} == {17, 18}, rows
+        finally:
+            conn.close()
+
+    def test_execution_index_overflow_drops_remainder_with_warning(self, tmp_path):
+        """One operation with more executions than the stride allows keeps exactly a stride of them.
+
+        execution_id is operation_id * stride + index, so the index must stay below the stride or
+        the next operation's ids would be reused. The importer drops the remainder instead; this
+        pins that boundary, which the stride-collision test above does not reach.
+        """
+        stride = graph_report._EXECUTION_ID_STRIDE_PER_OPERATION
+        overflow = 5
+
+        graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn.add"},
+                "connections": [],
+                "input_tensors": [],
+                "arguments": [],
+            },
+        ]
+        for index in range(stride + overflow):
+            graph.append(
+                {
+                    "counter": 2 + index,
+                    "node_type": "program_execution",
+                    "params": {
+                        "device_id": 5,
+                        "physical_device_id": index,
+                        "sub_device_manager_id": 7,
+                        "sub_device_id": 0,
+                        "worker_core_ranges": "[]",
+                        "runtime_id": 3,
+                        "global_call_count": (3 << 10) | index,
+                        "command_queue_id": 0,
+                    },
+                    "connections": [],
+                }
+            )
+        graph.append(
+            {
+                "counter": 2 + stride + overflow,
+                "node_type": "function_end",
+                "params": {"name": "ttnn.add"},
+                "connections": [],
+                "duration_ns": 1000,
+            }
+        )
+        graph.append({"counter": 3 + stride + overflow, "node_type": "capture_end", "params": {}, "connections": []})
+
+        # graph_report logs through loguru, which does not propagate to pytest's caplog.
+        messages = []
+        sink_id = loguru_logger.add(messages.append, level="WARNING")
+        try:
+            conn, cursor = _import_to_db(_make_report(graph, devices=[{"device_id": 5}]), tmp_path)
+        finally:
+            loguru_logger.remove(sink_id)
+
+        try:
+            rows = cursor.execute(
+                "SELECT execution_id, operation_id FROM operation_executions ORDER BY execution_id"
+            ).fetchall()
+            assert len(rows) == stride, f"expected the remainder to be dropped, kept {len(rows)}"
+            operation_id = rows[0][1]
+            # The kept ids fill the operation's band exactly and stop short of the next one's.
+            assert [execution_id for execution_id, _ in rows] == [
+                operation_id * stride + index for index in range(stride)
+            ]
+            assert cursor.execute("SELECT COUNT(*) FROM execution_sub_devices").fetchone()[0] == stride
+        finally:
+            conn.close()
+
+        assert any(
+            f"has more than {stride} program executions" in message for message in messages
+        ), f"the drop must be logged, got: {messages}"
+
+    def test_old_report_without_execution_nodes_creates_empty_compatible_tables(self, tmp_path):
+        report = _make_report([{"counter": 0, "node_type": "capture_start", "params": {}, "connections": []}])
+        conn, cursor = _import_to_db(report, tmp_path)
+        try:
+            for table in (
+                "sub_device_managers",
+                "sub_devices",
+                "operation_executions",
+                "execution_sub_devices",
+            ):
+                assert cursor.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+            assert cursor.execute("SELECT value FROM report_metadata WHERE key = 'schema_version'").fetchone() == (
+                graph_report.DATABASE_SCHEMA_VERSION,
+            )
+        finally:
+            conn.close()
+
+
+class TestImportReportMultiFileOperationIds:
+    """import_report over multiple JSON files: UNIQUE(operation_id, rank) and per-rank file stride."""
+
+    def _import_report_dir(self, reports, tmp_path):
+        """Write JSON reports into a directory and run import_report on that directory."""
+        report_dir = tmp_path / "reports_in"
+        _write_reports(report_dir, reports)
+        db_path = graph_report.import_report(report_dir, tmp_path / "output")
+        conn = sqlite3.connect(db_path)
+        return conn, conn.cursor()
+
+    def test_same_numeric_operation_id_for_different_ranks(self, tmp_path):
+        """Two captures with different ranks may both assign operation_id 1 (disambiguated by rank)."""
+        r0 = _make_report(_minimal_single_op_graph(), metadata={"rank": 0})
+        r1 = _make_report(_minimal_single_op_graph(), metadata={"rank": 1})
+        conn, cursor = self._import_report_dir([("first.json", r0), ("second.json", r1)], tmp_path)
+        cursor.execute("SELECT operation_id, rank FROM operations ORDER BY rank, operation_id")
+        assert cursor.fetchall() == [(1, 0), (1, 1)]
+        conn.close()
+
+    def test_second_json_same_rank_shifts_operation_ids(self, tmp_path):
+        """Two JSON files for the same rank: second file uses base_operation_id = stride (10000)."""
+        r_a = _make_report(_minimal_single_op_graph("ttnn.op_a"), metadata={"rank": 0})
+        r_b = _make_report(_minimal_single_op_graph("ttnn.op_b"), metadata={"rank": 0})
+        conn, cursor = self._import_report_dir([("a.json", r_a), ("b.json", r_b)], tmp_path)
+        stride = graph_report._OPERATION_ID_STRIDE_PER_RANK_FILE
+        cursor.execute("SELECT operation_id, rank FROM operations ORDER BY operation_id")
+        rows = cursor.fetchall()
+        assert rows == [(1, 0), (stride + 1, 0)]
+        conn.close()
+
+    def test_mixed_multiple_files_per_rank_and_separate_ranks(self, tmp_path):
+        """Rank 0: two files (ids 1 and 10001); rank 1: one file (id 1 again)."""
+        r0a = _make_report(_minimal_single_op_graph("ttnn.r0a"), metadata={"rank": 0})
+        r0b = _make_report(_minimal_single_op_graph("ttnn.r0b"), metadata={"rank": 0})
+        r1 = _make_report(_minimal_single_op_graph("ttnn.r1"), metadata={"rank": 1})
+        conn, cursor = self._import_report_dir([("a.json", r0a), ("b.json", r0b), ("c.json", r1)], tmp_path)
+        stride = graph_report._OPERATION_ID_STRIDE_PER_RANK_FILE
+        cursor.execute("SELECT operation_id, rank FROM operations ORDER BY rank, operation_id")
+        assert cursor.fetchall() == [(1, 0), (stride + 1, 0), (1, 1)]
+
+
+def _rank_capture(rank, world_size, filename=None):
+    """(filename, report) for 0-based ``rank`` of ``world_size``, named as the pytest fixture names it by default."""
+    report = _make_report(_minimal_single_op_graph(), metadata={"rank": rank, "world_size": world_size})
+    return filename or graph_report._rank_capture_name(rank, world_size), report
+
+
+class TestImportReportRankCompleteness:
+    """import_report over graph_capture_<r>_of_<N>.json: every rank of one run, each exactly once.
+
+    Ranks here are 0-based distributed ranks, as in the capture metadata; file names number them from 1.
+    """
+
+    def test_all_ranks_present_imports_every_rank(self, tmp_path):
+        """With the python_io sidecars real runs write beside each capture, which must not count as captures."""
+        report_dir = tmp_path / "reports_in"
+        _write_reports(
+            report_dir,
+            [
+                _rank_capture(0, 2),
+                _rank_capture(1, 2),
+                ("graph_capture_1_of_2.python_io.json", []),
+                ("graph_capture_2_of_2.python_io.json", []),
+            ],
+        )
+        db_path = graph_report.import_report(report_dir, tmp_path / "output")
+        assert _query_db(db_path, "SELECT DISTINCT rank FROM operations ORDER BY rank") == [(0,), (1,)]
+
+    def test_missing_rank_raises_and_names_missing_file(self, tmp_path, expect_error):
+        """Ranks 1 and 3 aren't visible, as when their report directory is local to another host."""
+        report_dir = tmp_path / "reports_in"
+        _write_reports(report_dir, [_rank_capture(0, 4), _rank_capture(2, 4)])
+        with expect_error(ValueError, r"2 of 4 ranks are missing") as excinfo:
+            graph_report.import_report(report_dir, tmp_path / "output")
+        assert "graph_capture_2_of_4.json, graph_capture_4_of_4.json" in str(excinfo.value)
+        assert not (tmp_path / "output" / "db.sqlite").exists()
+
+    def test_missing_rank_leaves_an_existing_db_untouched(self, tmp_path, expect_error):
+        """A failed import must not pass off an earlier run's DB as its own, nor change it."""
+        report_dir = tmp_path / "reports_in"
+        _write_reports(report_dir, [_rank_capture(0, 2), _rank_capture(1, 2)])
+        db_path = graph_report.import_report(report_dir, tmp_path / "output")
+        before = db_path.read_bytes()
+        (report_dir / "graph_capture_2_of_2.json").unlink()
+        with expect_error(ValueError, r"1 of 2 ranks are missing") as excinfo:
+            graph_report.import_report(report_dir, tmp_path / "output")
+        assert f"{db_path} was not updated" in str(excinfo.value)
+        assert db_path.read_bytes() == before
+
+    @pytest.mark.parametrize("unlisted", [0, 1, 2])
+    def test_missing_ranks_listed_are_capped(self, tmp_path, expect_error, unlisted):
+        """Missing names are listed up to the cap and counted past it, so a bogus world size in a file name can't
+        build a huge message."""
+        listed = graph_report._MAX_MISSING_CAPTURES_LISTED
+        world_size = 1 + listed + unlisted
+        report_dir = tmp_path / "reports_in"
+        _write_reports(report_dir, [_rank_capture(0, world_size)])
+        with expect_error(ValueError, rf"{listed + unlisted} of {world_size} ranks are missing") as excinfo:
+            graph_report.import_report(report_dir, tmp_path / "output")
+        message = str(excinfo.value)
+        assert message.count(f"_of_{world_size}.json") == listed
+        assert (f"and {unlisted} more" in message) == (unlisted > 0)
+
+    def test_mixed_world_sizes_raises(self, tmp_path, expect_error):
+        """A stale capture from an earlier run with a different world size is left in the directory."""
+        report_dir = tmp_path / "reports_in"
+        _write_reports(report_dir, [_rank_capture(0, 2), _rank_capture(1, 2), _rank_capture(0, 4)])
+        with expect_error(ValueError, r"different world sizes \[2, 4\]"):
+            graph_report.import_report(report_dir, tmp_path / "output")
+
+    @pytest.mark.parametrize("stray_name", ["graph_capture_3_of_2.json", "graph_capture_0_of_2.json"])
+    def test_rank_outside_the_run_raises(self, tmp_path, expect_error, stray_name):
+        report_dir = tmp_path / "reports_in"
+        _write_reports(report_dir, [_rank_capture(0, 2), _rank_capture(1, 2), _rank_capture(1, 2, stray_name)])
+        with expect_error(ValueError, rf"ranks outside 1\.\.2: {stray_name}"):
+            graph_report.import_report(report_dir, tmp_path / "output")
+
+    def test_rank_named_twice_raises(self, tmp_path, expect_error):
+        """graph_capture_01_of_2 and graph_capture_1_of_2 both name rank 0, which would otherwise import it twice."""
+        report_dir = tmp_path / "reports_in"
+        _write_reports(
+            report_dir,
+            [_rank_capture(0, 2), _rank_capture(0, 2, "graph_capture_01_of_2.json"), _rank_capture(1, 2)],
+        )
+        with expect_error(
+            ValueError, r"same rank more than once: graph_capture_01_of_2\.json and graph_capture_1_of_2\.json"
+        ):
+            graph_report.import_report(report_dir, tmp_path / "output")
+
+    @pytest.mark.parametrize(
+        "metadata_rank, metadata_world_size",
+        [(0, 2), (1, 4)],
+        ids=["rank_disagrees", "world_size_disagrees"],
+    )
+    def test_metadata_disagreeing_with_file_name_raises(
+        self, tmp_path, expect_error, metadata_rank, metadata_world_size
+    ):
+        """A capture copied or renamed into another rank's file name would otherwise be merged as that rank."""
+        report_dir = tmp_path / "reports_in"
+        copied = _make_report(
+            _minimal_single_op_graph(), metadata={"rank": metadata_rank, "world_size": metadata_world_size}
+        )
+        _write_reports(report_dir, [_rank_capture(0, 2), ("graph_capture_2_of_2.json", copied)])
+        expected_name = f"graph_capture_{metadata_rank + 1}_of_{metadata_world_size}\\.json"
+        with expect_error(
+            ValueError,
+            rf"graph_capture_2_of_2\.json holds the capture of {expected_name} according to its metadata "
+            rf"\(rank {metadata_rank} of world size {metadata_world_size}\)",
+        ):
+            graph_report.import_report(report_dir, tmp_path / "output")
+        assert not (tmp_path / "output" / "db.sqlite").exists()
+
+    def test_failure_during_the_import_leaves_an_existing_db_unchanged(self, tmp_path, expect_error):
+        """The mismatch is found after the import has opened the existing DB and imported the first capture into it;
+        nothing is committed, so the DB is left as it was, and the error says so."""
+        report_dir = tmp_path / "reports_in"
+        _write_reports(report_dir, [_rank_capture(0, 2), _rank_capture(1, 2)])
+        db_path = graph_report.import_report(report_dir, tmp_path / "output")
+        before = db_path.read_bytes()
+        copied = _make_report(_minimal_single_op_graph("ttnn.other"), metadata={"rank": 0, "world_size": 2})
+        _write_reports(report_dir, [("graph_capture_2_of_2.json", copied)])
+        with expect_error(ValueError, "according to its metadata") as excinfo:
+            graph_report.import_report(report_dir, tmp_path / "output")
+        assert f"{db_path} was not updated" in str(excinfo.value)
+        assert db_path.read_bytes() == before
+
+    def test_unsupported_version_of_a_rank_capture_raises(self, tmp_path, expect_error):
+        """Skipping it, as a loose capture is skipped, would leave that rank out of a merge that passed the check."""
+        report_dir = tmp_path / "reports_in"
+        name, report = _rank_capture(1, 2)
+        report["version"] = 99
+        _write_reports(report_dir, [_rank_capture(0, 2), (name, report)])
+        with expect_error(ValueError, r"graph_capture_2_of_2\.json has version 99"):
+            graph_report.import_report(report_dir, tmp_path / "output")
+        assert not (tmp_path / "output" / "db.sqlite").exists()
+
+    def test_rank_captures_are_imported_in_numeric_order(self, tmp_path, monkeypatch):
+        """graph_capture_10_of_10 is imported last, not between _1_ and _2_ as a plain string sort would put it.
+
+        The DB keys every row by rank rather than by import order, so the order is only visible from inside the
+        import loop, here through the per-file _report_rank call.
+        """
+        report_dir = tmp_path / "reports_in"
+        _write_reports(report_dir, [_rank_capture(rank, 10) for rank in range(10)])
+        imported_names = []
+        report_rank = graph_report._report_rank
+
+        def _recording_report_rank(report, path):
+            imported_names.append(path.name)
+            return report_rank(report, path)
+
+        monkeypatch.setattr(graph_report, "_report_rank", _recording_report_rank)
+        graph_report.import_report(report_dir, tmp_path / "output")
+        assert imported_names == [f"graph_capture_{n}_of_10.json" for n in range(1, 11)]
+
+    def test_single_rank_capture_file_imports_alone(self, tmp_path):
+        """Pointing import_report at one rank's file imports just that rank: only a directory is checked for
+        completeness."""
+        report_dir = tmp_path / "reports_in"
+        _write_reports(report_dir, [_rank_capture(0, 4)])
+        db_path = graph_report.import_report(report_dir / "graph_capture_1_of_4.json", tmp_path / "output")
+        assert _query_db(db_path, "SELECT DISTINCT rank FROM operations") == [(0,)]
+
+    def test_files_without_rank_suffix_are_not_checked(self, tmp_path):
+        """Loose *.json captures carry no world size, so there is nothing to check them against."""
+        report_dir = tmp_path / "reports_in"
+        _write_reports(
+            report_dir, [("graph_capture.json", _make_report(_minimal_single_op_graph(), metadata={"rank": 3}))]
+        )
+        db_path = graph_report.import_report(report_dir, tmp_path / "output")
+        assert _query_db(db_path, "SELECT DISTINCT rank FROM operations") == [(3,)]
+
+
+class TestGraphReportFixtureMultiRankTeardown:
+    """Teardown of the graph report pytest fixture on a two-rank run, with ttnn's capture and distributed calls
+    replaced by recorders. Every rank must reach both barriers, even when rank 0's import raises."""
+
+    @staticmethod
+    def _stub_ttnn(monkeypatch, tmp_path, rank, world_size, distributed=True):
+        calls = []
+        capture_active = [False]
+
+        def begin_graph_capture(run_mode):
+            capture_active[0] = True
+
+        def end_graph_capture_to_file(path):
+            capture_active[0] = False
+            calls.append(("end", Path(path).name))
+            Path(path).write_text("{}")
+
+        config = SimpleNamespace(
+            enable_graph_report=True,
+            enable_comparison_mode=False,
+            enable_detailed_buffer_report=True,
+            report_path=str(tmp_path / "report"),
+        )
+        monkeypatch.setattr(ttnn, "CONFIG", config)
+        monkeypatch.setattr(ttnn.graph, "is_graph_capture_active", lambda: capture_active[0])
+        monkeypatch.setattr(ttnn.graph, "begin_graph_capture", begin_graph_capture)
+        monkeypatch.setattr(ttnn.graph, "end_graph_capture_to_file", end_graph_capture_to_file)
+        monkeypatch.setattr(ttnn.graph, "enable_detailed_buffer_tracing", lambda: calls.append("enable_tracing"))
+        monkeypatch.setattr(ttnn.graph, "disable_detailed_buffer_tracing", lambda: calls.append("disable_tracing"))
+        monkeypatch.setattr(ttnn, "distributed_context_is_initialized", lambda: distributed)
+        monkeypatch.setattr(ttnn, "distributed_context_get_rank", lambda: rank)
+        monkeypatch.setattr(ttnn, "distributed_context_get_size", lambda: world_size)
+        monkeypatch.setattr(ttnn, "distributed_context_barrier", lambda: calls.append("barrier"))
+        monkeypatch.setattr(ttnn, "save_config_to_json_file", lambda path: calls.append(("config", Path(path).name)))
+        return calls
+
+    @staticmethod
+    def _run_fixture():
+        """Run the fixture's setup, then its teardown, with no test body in between."""
+        request = SimpleNamespace(fixturenames=[], getfixturevalue=lambda name: None)
+        fixture = graph_report._run_pytest_graph_report_fixture(request)
+        next(fixture)
+        next(fixture, None)
+
+    def test_rank_0_import_error_still_releases_the_other_ranks(self, monkeypatch, tmp_path, expect_error):
+        calls = self._stub_ttnn(monkeypatch, tmp_path, rank=0, world_size=2)
+
+        def failing_import_report(report_path, output_dir):
+            calls.append("import")
+            raise ValueError("Graph capture files for 1 of 2 ranks are missing")
+
+        monkeypatch.setattr(graph_report, "import_report", failing_import_report)
+        with expect_error(ValueError, "1 of 2 ranks are missing"):
+            self._run_fixture()
+        assert calls == [
+            "enable_tracing",
+            ("end", "graph_capture_1_of_2.json"),
+            "barrier",
+            "import",
+            "barrier",
+            "disable_tracing",
+            ("config", "config_1_of_2.json"),
+        ]
+        # Left for diagnosing the failed import.
+        assert (tmp_path / "report" / "graph_capture_1_of_2.json").exists()
+
+    def test_rank_0_imports_then_removes_the_captures(self, monkeypatch, tmp_path):
+        calls = self._stub_ttnn(monkeypatch, tmp_path, rank=0, world_size=2)
+        (tmp_path / "report").mkdir()
+        (tmp_path / "report" / "graph_capture_2_of_2.json").write_text("{}")
+        monkeypatch.setattr(graph_report, "import_report", lambda report_path, output_dir: calls.append("import"))
+        self._run_fixture()
+        assert calls == [
+            "enable_tracing",
+            ("end", "graph_capture_1_of_2.json"),
+            "barrier",
+            "import",
+            "barrier",
+            "disable_tracing",
+            ("config", "config_1_of_2.json"),
+        ]
+        assert not list((tmp_path / "report").glob("graph_capture_*_of_*.json"))
+
+    def test_single_process_needs_no_barriers(self, monkeypatch, tmp_path, expect_error):
+        calls = self._stub_ttnn(monkeypatch, tmp_path, rank=0, world_size=1, distributed=False)
+
+        def failing_import_report(report_path, output_dir):
+            calls.append("import")
+            raise ValueError("import failed")
+
+        monkeypatch.setattr(graph_report, "import_report", failing_import_report)
+        with expect_error(ValueError, "import failed"):
+            self._run_fixture()
+        assert calls == [
+            "enable_tracing",
+            ("end", "graph_capture.json"),
+            "import",
+            "disable_tracing",
+            ("config", "config.json"),
+        ]
+
+    def test_other_ranks_skip_the_import_and_reach_both_barriers(self, monkeypatch, tmp_path):
+        calls = self._stub_ttnn(monkeypatch, tmp_path, rank=1, world_size=2)
+        monkeypatch.setattr(graph_report, "import_report", lambda report_path, output_dir: calls.append("import"))
+        self._run_fixture()
+        assert calls == [
+            "enable_tracing",
+            ("end", "graph_capture_2_of_2.json"),
+            "barrier",
+            "barrier",
+            "disable_tracing",
+            ("config", "config_2_of_2.json"),
+        ]
+
+
+class TestDeallocateTensorLookup:
+    """A top-level buffer_deallocate becomes a ttnn::deallocate operation whose input is the tensor living at the freed
+    address when it is freed; one inside an operation lifts that tensor into the operation's inputs."""
+
+    L1 = 1
+    DRAM = 0
+
+    @staticmethod
+    def _graph(events):
+        """Graph of these events, in order (a buffer_type or device_id of None is left out of the node, as older
+        captures did):
+        - ("tensor", tensor_id, address, buffer_type[, device_id])
+        - ("dealloc", address, buffer_type[, device_id])
+        - ("alloc", address, buffer_type, device_id): a buffer_allocate
+        - ("dealloc_of_last_alloc",): a buffer_deallocate with no params, connected to the latest buffer_allocate
+        - ("start", name) / ("end", name): a function_start / function_end with no input tensors
+        """
+        nodes = []
+        last_alloc = None
+        for i, event in enumerate(events, start=1):
+            kind, *fields = event
+            node = {"counter": i, "params": {}, "connections": []}
+            if kind in ("start", "end"):
+                node["node_type"] = "function_start" if kind == "start" else "function_end"
+                node["params"] = {"name": fields[0]}
+                if kind == "start":
+                    node["input_tensors"] = []
+            elif kind == "dealloc_of_last_alloc":
+                node["node_type"] = "buffer_deallocate"
+                node["connections"] = [last_alloc]
+            else:
+                if kind == "tensor":
+                    tensor_id, address, buffer_type, *device = fields
+                    node["params"] = {"tensor_id": str(tensor_id), "address": str(address), "storage_type": "DEVICE"}
+                else:
+                    address, buffer_type, *device = fields
+                    node["params"] = {"address": str(address)}
+                    if kind == "alloc":
+                        node["params"].update({"size": "2048", "page_size": "2048"})
+                        last_alloc = i
+                node["node_type"] = {
+                    "tensor": "tensor",
+                    "dealloc": "buffer_deallocate",
+                    "alloc": "buffer_allocate",
+                }[kind]
+                if buffer_type is not None:
+                    node["params"]["buffer_type"] = str(buffer_type)
+                if device and device[0] is not None:
+                    node["params"]["device_id"] = str(device[0])
+            nodes.append(node)
+        end = len(events) + 1
+        return [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1, end]},
+            *nodes,
+            {"counter": end, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+    @classmethod
+    def _operation_inputs(cls, events, tmp_path):
+        """(name, input tensor) for each operation, in operation order; None for one with no input."""
+        conn, cursor = _import_to_db(_make_report(cls._graph(events)), tmp_path)
+        try:
+            cursor.execute(
+                """SELECT o.name, it.tensor_id FROM operations o
+                   LEFT JOIN input_tensors it ON it.operation_id = o.operation_id AND it.rank = o.rank
+                   ORDER BY o.operation_id"""
+            )
+            return cursor.fetchall()
+        finally:
+            conn.close()
+
+    @classmethod
+    def _deallocated_tensor_ids(cls, events, tmp_path):
+        """The input tensor of each ttnn::deallocate operation, in operation order (None for one with no input)."""
+        return [tensor_id for name, tensor_id in cls._operation_inputs(events, tmp_path) if name == "ttnn::deallocate"]
+
+    def test_reused_address_is_credited_to_the_tensor_living_there(self, tmp_path):
+        """Tensor 2 reuses tensor 1's freed address; freeing it again must not be credited to tensor 1."""
+        events = [
+            ("tensor", 1, 4096, self.L1),
+            ("dealloc", 4096, self.L1),
+            ("tensor", 2, 4096, self.L1),
+            ("dealloc", 4096, self.L1),
+        ]
+        assert self._deallocated_tensor_ids(events, tmp_path) == [1, 2]
+
+    def test_dram_and_l1_tensors_at_the_same_address_are_told_apart(self, tmp_path):
+        events = [
+            ("tensor", 1, 8192, self.L1),
+            ("tensor", 2, 8192, self.DRAM),
+            ("dealloc", 8192, self.L1),
+            ("dealloc", 8192, self.DRAM),
+        ]
+        assert self._deallocated_tensor_ids(events, tmp_path) == [1, 2]
+
+    def test_deallocate_without_buffer_type_takes_the_latest_tensor_at_the_address(self, tmp_path):
+        events = [
+            ("tensor", 1, 4096, self.L1),
+            ("dealloc", 4096, self.L1),
+            ("tensor", 2, 4096, self.L1),
+            ("dealloc", 4096, None),
+        ]
+        assert self._deallocated_tensor_ids(events, tmp_path) == [1, 2]
+
+    def test_tensor_without_buffer_type_still_matches_a_typed_deallocate(self, tmp_path):
+        """Captures that predate the tensor's buffer_type still credit the deallocation."""
+        events = [("tensor", 1, 4096, None), ("dealloc", 4096, self.L1)]
+        assert self._deallocated_tensor_ids(events, tmp_path) == [1]
+
+    def test_freed_tensor_is_not_credited_with_a_later_free_at_its_address(self, tmp_path):
+        """A scratch buffer that reuses tensor 1's freed address is freed in turn: tensor 1 is already gone."""
+        events = [("tensor", 1, 4096, self.L1), ("dealloc", 4096, self.L1), ("dealloc", 4096, self.L1)]
+        assert self._deallocated_tensor_ids(events, tmp_path) == [1, None]
+
+    def test_same_address_on_two_devices_is_credited_per_device(self, tmp_path):
+        events = [
+            ("tensor", 1, 4096, self.L1, 0),
+            ("tensor", 2, 4096, self.L1, 1),
+            ("dealloc", 4096, self.L1, 1),
+            ("dealloc", 4096, self.L1, 0),
+        ]
+        assert self._deallocated_tensor_ids(events, tmp_path) == [2, 1]
+
+    def test_address_with_no_tensor_has_no_input(self, tmp_path):
+        """A scratch buffer that no tensor node ever named: the operation is kept, with no input tensor."""
+        events = [("tensor", 1, 4096, self.L1), ("dealloc", 12288, self.L1)]
+        assert self._deallocated_tensor_ids(events, tmp_path) == [None]
+
+    def test_tensor_seen_at_a_live_slot_takes_over_the_deallocation(self, tmp_path):
+        """Tensor 2 shows up at tensor 1's address before any free there (a view, or a free the capture missed): the
+        free goes to tensor 2, the one living there now."""
+        events = [("tensor", 1, 4096, self.L1), ("tensor", 2, 4096, self.L1), ("dealloc", 4096, self.L1)]
+        assert self._deallocated_tensor_ids(events, tmp_path) == [2]
+
+    def test_typed_deallocate_does_not_credit_a_tensor_of_another_type(self, tmp_path):
+        events = [("tensor", 1, 4096, self.DRAM), ("dealloc", 4096, self.L1)]
+        assert self._deallocated_tensor_ids(events, tmp_path) == [None]
+
+    def test_deallocate_on_an_unknown_device_credits_no_tensor(self, tmp_path):
+        """Tensor and free nodes both carry device_id in captures that carry address; a free without one names no
+        device, so it is not matched to a tensor recorded on one."""
+        events = [("tensor", 1, 4096, self.L1, 0), ("dealloc", 4096, self.L1)]
+        assert self._deallocated_tensor_ids(events, tmp_path) == [None]
+
+    def test_deallocate_without_address_uses_its_allocation(self, tmp_path):
+        """A free with no params of its own takes address, buffer type and device from the buffer_allocate it is
+        connected to."""
+        events = [
+            ("tensor", 1, 8192, self.L1, 0),
+            ("tensor", 2, 8192, self.DRAM, 0),
+            ("alloc", 8192, self.DRAM, 0),
+            ("dealloc_of_last_alloc",),
+        ]
+        assert self._deallocated_tensor_ids(events, tmp_path) == [2]
+
+    def test_free_inside_an_operation_is_lifted_into_its_inputs(self, tmp_path):
+        """A free inside a function_start/function_end pair (Python-level ttnn.deallocate) takes the tensor living at
+        the address, as a top-level free does, and the operation gets it as its input; a later top-level free at the
+        same address finds nothing left there."""
+        events = [
+            ("tensor", 1, 4096, self.L1),
+            ("dealloc", 4096, self.L1),
+            ("tensor", 2, 4096, self.L1),
+            ("start", "ttnn.deallocate"),
+            ("dealloc", 4096, self.L1),
+            ("end", "ttnn.deallocate"),
+            ("dealloc", 4096, self.L1),
+        ]
+        assert self._operation_inputs(events, tmp_path) == [
+            ("ttnn::deallocate", 1),
+            ("ttnn.deallocate", 2),
+            ("ttnn::deallocate", None),
+        ]
+
+    def test_reused_address_gives_each_tensor_its_own_deallocate_operation(self):
+        """What the visualizer shows: each tensor's lifetime ends at the free of its own buffer."""
+        events = [
+            ("tensor", 1, 4096, self.L1),
+            ("dealloc", 4096, self.L1),
+            ("tensor", 2, 4096, self.L1),
+            ("dealloc", 4096, self.L1),
+        ]
+        conn = sqlite3.connect(":memory:")
+        try:
+            cursor = conn.cursor()
+            graph_report.create_database_schema(cursor)
+            graph_report.import_graph(cursor, self._graph(events), record_tensor_lifetime=True)
+            lifetimes = cursor.execute(
+                "SELECT tensor_id, deallocate_operation_id FROM tensor_lifetime ORDER BY tensor_id"
+            ).fetchall()
+            deallocations = [
+                operation_id
+                for (operation_id,) in cursor.execute(
+                    "SELECT operation_id FROM operations WHERE name = 'ttnn::deallocate' ORDER BY operation_id"
+                )
+            ]
+        finally:
+            conn.close()
+        assert lifetimes == [(1, deallocations[0]), (2, deallocations[1])]
+
+    def test_free_keeps_live_buffers_of_another_type_or_device_in_the_snapshot(self, tmp_path):
+        """The per-operation buffer snapshot drops only the freed buffer, not every buffer at its address."""
+        events = [
+            ("alloc", 4096, self.L1, 0),
+            ("alloc", 4096, self.DRAM, 0),
+            ("alloc", 4096, self.L1, 1),
+            ("dealloc", 4096, self.L1, 0),
+        ]
+        conn, cursor = _import_to_db(_make_report(self._graph(events)), tmp_path)
+        try:
+            live = cursor.execute(
+                "SELECT device_id, buffer_type FROM buffers WHERE operation_id = "
+                "(SELECT MAX(operation_id) FROM operations) ORDER BY device_id, buffer_type"
+            ).fetchall()
+        finally:
+            conn.close()
+        assert live == [(0, self.DRAM), (1, self.L1)]
+
+
+@pytest.fixture
+def single_relu_python_io():
+    """python_io sidecar for single_relu_mock_graph with a minimal stack trace.
+
+    The stack trace makes import_report treat this as a detailed-tensor-report capture,
+    so the tensor_lifetime table is populated (gated on has_stack_traces in import_report).
+    """
+    return [
+        {
+            "name": "ttnn::relu",
+            "arguments": {},
+            "input_tensor_ids": [42],
+            "output_tensor_ids": [101],
+            "python_stack_trace": ['  File "model.py", line 10, in forward\n    out = ttnn.relu(x)\n'],
+        }
+    ]
+
+
+@pytest.fixture
+def single_relu_mock_graph():
+    """Minimal graph: one ttnn::relu consuming tensor 42 and producing tensor 101.
+
+    Shared across TestTensorLifetime cases that only need a single-producer /
+    single-consumer trace to validate schema-level wiring.
+    """
+    return [
+        {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1, 5]},
+        {
+            "counter": 1,
+            "node_type": "tensor",
+            "params": {"tensor_id": "42", "shape": "[1,1,32,32]"},
+            "connections": [],
+        },
+        {
+            "counter": 2,
+            "node_type": "function_start",
+            "params": {"name": "ttnn::relu", "inputs": "1"},
+            "connections": [],
+            "input_tensors": [1],
+        },
+        {
+            "counter": 3,
+            "node_type": "tensor",
+            "params": {"tensor_id": "101", "shape": "[1,1,32,32]"},
+            "connections": [],
+        },
+        {
+            "counter": 4,
+            "node_type": "function_end",
+            "params": {"name": "ttnn::relu"},
+            "connections": [3],
+            "duration_ns": 1000,
+        },
+        {"counter": 5, "node_type": "capture_end", "params": {}, "connections": []},
+    ]
+
+
+class TestInnermostStackFrame:
+    """Unit tests for graph_report._innermost_stack_frame."""
+
+    def test_none_input_returns_none_pair(self):
+        assert graph_report._innermost_stack_frame(None) == (None, None)
+
+    def test_empty_string_returns_none_pair(self):
+        assert graph_report._innermost_stack_frame("") == (None, None)
+
+    def test_malformed_text_with_no_file_line_returns_none_pair(self):
+        assert graph_report._innermost_stack_frame("Traceback (most recent call last):\n  random text\n") == (
+            None,
+            None,
+        )
+
+    def test_single_frame(self):
+        trace = '  File "/path/to/model.py", line 42, in forward\n    out = self.layer(x)\n'
+        fname, lineno = graph_report._innermost_stack_frame(trace)
+        assert fname == "/path/to/model.py"
+        assert lineno == 42
+
+    def test_multiple_frames_returns_first_innermost(self):
+        # _capture_python_stack_trace orders frames innermost-first.
+        # The first File/line entry should be the callsite nearest the op.
+        trace = (
+            '  File "/inner/op.py", line 5, in run\n'
+            "    result = ttnn.relu(x)\n"
+            '  File "/middle/wrapper.py", line 20, in call\n'
+            "    return self.op(x)\n"
+            '  File "/outer/demo.py", line 99, in main\n'
+            "    wrapper(t)\n"
+        )
+        fname, lineno = graph_report._innermost_stack_frame(trace)
+        assert fname == "/inner/op.py"
+        assert lineno == 5
+
+    def test_multiple_frames_does_not_return_outermost(self):
+        # Regression guard: the original bug used matches[-1] (outermost) which
+        # pinned every tensor to the same demo.py entry point.
+        trace = (
+            '  File "/inner/op.py", line 5, in run\n'
+            "    result = ttnn.relu(x)\n"
+            '  File "/outer/demo.py", line 99, in main\n'
+            "    wrapper(t)\n"
+        )
+        fname, lineno = graph_report._innermost_stack_frame(trace)
+        assert fname != "/outer/demo.py"
+        assert lineno != 99
+
+    def test_line_number_parsed_as_int(self):
+        trace = '  File "model.py", line 123, in forward\n'
+        _, lineno = graph_report._innermost_stack_frame(trace)
+        assert isinstance(lineno, int)
+        assert lineno == 123
+
+
+class TestTensorLifetime:
+    """Tensor lifetime metadata for late-deallocation analysis (tt-metal#27868)."""
+
+    def test_compute_tensor_lifetime_records_smoke(self):
+        operations = [(1, "ttnn::relu", 0.0), (2, "ttnn::add", 0.0), (3, "ttnn::deallocate", 0.0)]
+        input_tensors = [(1, 0, 42), (2, 0, 101), (3, 0, 101)]
+        output_tensors = [(1, 0, 101)]
+        stack_traces = [
+            (
+                1,
+                '  File "producer_ctx.py", line 10, in forward\n    x\n  File "producer.py", line 2, in run\n',
+            ),
+            (
+                2,
+                '  File "consumer_ctx.py", line 3, in wrap\n    z\n  File "consumer.py", line 99, in step\n',
+            ),
+        ]
+        kept = {42, 101}
+        recs = graph_report.compute_tensor_lifetime_records(
+            operations, input_tensors, output_tensors, stack_traces, kept
+        )
+        by_id = {r["tensor_id"]: r for r in recs}
+        assert by_id[42]["producer_operation_id"] is None
+        assert by_id[42]["last_use_operation_id"] == 1
+        assert by_id[42]["last_use_source_file"] == "producer_ctx.py"
+        assert by_id[42]["last_use_source_line"] == 10
+        assert by_id[101]["producer_operation_id"] == 1
+        assert by_id[101]["last_use_operation_id"] == 2
+        assert by_id[101]["deallocate_operation_id"] == 3
+        assert by_id[101]["producer_source_file"] == "producer_ctx.py"
+        assert by_id[101]["producer_source_line"] == 10
+        assert by_id[101]["last_use_source_file"] == "consumer_ctx.py"
+        assert by_id[101]["last_use_source_line"] == 3
+
+    @pytest.mark.parametrize(
+        "op_name",
+        [
+            "ttnn.deallocate",  # Python-registered (dot separator)
+            "ttnn::deallocate",  # synthesized by importer for bare buffer_deallocate nodes
+            "Tensor::deallocate",  # C++ GraphTracker in tensor.cpp
+        ],
+    )
+    def test_deallocate_operation_id_matched_for_all_known_names(self, op_name):
+        """All three known dealloc op names must be recognised."""
+        operations = [(10, op_name, 0.0)]
+        input_tensors = [(10, 0, 999)]
+        output_tensors = []
+        stack_traces = []
+        recs = graph_report.compute_tensor_lifetime_records(
+            operations, input_tensors, output_tensors, stack_traces, {999}
+        )
+        assert len(recs) == 1
+        assert recs[0]["deallocate_operation_id"] == 10, f"{op_name!r} not treated as deallocate"
+
+    @pytest.mark.parametrize(
+        "op_name",
+        [
+            "ComplexTensor::deallocate",  # lookalike — not a tensor-dealloc op
+            "MeshTensor::deallocate",
+            "ttnn::partial_deallocate",
+            "ttnn.some_deallocate",
+            "buffer_deallocate",  # graph node type, not an op name
+        ],
+    )
+    def test_deallocate_operation_id_not_matched_for_lookalikes(self, op_name):
+        """Suffix-matching lookalikes must NOT be treated as dealloc ops."""
+        operations = [(10, op_name, 0.0)]
+        input_tensors = [(10, 0, 999)]
+        output_tensors = []
+        stack_traces = []
+        recs = graph_report.compute_tensor_lifetime_records(
+            operations, input_tensors, output_tensors, stack_traces, {999}
+        )
+        assert len(recs) == 1
+        assert recs[0]["deallocate_operation_id"] is None, f"{op_name!r} incorrectly treated as deallocate"
+        # The op should appear as last_use_operation_id since it consumed the tensor as input
+        assert recs[0]["last_use_operation_id"] == 10
+
+    def test_tensor_lifetime_table_populated_on_import(self, tmp_path, single_relu_mock_graph, single_relu_python_io):
+        # python_io with stack traces signals enable_detailed_tensor_report=True to import_report,
+        # which is required for the tensor_lifetime table to be populated.
+        report = _make_report(single_relu_mock_graph, python_io=single_relu_python_io)
+        conn, cursor = _import_to_db(report, tmp_path)
+        cursor.execute(
+            "SELECT tensor_id, producer_operation_id, last_use_operation_id, deallocate_operation_id, rank "
+            "FROM tensor_lifetime ORDER BY tensor_id"
+        )
+        rows = {r[0]: r for r in cursor.fetchall()}
+        assert rows[42][1] is None  # tensor 42 has no producer op in this graph
+        assert rows[42][2] == 1  # tensor 42 is consumed by op 1 (ttnn::relu)
+        assert rows[101][1] == 1  # tensor 101 is produced by op 1
+        assert rows[101][2] is None  # tensor 101 is never consumed — orphan candidate
+        assert all(r[4] == 0 for r in rows.values())
+        conn.close()
+
+    def test_tensor_lifetime_table_empty_without_stack_traces(self, tmp_path, single_relu_mock_graph):
+        """tensor_lifetime must NOT be populated when no stack traces are present.
+
+        enable_detailed_tensor_report=False (the default) means begin_graph_capture does
+        not record stack traces. import_report detects this via has_stack_traces=False and
+        skips record_tensor_lifetime, leaving the table empty.
+        """
+        report = _make_report(single_relu_mock_graph)  # no python_io → no stack traces
+        conn, cursor = _import_to_db(report, tmp_path)
+        cursor.execute("SELECT COUNT(*) FROM tensor_lifetime")
+        assert cursor.fetchone()[0] == 0
+        conn.close()
+
+    def test_tensor_consumers_mirror_input_tensors(self, tmp_path, single_relu_mock_graph):
+        report = _make_report(single_relu_mock_graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+        cursor.execute("SELECT operation_id, input_index, tensor_id, rank FROM input_tensors ORDER BY tensor_id")
+        inp = cursor.fetchall()
+        cursor.execute("SELECT tensor_id, operation_id, input_index, rank FROM tensor_consumers ORDER BY tensor_id")
+        tc = cursor.fetchall()
+        assert len(tc) == len(inp)
+        assert {(r[2], r[0], r[1], r[3]) for r in inp} == {(r[0], r[1], r[2], r[3]) for r in tc}
+        conn.close()
+
+    def test_tensor_producers_mirror_output_tensors(self, tmp_path, single_relu_mock_graph):
+        report = _make_report(single_relu_mock_graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+        cursor.execute("SELECT operation_id, output_index, tensor_id, rank FROM output_tensors ORDER BY tensor_id")
+        out = cursor.fetchall()
+        cursor.execute("SELECT tensor_id, operation_id, output_index, rank FROM tensor_producers ORDER BY tensor_id")
+        tp = cursor.fetchall()
+        assert len(tp) == len(out)
+        assert {(r[2], r[0], r[1], r[3]) for r in out} == {(r[0], r[1], r[2], r[3]) for r in tp}
+        conn.close()
+
+
+class TestImportGraphUnit:
+    """Pure unit tests for import_graph function - no device required."""
+
+    def test_unplaced_program_execution_is_still_recorded(self, tmp_path):
+        """A program_execution with no sub_device_id keeps its row, minus the sub-device link.
+
+        Capture omits sub_device_id when it cannot place a program (an eth-only op, say). Which
+        chip ran the operation is still worth reporting, so the execution must survive import; only
+        the execution_sub_devices link is dropped, so the placement reads as unknown rather than as
+        a spurious sub-device 0.
+        """
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::all_gather", "inputs": "0"},
+                "connections": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "program_execution",
+                "params": {
+                    "device_id": 0,
+                    "physical_device_id": 3,
+                    "sub_device_manager_id": 77,
+                    "runtime_id": 5,
+                    "global_call_count": 5123,
+                    "command_queue_id": 0,
+                },
+                "connections": [],
+            },
+            {
+                "counter": 3,
+                "node_type": "function_end",
+                "params": {"name": "ttnn::all_gather"},
+                "connections": [],
+            },
+            {"counter": 4, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+        conn, cursor = _import_to_db(_make_report(mock_graph, devices=[{"device_id": 0}]), tmp_path)
+
+        cursor.execute("SELECT physical_device_id, global_call_count FROM operation_executions")
+        assert cursor.fetchall() == [(3, 5123)]
+        cursor.execute("SELECT COUNT(*) FROM execution_sub_devices")
+        assert cursor.fetchone()[0] == 0, "an unplaced execution must not claim a sub-device"
+        conn.close()
+
+    def test_placed_and_unplaced_executions_coexist_under_one_operation(self, tmp_path):
+        """Dropping one program's placement must not drop its siblings'."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::add", "inputs": "0"},
+                "connections": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "program_execution",
+                "params": {
+                    "device_id": 0,
+                    "physical_device_id": 0,
+                    "sub_device_manager_id": 77,
+                    "sub_device_id": 1,
+                    "runtime_id": 5,
+                    "global_call_count": 5120,
+                    "command_queue_id": 0,
+                },
+                "connections": [],
+            },
+            {
+                "counter": 3,
+                "node_type": "program_execution",
+                "params": {
+                    "device_id": 0,
+                    "physical_device_id": 1,
+                    "sub_device_manager_id": 77,
+                    "runtime_id": 5,
+                    "global_call_count": 5121,
+                    "command_queue_id": 0,
+                },
+                "connections": [],
+            },
+            {
+                "counter": 4,
+                "node_type": "function_end",
+                "params": {"name": "ttnn::add"},
+                "connections": [],
+            },
+            {"counter": 5, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+        conn, cursor = _import_to_db(_make_report(mock_graph, devices=[{"device_id": 0}]), tmp_path)
+
+        cursor.execute("SELECT physical_device_id FROM operation_executions ORDER BY physical_device_id")
+        assert cursor.fetchall() == [(0,), (1,)]
+        cursor.execute(
+            "SELECT e.physical_device_id, x.sub_device_id FROM operation_executions e "
+            "JOIN execution_sub_devices x ON x.execution_id = e.execution_id AND x.rank = e.rank"
+        )
+        assert cursor.fetchall() == [(0, 1)], "only the placed execution should link to a sub-device"
+        conn.close()
+
+    def test_output_tensors_extracted_from_function_end(self, tmp_path):
+        """Test that output tensors are extracted from function_end connections."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1, 5]},
+            {
+                "counter": 1,
+                "node_type": "tensor",
+                "params": {"tensor_id": "42", "shape": "[1,1,32,32]"},
+                "connections": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::relu", "inputs": "1"},
+                "connections": [],
+                "input_tensors": [1],
+            },
+            {
+                "counter": 3,
+                "node_type": "tensor",
+                "params": {"tensor_id": "101", "shape": "[1,1,32,32]"},
+                "connections": [],
+            },
+            {
+                "counter": 4,
+                "node_type": "function_end",
+                "params": {"name": "ttnn::relu"},
+                "connections": [3],
+                "duration_ns": 1000,
+            },
+            {"counter": 5, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+        report = _make_report(mock_graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT operation_id, output_index, tensor_id FROM output_tensors")
+        output_rows = cursor.fetchall()
+
+        assert len(output_rows) == 1, f"Expected 1 output tensor, got {len(output_rows)}"
+        assert str(output_rows[0][2]) == "101", f"Expected tensor_id '101', got {output_rows[0][2]}"
+
+        # input_tensors[1] points to node counter 1 (tensor with tensor_id="42")
+        cursor.execute("SELECT operation_id, input_index, tensor_id FROM input_tensors")
+        input_rows = cursor.fetchall()
+        assert len(input_rows) == 1, f"Expected 1 input tensor, got {len(input_rows)}"
+        assert input_rows[0][2] == 42, f"Expected tensor_id 42 (resolved from node 1), got {input_rows[0][2]}"
+
+        conn.close()
+
+    def test_comparison_sidecar_imports_records_and_golden_tensors(self, tmp_path):
+        """Comparison mode records are imported from the JSON sidecar."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn.relu"},
+                "connections": [],
+                "input_tensors": [2],
+            },
+            {
+                "counter": 2,
+                "node_type": "tensor",
+                "params": {"tensor_id": "100", "shape": "[1,32]", "dtype": "BFLOAT16", "layout": "TILE"},
+                "connections": [1],
+            },
+            {
+                "counter": 3,
+                "node_type": "function_end",
+                "params": {"name": "ttnn.relu"},
+                "connections": [4],
+                "duration_ns": 100,
+            },
+            {
+                "counter": 4,
+                "node_type": "tensor",
+                "params": {"tensor_id": "101", "shape": "[1,32]", "dtype": "BFLOAT16", "layout": "TILE"},
+                "connections": [],
+            },
+            {"counter": 5, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+        comparison_sidecar = {
+            "version": 1,
+            "local_tensor_comparison_records": [
+                {
+                    "tensor_id": 101,
+                    "golden_tensor_id": 1001,
+                    "matches": True,
+                    "desired_pcc": 0.9999,
+                    "actual_pcc": 1.0,
+                }
+            ],
+            "global_tensor_comparison_records": [
+                {
+                    "tensor_id": 101,
+                    "golden_tensor_id": 1002,
+                    "matches": True,
+                    "desired_pcc": 0.9999,
+                    "actual_pcc": 1.0,
+                }
+            ],
+            "tensors": [
+                {
+                    "tensor_id": 1001,
+                    "shape": "torch.Size([1, 32])",
+                    "dtype": "torch.bfloat16",
+                    "layout": "torch.strided",
+                    "memory_config": None,
+                    "device_id": None,
+                    "address": None,
+                    "buffer_type": None,
+                    "storage_type": "HOST",
+                },
+                {
+                    "tensor_id": 1002,
+                    "shape": "torch.Size([1, 32])",
+                    "dtype": "torch.bfloat16",
+                    "layout": "torch.strided",
+                    "memory_config": None,
+                    "device_id": None,
+                    "address": None,
+                    "buffer_type": None,
+                    "storage_type": "HOST",
+                },
+                # Written before storage_type existed: the memory config marks a device tensor
+                {
+                    "tensor_id": 1003,
+                    "shape": "Shape([1, 32])",
+                    "dtype": "DataType.BFLOAT16",
+                    "layout": "Layout.TILE",
+                    "memory_config": "MemoryConfig(memory_layout=TensorMemoryLayout::INTERLEAVED,"
+                    "buffer_type=BufferType::L1,shard_spec=std::nullopt)",
+                    "device_id": 0,
+                    "address": 4096,
+                    "buffer_type": 1,
+                },
+            ],
+        }
+
+        report = _make_report(mock_graph)
+        conn, cursor = _import_to_db_with_comparison_sidecar(report, comparison_sidecar, tmp_path)
+
+        cursor.execute("SELECT * FROM local_tensor_comparison_records")
+        assert cursor.fetchall() == [(101, 1001, 1, 0.9999, 1.0, 0)]
+
+        cursor.execute("SELECT * FROM global_tensor_comparison_records")
+        assert cursor.fetchall() == [(101, 1002, 1, 0.9999, 1.0, 0)]
+
+        cursor.execute(
+            "SELECT tensor_id, buffer_type, storage_type FROM tensors "
+            "WHERE tensor_id IN (1001, 1002, 1003) AND rank = 0 ORDER BY tensor_id"
+        )
+        assert cursor.fetchall() == [(1001, None, "HOST"), (1002, None, "HOST"), (1003, 1, "DEVICE")]
+        conn.close()
+
+    def test_multiple_output_tensors(self, tmp_path):
+        """Test function_end with multiple output tensor connections."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1, 5]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::split", "inputs": "1"},
+                "connections": [],
+                "input_tensors": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "tensor",
+                "params": {"tensor_id": "201", "shape": "[1,1,16,32]"},
+                "connections": [],
+            },
+            {
+                "counter": 3,
+                "node_type": "tensor",
+                "params": {"tensor_id": "202", "shape": "[1,1,16,32]"},
+                "connections": [],
+            },
+            {
+                "counter": 4,
+                "node_type": "function_end",
+                "params": {"name": "ttnn::split"},
+                "connections": [2, 3],
+                "duration_ns": 2000,
+            },
+            {"counter": 5, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+        report = _make_report(mock_graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT tensor_id FROM output_tensors ORDER BY output_index")
+        output_rows = cursor.fetchall()
+
+        assert len(output_rows) == 2, f"Expected 2 output tensors, got {len(output_rows)}"
+        assert str(output_rows[0][0]) == "201"
+        assert str(output_rows[1][0]) == "202"
+
+        conn.close()
+
+    def test_error_nodes_imported(self, tmp_path):
+        """Test that error nodes are imported."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1, 3]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::bad_op", "inputs": "1"},
+                "connections": [2],
+                "input_tensors": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "error",
+                "params": {
+                    "error_type": "exception",
+                    "error_message": "Something went wrong",
+                    "error_operation": "ttnn::bad_op",
+                },
+                "connections": [],
+            },
+            {"counter": 3, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+        report = _make_report(mock_graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT operation_id, name FROM operations")
+        operations = cursor.fetchall()
+        assert len(operations) == 1, f"the unfinished op must be recorded, got {operations}"
+        operation_id, name = operations[0]
+        assert name == "ttnn::bad_op"
+
+        cursor.execute("SELECT operation_id, operation_name, error_type, error_message FROM errors")
+        rows = cursor.fetchall()
+        assert rows == [
+            (operation_id, "ttnn::bad_op", "exception", "Something went wrong")
+        ], f"legacy error node must join the unfinished operation by operation_id, got {rows}"
+
+        conn.close()
+
+    def test_retried_operation_keeps_the_orphan_error(self, tmp_path):
+        """A completed failure of ttnn.conv2d must not suppress a later orphaned ttnn.conv2d error."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn.conv2d"},
+                "connections": [2],
+                "input_tensors": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "function_end",
+                "params": {"name": "ttnn.conv2d"},
+                "connections": [3],
+                "duration_ns": 100,
+            },
+            {
+                "counter": 3,
+                "node_type": "function_start",
+                "params": {"name": "ttnn.conv2d"},
+                "connections": [],
+                "input_tensors": [],
+            },
+            {"counter": 4, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+        python_io = [
+            {
+                "name": "ttnn.conv2d",
+                "arguments": {},
+                "error": {"type": "RuntimeError", "message": "first failure"},
+            },
+            {
+                "name": "ttnn.conv2d",
+                "arguments": {},
+                "error": {"type": "RuntimeError", "message": "second failure"},
+            },
+        ]
+
+        report = _make_report(mock_graph, python_io=python_io)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT operation_id, name FROM operations ORDER BY operation_id")
+        operations = cursor.fetchall()
+        assert len(operations) == 2, f"retried op must produce two rows, got {operations}"
+        first_id, first_name = operations[0]
+        second_id, second_name = operations[1]
+        assert first_name == second_name == "ttnn.conv2d"
+        assert first_id != second_id
+
+        cursor.execute(
+            "SELECT operation_id, operation_name, error_type, error_message FROM errors ORDER BY operation_id"
+        )
+        errors = cursor.fetchall()
+        assert errors == [
+            (first_id, "ttnn.conv2d", "RuntimeError", "first failure"),
+            (second_id, "ttnn.conv2d", "RuntimeError", "second failure"),
+        ], f"each failure must join its own operation_id, got {errors}"
+
+        conn.close()
+
+    def test_raising_operation_is_recorded_with_its_error(self, tmp_path):
+        """Issue #28836: an operation with no function_end is still imported, with its exception."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1]},
+            {
+                "counter": 1,
+                "node_type": "tensor",
+                "params": {"tensor_id": "7", "shape": "[1, 1, 6400, 256]", "device_id": "0", "address": "1024"},
+                "connections": [2],
+            },
+            {
+                "counter": 2,
+                "node_type": "function_start",
+                "params": {"name": "ttnn.conv2d"},
+                "connections": [],
+                "input_tensors": [1],
+            },
+            {"counter": 3, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+        python_io = [
+            {
+                "name": "ttnn.conv2d",
+                "arguments": {"in_channels": "256"},
+                "input_tensor_ids": [7],
+                "error": {"type": "RuntimeError", "message": "Something went wrong"},
+            }
+        ]
+
+        report = _make_report(mock_graph, python_io=python_io)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT operation_id, name FROM operations")
+        operations = cursor.fetchall()
+        assert len(operations) == 1, f"the raising operation must be recorded, got {operations}"
+        operation_id, name = operations[0]
+        assert name == "ttnn.conv2d"
+
+        cursor.execute("SELECT operation_id, operation_name, error_type, error_message FROM errors")
+        assert cursor.fetchall() == [(operation_id, "ttnn.conv2d", "RuntimeError", "Something went wrong")]
+
+        cursor.execute("SELECT value FROM operation_arguments WHERE operation_id = ?", (operation_id,))
+        assert cursor.fetchall() == [("256",)]
+        cursor.execute("SELECT tensor_id FROM input_tensors WHERE operation_id = ?", (operation_id,))
+        assert cursor.fetchall() == [(7,)]
+
+        conn.close()
+
+    def test_orphan_subgraph_excludes_report_capture_end(self, tmp_path):
+        """Orphan fallback must not wrap the report-level capture_end in a second pair."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1]},
+            {
+                "counter": 1,
+                "node_type": "tensor",
+                "params": {"tensor_id": "7", "shape": "[1, 1, 6400, 256]", "device_id": "0", "address": "1024"},
+                "connections": [2],
+            },
+            {
+                "counter": 2,
+                "node_type": "function_start",
+                "params": {"name": "ttnn.conv2d"},
+                "connections": [],
+                "input_tensors": [1],
+            },
+            {"counter": 3, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+        python_io = [
+            {
+                "name": "ttnn.conv2d",
+                "arguments": {"in_channels": "256"},
+                "input_tensor_ids": [7],
+                "error": {"type": "RuntimeError", "message": "Something went wrong"},
+            }
+        ]
+
+        report = _make_report(mock_graph, python_io=python_io)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT captured_graph FROM captured_graph")
+        rows = cursor.fetchall()
+        assert len(rows) == 1, f"expected one per-op graph, got {len(rows)}"
+        stored = json.loads(rows[0][0])
+        node_types = [node["node_type"] for node in stored]
+        assert node_types[0] == "capture_start", f"expected synthetic capture_start first, got {node_types}"
+        assert node_types[-1] == "capture_end", f"expected synthetic capture_end last, got {node_types}"
+        assert node_types.count("capture_start") == 1, f"duplicate capture_start: {node_types}"
+        assert node_types.count("capture_end") == 1, f"report capture_end leaked into the subgraph: {node_types}"
+        assert "function_start" in node_types, f"orphan function_start missing from subgraph: {node_types}"
+
+        conn.close()
+
+    def test_orphan_subgraph_keeps_inner_nodes(self, tmp_path):
+        """Stripping report boundaries must keep nodes captured after the orphan start."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn.conv2d"},
+                "connections": [2],
+                "input_tensors": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "function_start",
+                "params": {"name": "Conv2dDeviceOperation"},
+                "connections": [3],
+                "input_tensors": [],
+            },
+            {
+                "counter": 3,
+                "node_type": "function_end",
+                "params": {"name": "Conv2dDeviceOperation"},
+                "connections": [4],
+            },
+            {"counter": 4, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+        report = _make_report(mock_graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT captured_graph FROM captured_graph")
+        rows = cursor.fetchall()
+        assert len(rows) == 1, f"expected one per-op graph, got {len(rows)}"
+        stored = json.loads(rows[0][0])
+        node_types = [node["node_type"] for node in stored]
+        assert node_types == [
+            "capture_start",
+            "function_start",
+            "function_start",
+            "function_end",
+            "capture_end",
+        ], f"inner nodes dropped or report boundary kept: {node_types}"
+        assert stored[1]["params"]["name"] == "ttnn.conv2d"
+        assert stored[2]["params"]["name"] == "Conv2dDeviceOperation"
+        assert stored[3]["params"]["name"] == "Conv2dDeviceOperation"
+
+        conn.close()
+
+    def test_incomplete_operation_without_error_record_still_imported(self, tmp_path):
+        """Without a recorded exception the reason stays generic, but the operation is still listed."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn.matmul"},
+                "connections": [],
+                "input_tensors": [],
+            },
+            {"counter": 2, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+        report = _make_report(mock_graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT name FROM operations")
+        assert cursor.fetchall() == [("ttnn.matmul",)]
+
+        cursor.execute("SELECT error_type, error_message FROM errors")
+        error_type, error_message = cursor.fetchone()
+        assert error_type == "incomplete_operation"
+        assert "never completed" in error_message
+
+        conn.close()
+
+    def test_legacy_orphan_preserves_cpp_input_tensors(self, tmp_path):
+        """Older reports and C++-initiated captures have no python_io; C++ inputs still join."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1]},
+            {
+                "counter": 1,
+                "node_type": "tensor",
+                "params": {"tensor_id": "77", "shape": "[1, 1, 32, 32]", "device_id": "0", "address": "1024"},
+                "connections": [2],
+            },
+            {
+                "counter": 2,
+                "node_type": "function_start",
+                "params": {"name": "Conv2dDeviceOperation"},
+                "connections": [],
+                "input_tensors": [1],
+            },
+            {"counter": 3, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+        report = _make_report(mock_graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT operation_id, name FROM operations")
+        operations = cursor.fetchall()
+        assert len(operations) == 1, f"the unfinished C++ op must be recorded, got {operations}"
+        operation_id, name = operations[0]
+        assert name == "Conv2dDeviceOperation"
+
+        cursor.execute(
+            "SELECT input_index, tensor_id FROM input_tensors WHERE operation_id = ? ORDER BY input_index",
+            (operation_id,),
+        )
+        assert cursor.fetchall() == [(0, 77)], "orphan import must resolve C++ input_tensors to tensor_id 77"
+
+        conn.close()
+
+    def test_aborted_function_end_is_reported_as_an_error(self, tmp_path):
+        """A C++-only capture has no python_io, so the abort marker is the only evidence of failure."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "Conv2dDeviceOperation"},
+                "connections": [2],
+                "input_tensors": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "function_end",
+                "params": {
+                    "name": "Conv2dDeviceOperation",
+                    "aborted": "true",
+                    "abort_reason": "Statically allocated circular buffers in program 73 clash with L1 buffers",
+                },
+                "connections": [3],
+            },
+            {"counter": 3, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+        report = _make_report(mock_graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT name FROM operations")
+        assert cursor.fetchall() == [("Conv2dDeviceOperation",)]
+
+        cursor.execute("SELECT operation_name, error_type, error_message FROM errors")
+        assert cursor.fetchall() == [
+            (
+                "Conv2dDeviceOperation",
+                "aborted_operation",
+                "Statically allocated circular buffers in program 73 clash with L1 buffers",
+            )
+        ]
+
+        conn.close()
+
+    def test_abort_inside_an_operation_keeps_later_operations_visible(self, tmp_path):
+        """The point of closing the scope in C++: ops after the failure stay top level.
+
+        Before the guard the aborting scope stayed open, so ``ttnn.add`` was folded into the
+        failed ``ttnn.conv2d`` and vanished from the report.
+        """
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn.conv2d"},
+                "connections": [2],
+                "input_tensors": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "function_start",
+                "params": {"name": "Conv2dDeviceOperation"},
+                "connections": [3],
+                "input_tensors": [],
+            },
+            {
+                # No abort_reason: this is what ScopedTrackedFunction's destructor emits, since the
+                # exception message is out of reach during unwinding.
+                "counter": 3,
+                "node_type": "function_end",
+                "params": {"name": "Conv2dDeviceOperation", "aborted": "true"},
+                "connections": [4],
+            },
+            {"counter": 4, "node_type": "function_end", "params": {"name": "ttnn.conv2d"}, "connections": [5]},
+            {
+                "counter": 5,
+                "node_type": "function_start",
+                "params": {"name": "ttnn.add"},
+                "connections": [6],
+                "input_tensors": [],
+            },
+            {"counter": 6, "node_type": "function_end", "params": {"name": "ttnn.add"}, "connections": [7]},
+            {"counter": 7, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+        report = _make_report(mock_graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT name FROM operations ORDER BY operation_id")
+        assert cursor.fetchall() == [("ttnn.conv2d",), ("ttnn.add",)]
+
+        # The abort is attributed to the operation the report lists, and names the frame that died.
+        cursor.execute("SELECT operation_name, error_type, error_message FROM errors")
+        assert cursor.fetchall() == [
+            ("ttnn.conv2d", "aborted_operation", "Operation 'Conv2dDeviceOperation' was aborted by an exception")
+        ]
+
+        conn.close()
+
+    def test_python_recorded_error_wins_over_the_abort_marker(self, tmp_path):
+        """When Python recorded the exception, its type and message are the better diagnostic."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn.conv2d"},
+                "connections": [2],
+                "input_tensors": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "function_start",
+                "params": {"name": "Conv2dDeviceOperation"},
+                "connections": [3],
+                "input_tensors": [],
+            },
+            {
+                "counter": 3,
+                "node_type": "function_end",
+                "params": {"name": "Conv2dDeviceOperation", "aborted": "true", "abort_reason": "CB/L1 clash"},
+                "connections": [4],
+            },
+            {"counter": 4, "node_type": "function_end", "params": {"name": "ttnn.conv2d"}, "connections": [5]},
+            {"counter": 5, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+        python_io = [
+            {
+                "name": "ttnn.conv2d",
+                "arguments": {},
+                "error": {"type": "RuntimeError", "message": "TT_THROW @ program.cpp:1773"},
+            }
+        ]
+
+        report = _make_report(mock_graph, python_io=python_io)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT operation_name, error_type, error_message FROM errors")
+        assert cursor.fetchall() == [("ttnn.conv2d", "RuntimeError", "TT_THROW @ program.cpp:1773")]
+
+        conn.close()
+
+    def test_operation_arguments_imported(self, tmp_path):
+        """Test that operation arguments are imported from function_start."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1, 3]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::add", "inputs": "2"},
+                "connections": [],
+                "input_tensors": [],
+                "arguments": ["tensor_a", "tensor_b", "alpha=1.0"],
+            },
+            {
+                "counter": 2,
+                "node_type": "function_end",
+                "params": {"name": "ttnn::add"},
+                "connections": [],
+                "duration_ns": 5000,
+            },
+            {"counter": 3, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+        report = _make_report(mock_graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT name, value FROM operation_arguments ORDER BY name")
+        rows = cursor.fetchall()
+
+        assert len(rows) == 3
+        # arg_0, arg_1, arg_2
+        values = [r[1] for r in rows]
+        assert "tensor_a" in values
+        assert "tensor_b" in values
+        assert "alpha=1.0" in values
+
+        conn.close()
+
+    def test_buffers_imported(self, tmp_path):
+        """Test that buffer allocations are imported."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1, 4]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::relu", "inputs": "1"},
+                "connections": [],
+                "input_tensors": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "buffer_allocate",
+                "params": {
+                    "device_id": "0",
+                    "address": "12345",
+                    "size": "4096",
+                    "type": "L1",
+                    "buffer_type": "1",
+                    "layout": "INTERLEAVED",
+                },
+                "connections": [],
+            },
+            {
+                "counter": 3,
+                "node_type": "function_end",
+                "params": {"name": "ttnn::relu"},
+                "connections": [],
+                "duration_ns": 1000,
+            },
+            {"counter": 4, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+        report = _make_report(mock_graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT operation_id, device_id, address, max_size_per_bank, buffer_type FROM buffers")
+        rows = cursor.fetchall()
+
+        assert len(rows) == 1
+        assert rows[0][0] == 1  # operation_id
+        assert rows[0][1] == 0  # device_id
+        assert rows[0][2] == 12345  # address
+        assert rows[0][3] == 4096  # size
+        assert rows[0][4] == 1  # buffer_type (1=L1)
+
+        conn.close()
+
+    def test_buffer_type_mapping_all_types(self, tmp_path):
+        """All buffer types (DRAM, L1, L1_SMALL, SYSTEM_MEMORY, TRACE) map to correct integers."""
+        type_map = {"DRAM": 0, "L1": 1, "SYSTEM_MEMORY": 2, "L1_SMALL": 3, "TRACE": 4}
+        nodes = [
+            {
+                "counter": 0,
+                "node_type": "capture_start",
+                "params": {},
+                "connections": list(range(1, 1 + 3 * len(type_map), 3)),
+            },
+        ]
+        counter = 1
+        for type_name in type_map:
+            nodes.append(
+                {
+                    "counter": counter,
+                    "node_type": "function_start",
+                    "params": {"name": f"ttnn::op_{type_name}", "inputs": "0"},
+                    "connections": [],
+                    "input_tensors": [],
+                }
+            )
+            nodes.append(
+                {
+                    "counter": counter + 1,
+                    "node_type": "buffer_allocate",
+                    "params": {
+                        "device_id": "0",
+                        "address": str(counter * 10000),
+                        "size": "4096",
+                        "page_size": "1024",
+                        "type": type_name,
+                        "buffer_type": str(type_map[type_name]),
+                        "layout": "INTERLEAVED",
+                    },
+                    "connections": [],
+                }
+            )
+            nodes.append(
+                {
+                    "counter": counter + 2,
+                    "node_type": "function_end",
+                    "params": {"name": f"ttnn::op_{type_name}"},
+                    "connections": [],
+                    "duration_ns": 100,
+                }
+            )
+            counter += 3
+        nodes.append({"counter": counter, "node_type": "capture_end", "params": {}, "connections": []})
+
+        report = _make_report(nodes)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT address, buffer_type FROM buffers ORDER BY address")
+        rows = cursor.fetchall()
+        addr_to_type = {addr: bt for addr, bt in rows}
+
+        for i, (type_name, expected_int) in enumerate(type_map.items()):
+            addr = (1 + i * 3) * 10000
+            actual_val = addr_to_type.get(addr)
+            assert (
+                actual_val == expected_int
+            ), f"Buffer type '{type_name}' at addr {addr}: expected {expected_int}, got {actual_val}"
+
+        conn.close()
+
+    def test_l1_small_buffer_type_not_collapsed_to_dram(self, tmp_path):
+        """Regression: L1_SMALL must map to 3, not 0 (DRAM)."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::relu", "inputs": "0"},
+                "connections": [],
+                "input_tensors": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "buffer_allocate",
+                "params": {
+                    "device_id": "0",
+                    "address": "99999",
+                    "size": "2048",
+                    "page_size": "512",
+                    "type": "L1_SMALL",
+                    "buffer_type": "3",
+                    "layout": "INTERLEAVED",
+                },
+                "connections": [],
+            },
+            {
+                "counter": 3,
+                "node_type": "function_end",
+                "params": {"name": "ttnn::relu"},
+                "connections": [],
+                "duration_ns": 100,
+            },
+            {"counter": 4, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+        report = _make_report(mock_graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT buffer_type FROM buffers WHERE address=99999")
+        (bt,) = cursor.fetchone()
+        assert bt == 3, f"buffer_type should be 3 (L1_SMALL), got {bt}"
+
+        conn.close()
+
+    def test_mixed_buffer_types_cumulative(self, tmp_path):
+        """Cumulative snapshots preserve correct buffer_type for mixed DRAM/L1/L1_SMALL."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1, 5]},
+            # Op 1: allocates DRAM + L1_SMALL
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::op_a", "inputs": "0"},
+                "connections": [],
+                "input_tensors": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "buffer_allocate",
+                "params": {
+                    "device_id": "0",
+                    "address": "1000",
+                    "size": "8192",
+                    "page_size": "1024",
+                    "type": "DRAM",
+                    "buffer_type": "0",
+                    "layout": "INTERLEAVED",
+                },
+                "connections": [],
+            },
+            {
+                "counter": 3,
+                "node_type": "buffer_allocate",
+                "params": {
+                    "device_id": "0",
+                    "address": "2000",
+                    "size": "512",
+                    "page_size": "256",
+                    "type": "L1_SMALL",
+                    "buffer_type": "3",
+                    "layout": "INTERLEAVED",
+                },
+                "connections": [],
+            },
+            {
+                "counter": 4,
+                "node_type": "function_end",
+                "params": {"name": "ttnn::op_a"},
+                "connections": [],
+                "duration_ns": 100,
+            },
+            # Op 2: allocates L1 (cumulative snapshot should have all 3)
+            {
+                "counter": 5,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::op_b", "inputs": "0"},
+                "connections": [],
+                "input_tensors": [],
+            },
+            {
+                "counter": 6,
+                "node_type": "buffer_allocate",
+                "params": {
+                    "device_id": "0",
+                    "address": "3000",
+                    "size": "4096",
+                    "page_size": "512",
+                    "type": "L1",
+                    "buffer_type": "1",
+                    "layout": "INTERLEAVED",
+                },
+                "connections": [],
+            },
+            {
+                "counter": 7,
+                "node_type": "function_end",
+                "params": {"name": "ttnn::op_b"},
+                "connections": [],
+                "duration_ns": 200,
+            },
+            {"counter": 8, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+        report = _make_report(mock_graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT address, buffer_type FROM buffers WHERE operation_id=2 ORDER BY address")
+        rows = cursor.fetchall()
+        assert len(rows) == 3, f"Op 2 should have 3 cumulative buffers, got {len(rows)}"
+        type_by_addr = {addr: bt for addr, bt in rows}
+        assert type_by_addr[1000] == 0, f"DRAM buffer should be 0, got {type_by_addr[1000]}"
+        assert type_by_addr[2000] == 3, f"L1_SMALL buffer should be 3, got {type_by_addr[2000]}"
+        assert type_by_addr[3000] == 1, f"L1 buffer should be 1, got {type_by_addr[3000]}"
+
+        conn.close()
+
+    def test_buffers_cumulative_per_operation(self, tmp_path):
+        """Buffers must be cumulative: each operation includes all currently-allocated buffers."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1, 10]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "op_A", "inputs": "0"},
+                "connections": [],
+                "input_tensors": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "buffer_allocate",
+                "params": {
+                    "device_id": "0",
+                    "address": "1000",
+                    "size": "4096",
+                    "type": "DRAM",
+                    "buffer_type": "0",
+                    "layout": "INTERLEAVED",
+                },
+                "connections": [],
+            },
+            {
+                "counter": 3,
+                "node_type": "function_end",
+                "params": {"name": "op_A"},
+                "connections": [],
+                "duration_ns": 100,
+            },
+            {
+                "counter": 4,
+                "node_type": "function_start",
+                "params": {"name": "op_B", "inputs": "0"},
+                "connections": [],
+                "input_tensors": [],
+            },
+            {
+                "counter": 5,
+                "node_type": "buffer_allocate",
+                "params": {
+                    "device_id": "0",
+                    "address": "2000",
+                    "size": "8192",
+                    "type": "DRAM",
+                    "buffer_type": "0",
+                    "layout": "INTERLEAVED",
+                },
+                "connections": [],
+            },
+            {
+                "counter": 6,
+                "node_type": "function_end",
+                "params": {"name": "op_B"},
+                "connections": [],
+                "duration_ns": 200,
+            },
+            {
+                "counter": 7,
+                "node_type": "function_start",
+                "params": {"name": "op_C", "inputs": "0"},
+                "connections": [],
+                "input_tensors": [],
+            },
+            {
+                "counter": 8,
+                "node_type": "buffer_allocate",
+                "params": {
+                    "device_id": "0",
+                    "address": "3000",
+                    "size": "2048",
+                    "type": "L1",
+                    "buffer_type": "1",
+                    "layout": "INTERLEAVED",
+                },
+                "connections": [],
+            },
+            {
+                "counter": 9,
+                "node_type": "function_end",
+                "params": {"name": "op_C"},
+                "connections": [],
+                "duration_ns": 300,
+            },
+            {"counter": 10, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+        report = _make_report(mock_graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT operation_id, address FROM buffers ORDER BY operation_id, address")
+        rows = cursor.fetchall()
+
+        op_1_buffers = [r[1] for r in rows if r[0] == 1]
+        op_2_buffers = [r[1] for r in rows if r[0] == 2]
+        op_3_buffers = [r[1] for r in rows if r[0] == 3]
+
+        assert op_1_buffers == [1000], f"op_A should have 1 buffer, got {op_1_buffers}"
+        assert op_2_buffers == [1000, 2000], f"op_B should have 2 cumulative buffers, got {op_2_buffers}"
+        assert op_3_buffers == [1000, 2000, 3000], f"op_C should have 3 cumulative buffers, got {op_3_buffers}"
+
+        assert len(rows) == 6  # 1 + 2 + 3
+        conn.close()
+
+    def test_device_tensors_imported(self, tmp_path):
+        """Test that device_tensors are imported for multi-device tensors."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1, 3]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::all_gather", "inputs": "1"},
+                "connections": [],
+                "input_tensors": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "tensor",
+                "params": {
+                    "tensor_id": "100",
+                    "shape": "[1, 32, 32]",
+                    "dtype": "bfloat16",
+                    "layout": "TILE",
+                    "device_id": "0",
+                    "address": "12345678",
+                    "buffer_type": "1",
+                    "device_tensors": '[{"device_id": 0, "address": 12345678}, {"device_id": 1, "address": 22345678}, {"device_id": 2, "address": 32345678}, {"device_id": 3, "address": 42345678}]',
+                },
+                "connections": [],
+            },
+            {"counter": 3, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+        report = _make_report(mock_graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT tensor_id, device_id, address FROM device_tensors ORDER BY device_id")
+        rows = cursor.fetchall()
+
+        assert len(rows) == 4, f"Expected 4 device tensor entries, got {len(rows)}"
+        assert rows[0] == (100, 0, 12345678)
+        assert rows[1] == (100, 1, 22345678)
+        assert rows[2] == (100, 2, 32345678)
+        assert rows[3] == (100, 3, 42345678)
+
+        conn.close()
+
+    def test_device_tensors_prefers_mesh_device_id(self, tmp_path):
+        """Test that mesh_device_id is used over device_id when present in device_tensors JSON."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1, 3]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::to_device", "inputs": "1"},
+                "connections": [],
+                "input_tensors": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "tensor",
+                "params": {
+                    "tensor_id": "50",
+                    "shape": "[1024, 1024]",
+                    "dtype": "bfloat16",
+                    "layout": "TILE",
+                    "device_id": "1",
+                    "address": "1920032",
+                    "buffer_type": "0",
+                    "device_tensors": '[{"device_id": 0, "mesh_device_id": 1, "address": 1920032}]',
+                },
+                "connections": [],
+            },
+            {"counter": 3, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+        report = _make_report(mock_graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT tensor_id, device_id, address FROM device_tensors")
+        rows = cursor.fetchall()
+
+        assert len(rows) == 1
+        assert rows[0] == (50, 1, 1920032), f"Should use mesh_device_id (1) not physical device_id (0). Got {rows[0]}"
+        conn.close()
+
+    def test_full_tensor_info_imported(self, tmp_path):
+        """Test that full tensor info (dtype, layout, memory_config, device_id, address, buffer_type) is imported."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1, 3]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::relu", "inputs": "1"},
+                "connections": [],
+                "input_tensors": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "tensor",
+                "params": {
+                    "tensor_id": "100",
+                    "shape": "[1, 32, 32]",
+                    "dtype": "bfloat16",
+                    "layout": "TILE",
+                    "memory_config": "MemoryConfig(DRAM, INTERLEAVED)",
+                    "device_id": "0",
+                    "address": "12345678",
+                    "buffer_type": 0,
+                    "size": "2048",
+                },
+                "connections": [],
+            },
+            {"counter": 3, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+        report = _make_report(mock_graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute(
+            "SELECT tensor_id, shape, dtype, layout, memory_config, device_id, address, buffer_type FROM tensors"
+        )
+        rows = cursor.fetchall()
+
+        assert len(rows) == 1
+        row = rows[0]
+        assert str(row[0]) == "100"  # tensor_id
+        assert row[1] == "[1, 32, 32]"  # shape
+        assert row[2] == "bfloat16"  # dtype
+        assert row[3] == "TILE"  # layout
+        assert "DRAM" in row[4]  # memory_config
+        assert row[5] == 0  # device_id
+        assert row[6] == 12345678  # address
+        assert row[7] == 0  # buffer_type (0=DRAM)
+
+        # No storage_type param (older capture): the memory config marks it as a device tensor
+        cursor.execute("SELECT storage_type FROM tensors")
+        assert cursor.fetchone() == ("DEVICE",)
+
+        conn.close()
+
+    @staticmethod
+    def _graph_with_input_tensors(*tensor_params):
+        """One ttnn::add consuming a tensor node per ``tensor_params`` entry, so host tensors are kept."""
+        tensor_nodes = [
+            {"counter": 1 + i, "node_type": "tensor", "params": params, "connections": []}
+            for i, params in enumerate(tensor_params)
+        ]
+        start = len(tensor_nodes) + 1
+        return [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": []},
+            *tensor_nodes,
+            {
+                "counter": start,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::add"},
+                "connections": [],
+                "input_tensors": [node["counter"] for node in tensor_nodes],
+            },
+            {
+                "counter": start + 1,
+                "node_type": "function_end",
+                "params": {"name": "ttnn::add"},
+                "connections": [],
+                "duration_ns": 1000,
+            },
+            {"counter": start + 2, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+    @staticmethod
+    def _tensor_placement_rows(cursor):
+        cursor.execute(
+            "SELECT tensor_id, memory_config, device_id, address, buffer_type, storage_type "
+            "FROM tensors ORDER BY tensor_id"
+        )
+        return cursor.fetchall()
+
+    _L1_MEMORY_CONFIG = (
+        "MemoryConfig(memory_layout=TensorMemoryLayout::INTERLEAVED,buffer_type=BufferType::L1,shard_spec=std::nullopt)"
+    )
+
+    def test_host_tensor_buffer_type_is_null(self, tmp_path):
+        """A host tensor has no buffer type; 0 would claim DRAM."""
+        graph = self._graph_with_input_tensors({"tensor_id": "1", "shape": "[1, 32]", "storage_type": "HOST"})
+        conn, cursor = _import_to_db(_make_report(graph), tmp_path)
+
+        assert self._tensor_placement_rows(cursor) == [(1, None, None, None, None, "HOST")]
+        conn.close()
+
+    def test_unaddressed_device_tensor_keeps_declared_buffer_type(self, tmp_path):
+        """A device tensor without a backing buffer still records the buffer type its memory config declares."""
+        graph = self._graph_with_input_tensors(
+            {
+                "tensor_id": "2",
+                "shape": "[1, 32]",
+                "storage_type": "DEVICE",
+                "memory_config": self._L1_MEMORY_CONFIG,
+                "buffer_type": 1,
+            }
+        )
+        conn, cursor = _import_to_db(_make_report(graph), tmp_path)
+
+        assert self._tensor_placement_rows(cursor) == [(2, self._L1_MEMORY_CONFIG, None, None, 1, "DEVICE")]
+        conn.close()
+
+    def test_legacy_tensor_without_buffer_type_is_null(self, tmp_path):
+        """Captures predating storage_type: a missing buffer type stays NULL rather than becoming DRAM."""
+        graph = self._graph_with_input_tensors(
+            {"tensor_id": "3", "shape": "[1, 32]"},
+            {"tensor_id": "4", "shape": "[1, 32]", "memory_config": self._L1_MEMORY_CONFIG},
+        )
+        conn, cursor = _import_to_db(_make_report(graph), tmp_path)
+
+        assert self._tensor_placement_rows(cursor) == [
+            # Host, or a deallocated device tensor: older captures can't tell them apart
+            (3, None, None, None, None, None),
+            (4, self._L1_MEMORY_CONFIG, None, None, None, "DEVICE"),
+        ]
+        conn.close()
+
+    def test_unreferenced_device_tensor_without_buffer_is_kept(self, tmp_path):
+        """Only host tensors need an I/O reference to be kept; a device tensor without a buffer is not one."""
+        graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": []},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::add"},
+                "connections": [],
+                "input_tensors": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "tensor",
+                "params": {
+                    "tensor_id": "5",
+                    "shape": "[1, 32]",
+                    "storage_type": "DEVICE",
+                    "memory_config": self._L1_MEMORY_CONFIG,
+                    "buffer_type": 1,
+                },
+                "connections": [],
+            },
+            {
+                "counter": 3,
+                "node_type": "tensor",
+                "params": {"tensor_id": "6", "shape": "[1, 32]", "storage_type": "HOST"},
+                "connections": [],
+            },
+            {
+                "counter": 4,
+                "node_type": "function_end",
+                "params": {"name": "ttnn::add"},
+                "connections": [],
+                "duration_ns": 1000,
+            },
+            {"counter": 5, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+        conn, cursor = _import_to_db(_make_report(graph), tmp_path)
+
+        assert self._tensor_placement_rows(cursor) == [(5, self._L1_MEMORY_CONFIG, None, None, 1, "DEVICE")]
+        conn.close()
+
+    def test_python_io_output_tensor_row_matches_captured_node(self, tmp_path):
+        """A Python-level output ID copied from its C++ node gets the same row a captured tensor would."""
+        graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": []},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn.to_torch"},
+                "connections": [],
+                "input_tensors": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "tensor",
+                "params": {
+                    "tensor_id": "10",
+                    "shape": "[1, 32]",
+                    "dtype": "DataType::BFLOAT16",
+                    "layout": "Layout::ROW_MAJOR",
+                    "storage_type": "HOST",
+                },
+                "connections": [],
+            },
+            {
+                "counter": 3,
+                "node_type": "function_end",
+                "params": {"name": "ttnn.to_torch"},
+                "connections": [2],
+                "duration_ns": 1000,
+            },
+            {"counter": 4, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+        python_io = [{"name": "ttnn.to_torch", "arguments": {}, "input_tensor_ids": [], "output_tensor_ids": [99]}]
+        conn, cursor = _import_to_db(_make_report(graph, python_io=python_io), tmp_path)
+
+        cursor.execute(
+            "SELECT dtype, layout, memory_config, buffer_type, storage_type FROM tensors WHERE tensor_id = 99"
+        )
+        assert cursor.fetchall() == [("DataType.BFLOAT16", "Layout.ROW_MAJOR", None, None, "HOST")]
+        conn.close()
+
+    def test_edges_populated_from_captured_graph(self, tmp_path):
+        """Test that edges are extracted from captured_graph subgraphs."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1, 4]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::relu", "inputs": "1"},
+                "connections": [2],
+                "input_tensors": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "tensor",
+                "params": {"tensor_id": "100", "shape": "[1,32,32]"},
+                "connections": [3],
+            },
+            {
+                "counter": 3,
+                "node_type": "function_end",
+                "params": {"name": "ttnn::relu"},
+                "connections": [4],
+                "duration_ns": 1000,
+            },
+            {"counter": 4, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+        report = _make_report(mock_graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT COUNT(*) FROM edges")
+        assert cursor.fetchone()[0] > 0
+
+        conn.close()
+
+    def test_imported_sql_rows_rank_matches_report_metadata(self, tmp_path):
+        """Every populated table with a ``rank`` column stores ``metadata.rank`` from the JSON report."""
+        expected_rank = 6
+        devices = [{"device_id": 0, "num_dram_channels": 12, "l1_num_banks": 64}]
+
+        graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1, 7]},
+            {
+                "counter": 1,
+                "node_type": "tensor",
+                "params": {"tensor_id": "42", "shape": "[1,1,32,32]"},
+                "connections": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::relu", "inputs": "1"},
+                "connections": [3, 4],
+                "input_tensors": [1],
+                "arguments": ["x"],
+            },
+            {
+                "counter": 3,
+                "node_type": "buffer_allocate",
+                "params": {
+                    "device_id": "0",
+                    "address": "12345",
+                    "size": "4096",
+                    "page_size": "2048",
+                    "type": "L1",
+                    "layout": "INTERLEAVED",
+                },
+                "connections": [],
+            },
+            {
+                "counter": 4,
+                "node_type": "tensor",
+                "params": {
+                    "tensor_id": "101",
+                    "shape": "[1,1,32,32]",
+                    "dtype": "DataType.BFLOAT16",
+                    "layout": "Layout.TILE",
+                    "device_id": 0,
+                    "address": 9999,
+                    "buffer_type": "0",
+                    "device_tensors": json.dumps([{"device_id": 0, "address": 9999}]),
+                },
+                "connections": [],
+            },
+            {
+                "counter": 5,
+                "node_type": "function_end",
+                "params": {"name": "ttnn::relu"},
+                "connections": [4],
+                "duration_ns": 1000,
+            },
+            {"counter": 7, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+        python_io = [
+            {
+                "name": "ttnn::relu",
+                "arguments": {"x": "t42"},
+                "input_tensor_ids": [42],
+                "output_tensor_ids": [101],
+                "python_stack_trace": ['  File "model.py", line 10, in forward\n    ttnn.relu(x)'],
+            }
+        ]
+        report = _make_report(
+            graph,
+            devices=devices,
+            python_io=python_io,
+            metadata={
+                "rank": expected_rank,
+                "world_size": 4,
+                "capture_timestamp_ns": 0,
+            },
+        )
+        report["buffer_pages"] = [
+            {
+                "device_id": 0,
+                "address": 1,
+                "core_y": 0,
+                "core_x": 0,
+                "bank_id": 0,
+                "page_index": 0,
+                "page_address": 0,
+                "page_size": 2048,
+                "buffer_type": 0,
+            }
+        ]
+
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT value FROM report_metadata WHERE key = 'rank'")
+        assert cursor.fetchone()[0] == str(expected_rank)
+
+        _assert_nonempty_tables_rank_equals(cursor, expected_rank)
+        conn.close()
+
+    def test_errors_table_rank_matches_metadata(self, tmp_path):
+        """Error rows from ``node_type == 'error'`` carry the same rank as the rest of the import."""
+        expected_rank = 2
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1, 3]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::bad_op", "inputs": "1"},
+                "connections": [2],
+                "input_tensors": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "error",
+                "params": {
+                    "error_type": "exception",
+                    "error_message": "fail",
+                    "error_operation": "ttnn::bad_op",
+                },
+                "connections": [],
+            },
+            {"counter": 3, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+        report = _make_report(mock_graph, metadata={"rank": expected_rank, "world_size": 3})
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT COUNT(*), MIN(rank), MAX(rank) FROM errors")
+        cnt, rmin, rmax = cursor.fetchone()
+        assert cnt == 1
+        assert rmin == rmax == expected_rank
+        conn.close()
+
+    def test_cluster_mesh_descriptors_saved(self, tmp_path):
+        """Test that cluster and mesh descriptors are saved during import."""
+        graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1]},
+            {"counter": 1, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+        report = _make_report(graph)
+        report["cluster_descriptor"] = "# Mock cluster descriptor YAML\ndevices:\n  - id: 0\n    type: wormhole\n"
+        report["mesh_coordinate_mapping"] = "# physical_chip_mesh_coordinate_mapping_1_of_1.yaml\nchips:\n  0: [0, 0]\n"
+
+        report_path = tmp_path / "report.json"
+        with open(report_path, "w") as f:
+            json.dump(report, f)
+        output_dir = tmp_path / "output"
+        graph_report.import_report(report_path, output_dir)
+
+        # Check cluster descriptor was saved
+        cluster_path = output_dir / "cluster_descriptor.yaml"
+        assert cluster_path.exists(), "cluster_descriptor.yaml should be created"
+        with open(cluster_path) as f:
+            content = f.read()
+        assert "wormhole" in content
+
+        # Check mesh coordinate mapping was saved
+        mesh_path = output_dir / "physical_chip_mesh_coordinate_mapping.yaml"
+        assert mesh_path.exists(), "physical_chip_mesh_coordinate_mapping.yaml should be created"
+        with open(mesh_path) as f:
+            content = f.read()
+        assert "chips" in content
+        assert "0: [0, 0]" in content
+
+
+class TestInputTensorResolution:
+    """Regression tests: input_tensors must resolve node counters to real tensor_ids."""
+
+    def test_input_tensor_resolves_node_counter_to_tensor_id(self, tmp_path):
+        """
+        Regression: input_tensors field contains node counter values, not tensor_ids.
+        The import must look up the node and extract tensor_id from its params.
+        """
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1, 5]},
+            {
+                "counter": 1,
+                "node_type": "tensor",
+                "params": {"tensor_id": "77", "shape": "[1,1,32,32]"},
+                "connections": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::relu", "inputs": "1"},
+                "connections": [],
+                "input_tensors": [1],
+            },
+            {
+                "counter": 3,
+                "node_type": "function_end",
+                "params": {"name": "ttnn::relu"},
+                "connections": [],
+                "duration_ns": 500,
+            },
+            {"counter": 4, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+        report = _make_report(mock_graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT tensor_id FROM input_tensors")
+        rows = cursor.fetchall()
+        assert len(rows) == 1
+        assert (
+            rows[0][0] == 77
+        ), f"input_tensors should store the real tensor_id (77), not the node counter (1). Got {rows[0][0]}"
+        conn.close()
+
+    def test_input_tensor_id_exists_in_tensors_table(self, tmp_path):
+        """
+        Regression: all tensor_ids referenced in input_tensors must exist in the tensors table.
+        The old bug stored node counter values which didn't match any tensor row.
+        """
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [2, 6]},
+            {
+                "counter": 1,
+                "node_type": "tensor",
+                "params": {"tensor_id": "10", "shape": "[1024,1024]"},
+                "connections": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::matmul", "inputs": "1"},
+                "connections": [],
+                "input_tensors": [1],
+            },
+            {
+                "counter": 3,
+                "node_type": "tensor",
+                "params": {"tensor_id": "20", "shape": "[1024,1024]"},
+                "connections": [],
+            },
+            {
+                "counter": 4,
+                "node_type": "function_end",
+                "params": {"name": "ttnn::matmul"},
+                "connections": [3],
+                "duration_ns": 1000,
+            },
+            {"counter": 5, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+        report = _make_report(mock_graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT tensor_id FROM tensors")
+        tensor_ids = {row[0] for row in cursor.fetchall()}
+
+        cursor.execute("SELECT tensor_id FROM input_tensors")
+        for row in cursor.fetchall():
+            assert row[0] in tensor_ids or str(row[0]) in tensor_ids, (
+                f"input_tensors references tensor_id={row[0]} which doesn't exist in tensors table. "
+                f"Available: {tensor_ids}"
+            )
+        conn.close()
+
+    def test_multiple_input_tensors_all_resolved(self, tmp_path):
+        """Test that all input tensors for an operation are correctly resolved."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1, 8]},
+            {
+                "counter": 1,
+                "node_type": "tensor",
+                "params": {"tensor_id": "5", "shape": "[1024,1024]"},
+                "connections": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "tensor",
+                "params": {"tensor_id": "8", "shape": "[1024,1024]"},
+                "connections": [],
+            },
+            {
+                "counter": 3,
+                "node_type": "tensor",
+                "params": {"tensor_id": "11", "shape": "[1,1024]"},
+                "connections": [],
+            },
+            {
+                "counter": 4,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::linear", "inputs": "3"},
+                "connections": [],
+                "input_tensors": [1, 2, 3],
+            },
+            {
+                "counter": 5,
+                "node_type": "tensor",
+                "params": {"tensor_id": "20", "shape": "[1024,1024]"},
+                "connections": [],
+            },
+            {
+                "counter": 6,
+                "node_type": "function_end",
+                "params": {"name": "ttnn::linear"},
+                "connections": [5],
+                "duration_ns": 5000,
+            },
+            {"counter": 7, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+        report = _make_report(mock_graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT input_index, tensor_id FROM input_tensors ORDER BY input_index")
+        rows = cursor.fetchall()
+
+        assert len(rows) == 3, f"Expected 3 input tensors, got {len(rows)}"
+        assert rows[0] == (0, 5), f"Input 0 should be tensor_id 5 (node 1), got {rows[0]}"
+        assert rows[1] == (1, 8), f"Input 1 should be tensor_id 8 (node 2), got {rows[1]}"
+        assert rows[2] == (2, 11), f"Input 2 should be tensor_id 11 (node 3), got {rows[2]}"
+        conn.close()
+
+    def test_invalid_node_counter_skipped(self, tmp_path):
+        """Input tensor references to non-existent nodes are silently skipped."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1, 4]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::relu", "inputs": "1"},
+                "connections": [],
+                "input_tensors": [999],
+            },
+            {
+                "counter": 2,
+                "node_type": "function_end",
+                "params": {"name": "ttnn::relu"},
+                "connections": [],
+                "duration_ns": 100,
+            },
+            {"counter": 3, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+        report = _make_report(mock_graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT * FROM input_tensors")
+        assert cursor.fetchall() == [], "Invalid node counter should not produce input_tensor rows"
+        conn.close()
+
+
+class TestImportValidation:
+    """Tests for the referential integrity validation in the importer."""
+
+    def _make_db(self, tmp_path):
+        db_path = tmp_path / "test.db"
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        graph_report.create_database_schema(cursor)
+        return conn, cursor
+
+    def test_clean_import_produces_no_warnings(self, tmp_path):
+        """A well-formed graph should produce zero integrity warnings."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1, 5]},
+            {
+                "counter": 1,
+                "node_type": "tensor",
+                "params": {"tensor_id": "10", "shape": "[32,32]"},
+                "connections": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::relu", "inputs": "1"},
+                "connections": [],
+                "input_tensors": [1],
+            },
+            {
+                "counter": 3,
+                "node_type": "tensor",
+                "params": {"tensor_id": "20", "shape": "[32,32]"},
+                "connections": [],
+            },
+            {
+                "counter": 4,
+                "node_type": "function_end",
+                "params": {"name": "ttnn::relu"},
+                "connections": [3],
+                "duration_ns": 100,
+            },
+            {"counter": 5, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+        conn, cursor = self._make_db(tmp_path)
+        stats = graph_report.import_graph(cursor, mock_graph)
+        conn.commit()
+
+        assert stats.get("warnings", []) == [], f"Clean import should have no warnings, got: {stats['warnings']}"
+        conn.close()
+
+    def test_dangling_input_tensor_produces_warning(self, tmp_path):
+        """
+        Simulate the old bug: manually insert an input_tensor row pointing to
+        a nonexistent tensor_id and verify the validator catches it.
+        """
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1, 3]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::relu", "inputs": "1"},
+                "connections": [],
+                "input_tensors": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "function_end",
+                "params": {"name": "ttnn::relu"},
+                "connections": [],
+                "duration_ns": 100,
+            },
+            {"counter": 3, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+        conn, cursor = self._make_db(tmp_path)
+        graph_report.import_graph(cursor, mock_graph)
+        conn.commit()
+
+        # Manually insert a dangling reference (simulating the old bug)
+        cursor.execute("INSERT INTO input_tensors VALUES (0, 0, 999, 0)")
+        conn.commit()
+
+        # Run validation directly
+        warnings = graph_report._validate_graph_integrity(
+            operations_batch=[(0, "ttnn::relu", 0.0, 0)],
+            tensors_batch=[],
+            input_tensors_batch=[(0, 0, 999, 0)],
+            output_tensors_batch=[],
+            operation_arguments_batch=[],
+            device_tensors_batch=[],
+            buffers_batch=[],
+            devices=None,
+        )
+        assert len(warnings) >= 1
+        assert any("tensor_id=999" in w for w in warnings), f"Should warn about dangling tensor_id=999, got: {warnings}"
+        conn.close()
+
+
+class TestBufferMaxSizePerBank:
+    """Regression tests: max_size_per_bank must be per-bank, not total buffer size."""
+
+    @staticmethod
+    def _make_buffer_graph(size, page_size, buf_type="DRAM", layout="INTERLEAVED", num_cores=0):
+        return [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1, 4]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::to_device", "inputs": "1"},
+                "connections": [],
+                "input_tensors": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "buffer_allocate",
+                "params": {
+                    "device_id": "0",
+                    "address": "1000",
+                    "size": str(size),
+                    "page_size": str(page_size),
+                    "num_cores": str(num_cores),
+                    "type": buf_type,
+                    "buffer_type": str({"DRAM": 0, "L1": 1, "SYSTEM_MEMORY": 2, "L1_SMALL": 3, "TRACE": 4}[buf_type]),
+                    "layout": layout,
+                },
+                "connections": [],
+            },
+            {
+                "counter": 3,
+                "node_type": "function_end",
+                "params": {"name": "ttnn::to_device"},
+                "connections": [],
+                "duration_ns": 100,
+            },
+            {"counter": 4, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+    def test_dram_interleaved_per_bank_size(self, tmp_path):
+        """
+        Regression: a 1024x1024 bf16 TILE tensor is 2,097,152 bytes total.
+        With 12 DRAM channels: ceil(1024 pages / 12 banks) * 2048 page_size = 176,128 per bank.
+        """
+        devices = [{"device_id": 0, "num_dram_channels": 12, "l1_num_banks": 64}]
+        graph = self._make_buffer_graph(size=2097152, page_size=2048, buf_type="DRAM")
+
+        report = _make_report(graph, devices=devices)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT max_size_per_bank FROM buffers")
+        actual = cursor.fetchone()[0]
+        expected = 86 * 2048  # ceil(1024/12) * page_size = 176128
+        assert actual == expected, f"max_size_per_bank should be {expected} (per-bank), got {actual}"
+        conn.close()
+
+    def test_l1_interleaved_per_bank_size(self, tmp_path):
+        """L1 interleaved buffers should use l1_num_banks for per-bank computation."""
+        devices = [{"device_id": 0, "num_dram_channels": 12, "l1_num_banks": 64}]
+        graph = self._make_buffer_graph(size=65536, page_size=2048, buf_type="L1")
+
+        report = _make_report(graph, devices=devices)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT max_size_per_bank FROM buffers")
+        actual = cursor.fetchone()[0]
+        expected = 2048  # 32 pages, ceil(32/64) = 1 page/bank, 1 * 2048
+        assert actual == expected, f"L1 per-bank should be {expected}, got {actual}"
+        conn.close()
+
+    def test_small_dram_buffer_per_bank(self, tmp_path):
+        """
+        Regression from the real bug: bias tensor buffer (26,624 bytes).
+        ceil(13 pages / 12 banks) * 2048 = 4096 per bank.
+        """
+        devices = [{"device_id": 0, "num_dram_channels": 12, "l1_num_banks": 64}]
+        graph = self._make_buffer_graph(size=26624, page_size=2048, buf_type="DRAM")
+
+        report = _make_report(graph, devices=devices)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT max_size_per_bank FROM buffers")
+        actual = cursor.fetchone()[0]
+        expected = 2 * 2048  # ceil(13/12) * 2048 = 4096
+        assert actual == expected, f"Bias buffer per-bank should be {expected}, got {actual}"
+        conn.close()
+
+    def test_no_device_info_falls_back_to_total_size(self, tmp_path):
+        """Without device info, max_size_per_bank falls back to total buffer size."""
+        graph = self._make_buffer_graph(size=4096, page_size=2048, buf_type="DRAM")
+
+        report = _make_report(graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT max_size_per_bank FROM buffers")
+        assert cursor.fetchone()[0] == 4096, "Without device info, should fall back to total size"
+        conn.close()
+
+    def test_sharded_buffer_per_core_size(self, tmp_path):
+        """Sharded buffers compute per-bank from num_cores."""
+        devices = [{"device_id": 0, "num_dram_channels": 12, "l1_num_banks": 64}]
+        graph = self._make_buffer_graph(size=32768, page_size=2048, buf_type="L1", layout="HEIGHT_SHARDED", num_cores=8)
+
+        report = _make_report(graph, devices=devices)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT max_size_per_bank FROM buffers")
+        assert cursor.fetchone()[0] == 4096, f"Sharded per-core should be 4096"
+        conn.close()
+
+
+class TestLinearModelImport:
+    """
+    End-to-end regression test using the exact graph structure from the team's test_linear model:
+        a = ttnn.ones([1024, 1024], layout=ttnn.TILE_LAYOUT, device=device)
+        b = ttnn.ones([1024, 1024], layout=ttnn.TILE_LAYOUT, device=device)
+        c = ttnn.ones([1, 1024], layout=ttnn.TILE_LAYOUT, device=device)
+        d = ttnn.linear(a, b, bias=c)
+
+    Verifies the import produces output consistent with the known-good (correct) database.
+    """
+
+    MOCK_DEVICE_INFO = [
+        {
+            "device_id": 1,
+            "num_dram_channels": 12,
+            "l1_num_banks": 64,
+            "num_y_cores": 8,
+            "num_x_cores": 8,
+            "num_y_compute_cores": 8,
+            "num_x_compute_cores": 8,
+            "worker_l1_size": 1499136,
+            "l1_bank_size": 1395424,
+            "address_at_first_l1_bank": 0,
+            "address_at_first_l1_cb_buffer": 103712,
+            "num_banks_per_storage_core": 1,
+            "num_compute_cores": 64,
+            "num_storage_cores": 0,
+            "total_l1_memory": 95944704,
+            "total_l1_for_tensors": 0,
+            "total_l1_for_interleaved_buffers": 89307136,
+            "total_l1_for_sharded_buffers": 89307136,
+            "cb_limit": 1395424,
+        }
+    ]
+
+    MOCK_LINEAR_GRAPH = [
+        {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1, 7, 13, 19]},
+        # --- ttnn.ones #1 → ttnn.to_device ---
+        {
+            "counter": 1,
+            "node_type": "function_start",
+            "params": {"name": "ttnn.to_device", "inputs": "1"},
+            "connections": [3, 4, 5],
+            "input_tensors": [2],
+        },
+        {
+            "counter": 2,
+            "node_type": "tensor",
+            "params": {
+                "tensor_id": "0",
+                "shape": "Shape([1024, 1024])",
+                "dtype": "DataType::BFLOAT16",
+                "layout": "Layout::TILE",
+            },
+            "connections": [1],
+        },
+        {"counter": 3, "node_type": "buffer", "params": {}, "connections": [6, 6]},
+        {
+            "counter": 4,
+            "node_type": "buffer_allocate",
+            "params": {
+                "device_id": "1",
+                "address": "1920032",
+                "size": "2097152",
+                "page_size": "2048",
+                "num_cores": "0",
+                "type": "DRAM",
+                "buffer_type": "0",
+                "layout": "INTERLEAVED",
+            },
+            "connections": [3],
+        },
+        {
+            "counter": 5,
+            "node_type": "function_end",
+            "params": {"name": "ttnn.to_device"},
+            "connections": [6, 7],
+            "duration_ns": 2784790,
+        },
+        {
+            "counter": 6,
+            "node_type": "tensor",
+            "params": {
+                "tensor_id": "1",
+                "shape": "Shape([1024, 1024])",
+                "dtype": "DataType::BFLOAT16",
+                "layout": "Layout::TILE",
+                "memory_config": "MemoryConfig(memory_layout=TensorMemoryLayout::INTERLEAVED,buffer_type=BufferType::DRAM,shard_spec=std::nullopt,nd_shard_spec=std::nullopt,created_with_nd_shard_spec=0)",
+                "device_id": "1",
+                "address": "1920032",
+                "buffer_type": "0",
+                "device_tensors": '[{"device_id": 0, "mesh_device_id": 1, "address": 1920032}]',
+            },
+            "connections": [19],
+        },
+        # --- ttnn.ones #2 → ttnn.to_device ---
+        {
+            "counter": 7,
+            "node_type": "function_start",
+            "params": {"name": "ttnn.to_device", "inputs": "1"},
+            "connections": [9, 10, 11],
+            "input_tensors": [8],
+        },
+        {
+            "counter": 8,
+            "node_type": "tensor",
+            "params": {
+                "tensor_id": "2",
+                "shape": "Shape([1024, 1024])",
+                "dtype": "DataType::BFLOAT16",
+                "layout": "Layout::TILE",
+            },
+            "connections": [7],
+        },
+        {"counter": 9, "node_type": "buffer", "params": {}, "connections": [12, 12]},
+        {
+            "counter": 10,
+            "node_type": "buffer_allocate",
+            "params": {
+                "device_id": "1",
+                "address": "2096160",
+                "size": "2097152",
+                "page_size": "2048",
+                "num_cores": "0",
+                "type": "DRAM",
+                "buffer_type": "0",
+                "layout": "INTERLEAVED",
+            },
+            "connections": [9],
+        },
+        {
+            "counter": 11,
+            "node_type": "function_end",
+            "params": {"name": "ttnn.to_device"},
+            "connections": [12, 13],
+            "duration_ns": 252479,
+        },
+        {
+            "counter": 12,
+            "node_type": "tensor",
+            "params": {
+                "tensor_id": "3",
+                "shape": "Shape([1024, 1024])",
+                "dtype": "DataType::BFLOAT16",
+                "layout": "Layout::TILE",
+                "memory_config": "MemoryConfig(memory_layout=TensorMemoryLayout::INTERLEAVED,buffer_type=BufferType::DRAM,shard_spec=std::nullopt,nd_shard_spec=std::nullopt,created_with_nd_shard_spec=0)",
+                "device_id": "1",
+                "address": "2096160",
+                "buffer_type": "0",
+                "device_tensors": '[{"device_id": 0, "mesh_device_id": 1, "address": 2096160}]',
+            },
+            "connections": [19],
+        },
+        # --- ttnn.ones #3 → ttnn.to_device ---
+        {
+            "counter": 13,
+            "node_type": "function_start",
+            "params": {"name": "ttnn.to_device", "inputs": "1"},
+            "connections": [15, 16, 17],
+            "input_tensors": [14],
+        },
+        {
+            "counter": 14,
+            "node_type": "tensor",
+            "params": {
+                "tensor_id": "4",
+                "shape": "Shape([1, 1024])",
+                "dtype": "DataType::BFLOAT16",
+                "layout": "Layout::TILE",
+            },
+            "connections": [13],
+        },
+        {"counter": 15, "node_type": "buffer", "params": {}, "connections": [18, 18]},
+        {
+            "counter": 16,
+            "node_type": "buffer_allocate",
+            "params": {
+                "device_id": "1",
+                "address": "2272288",
+                "size": "65536",
+                "page_size": "2048",
+                "num_cores": "0",
+                "type": "DRAM",
+                "buffer_type": "0",
+                "layout": "INTERLEAVED",
+            },
+            "connections": [15],
+        },
+        {
+            "counter": 17,
+            "node_type": "function_end",
+            "params": {"name": "ttnn.to_device"},
+            "connections": [18, 19],
+            "duration_ns": 31240,
+        },
+        {
+            "counter": 18,
+            "node_type": "tensor",
+            "params": {
+                "tensor_id": "5",
+                "shape": "Shape([1, 1024])",
+                "dtype": "DataType::BFLOAT16",
+                "layout": "Layout::TILE",
+                "memory_config": "MemoryConfig(memory_layout=TensorMemoryLayout::INTERLEAVED,buffer_type=BufferType::DRAM,shard_spec=std::nullopt,nd_shard_spec=std::nullopt,created_with_nd_shard_spec=0)",
+                "device_id": "1",
+                "address": "2272288",
+                "buffer_type": "0",
+                "device_tensors": '[{"device_id": 0, "mesh_device_id": 1, "address": 2272288}]',
+            },
+            "connections": [19],
+        },
+        # --- ttnn.linear → MatmulDeviceOperation ---
+        {
+            "counter": 19,
+            "node_type": "function_start",
+            "params": {"name": "MatmulDeviceOperation", "inputs": "3"},
+            "connections": [20, 25, 26, 27, 28, 29, 30, 31, 32],
+            "input_tensors": [6, 12, 18],
+        },
+        {
+            "counter": 20,
+            "node_type": "function_start",
+            "params": {"name": "tt::tt_metal::create_device_tensor"},
+            "connections": [21, 22, 23],
+            "input_tensors": [],
+        },
+        {"counter": 21, "node_type": "buffer", "params": {}, "connections": [24, 24]},
+        {
+            "counter": 22,
+            "node_type": "buffer_allocate",
+            "params": {
+                "device_id": "1",
+                "address": "2278432",
+                "size": "2097152",
+                "page_size": "2048",
+                "num_cores": "0",
+                "type": "DRAM",
+                "buffer_type": "0",
+                "layout": "INTERLEAVED",
+            },
+            "connections": [21],
+        },
+        {
+            "counter": 23,
+            "node_type": "function_end",
+            "params": {"name": "tt::tt_metal::create_device_tensor"},
+            "connections": [24],
+            "duration_ns": 14929,
+        },
+        {
+            "counter": 24,
+            "node_type": "tensor",
+            "params": {
+                "tensor_id": "7",
+                "shape": "Shape([1024, 1024])",
+                "dtype": "DataType::BFLOAT16",
+                "layout": "Layout::TILE",
+                "memory_config": "MemoryConfig(memory_layout=TensorMemoryLayout::INTERLEAVED,buffer_type=BufferType::DRAM,shard_spec=std::nullopt,nd_shard_spec=std::nullopt,created_with_nd_shard_spec=0)",
+                "device_id": "1",
+                "address": "2278432",
+                "buffer_type": "0",
+                "device_tensors": '[{"device_id": 0, "mesh_device_id": 1, "address": 2278432}]',
+            },
+            "connections": [],
+        },
+        {"counter": 25, "node_type": "circular_buffer_deallocate_all", "params": {}, "connections": [19]},
+        {"counter": 26, "node_type": "circular_buffer_allocate", "params": {}, "connections": []},
+        {"counter": 27, "node_type": "circular_buffer_allocate", "params": {}, "connections": []},
+        {"counter": 28, "node_type": "circular_buffer_allocate", "params": {}, "connections": []},
+        {"counter": 29, "node_type": "circular_buffer_allocate", "params": {}, "connections": []},
+        {"counter": 30, "node_type": "buffer", "params": {}, "connections": []},
+        {
+            "counter": 31,
+            "node_type": "buffer_allocate",
+            "params": {
+                "device_id": "1",
+                "address": "1073737728",
+                "size": "26624",
+                "page_size": "2048",
+                "num_cores": "0",
+                "type": "DRAM",
+                "buffer_type": "0",
+                "layout": "INTERLEAVED",
+            },
+            "connections": [30],
+        },
+        {
+            "counter": 32,
+            "node_type": "function_end",
+            "params": {"name": "MatmulDeviceOperation"},
+            "connections": [24, 33],
+            "duration_ns": 13232532,
+        },
+        {"counter": 33, "node_type": "capture_end", "params": {}, "connections": []},
+    ]
+
+    def _import_linear_graph(self, tmp_path):
+        report = _make_report(self.MOCK_LINEAR_GRAPH, devices=self.MOCK_DEVICE_INFO)
+        return _import_to_db(report, tmp_path)
+
+    def test_operations_count_and_names(self, tmp_path):
+        """The linear model should produce 5 operations matching the C++ trace."""
+        conn, cursor = self._import_linear_graph(tmp_path)
+
+        cursor.execute("SELECT operation_id, name FROM operations ORDER BY operation_id")
+        rows = cursor.fetchall()
+
+        assert len(rows) == 4, f"Expected 4 ops (nested child ops filtered), got {len(rows)}"
+        assert rows[0][1] == "ttnn.to_device"
+        assert rows[1][1] == "ttnn.to_device"
+        assert rows[2][1] == "ttnn.to_device"
+        assert rows[3][1] == "MatmulDeviceOperation"
+        conn.close()
+
+    def test_all_input_tensors_reference_valid_tensor_ids(self, tmp_path):
+        """
+        Regression: the old bug stored node counters (2, 8, 14, 6, 12, 18) as tensor_ids
+        in input_tensors. After the fix, they must resolve to real tensor_ids that exist
+        in the tensors table.
+        """
+        conn, cursor = self._import_linear_graph(tmp_path)
+
+        cursor.execute("SELECT tensor_id FROM tensors")
+        valid_tensor_ids = {row[0] for row in cursor.fetchall()}
+        valid_tensor_ids_int = {int(t) if isinstance(t, str) else t for t in valid_tensor_ids}
+
+        cursor.execute(
+            "SELECT operation_id, input_index, tensor_id FROM input_tensors ORDER BY operation_id, input_index"
+        )
+        input_rows = cursor.fetchall()
+
+        for op_id, idx, tid in input_rows:
+            tid_int = int(tid) if isinstance(tid, str) else tid
+            assert tid_int in valid_tensor_ids_int, (
+                f"input_tensors({op_id}, {idx}) references tensor_id={tid} which doesn't exist in tensors table. "
+                f"This is likely the old bug where node counters were stored instead of real tensor_ids. "
+                f"Valid tensor_ids: {sorted(valid_tensor_ids_int)}"
+            )
+        conn.close()
+
+    def test_matmul_input_tensors_are_device_tensors(self, tmp_path):
+        """
+        The MatmulDeviceOperation's input_tensors field has [6, 12, 18] (node counters
+        for the three device tensors). After resolution, these should become tensor_ids
+        1, 3, 5 — the device-side tensors from the three to_device operations.
+        """
+        conn, cursor = self._import_linear_graph(tmp_path)
+
+        cursor.execute("SELECT input_index, tensor_id FROM input_tensors WHERE operation_id = 4 ORDER BY input_index")
+        rows = cursor.fetchall()
+
+        assert len(rows) == 3, f"MatmulDeviceOperation should have 3 inputs, got {len(rows)}"
+        resolved_ids = [int(r[1]) if isinstance(r[1], str) else r[1] for r in rows]
+        assert resolved_ids == [1, 3, 5], (
+            f"Matmul inputs should be tensor_ids [1, 3, 5] (device tensors), "
+            f"not node counters [6, 12, 18]. Got {resolved_ids}"
+        )
+        conn.close()
+
+    def test_to_device_input_tensors_are_host_tensors(self, tmp_path):
+        """Each ttnn.to_device should take one host tensor as input."""
+        conn, cursor = self._import_linear_graph(tmp_path)
+
+        cursor.execute("SELECT operation_id, tensor_id FROM input_tensors WHERE operation_id < 4 ORDER BY operation_id")
+        rows = cursor.fetchall()
+
+        assert len(rows) == 3
+        resolved_ids = [int(r[1]) if isinstance(r[1], str) else r[1] for r in rows]
+        assert resolved_ids == [0, 2, 4], f"to_device inputs should be host tensor_ids [0, 2, 4], got {resolved_ids}"
+        conn.close()
+
+    def test_output_tensors_match_expected(self, tmp_path):
+        """Verify output tensor associations match the graph structure."""
+        conn, cursor = self._import_linear_graph(tmp_path)
+
+        cursor.execute(
+            "SELECT operation_id, output_index, tensor_id FROM output_tensors ORDER BY operation_id, output_index"
+        )
+        rows = cursor.fetchall()
+
+        output_map = {r[0]: int(r[2]) if isinstance(r[2], str) else r[2] for r in rows}
+        assert output_map[1] == 1, "to_device #1 output should be tensor 1"
+        assert output_map[2] == 3, "to_device #2 output should be tensor 3"
+        assert output_map[3] == 5, "to_device #3 output should be tensor 5"
+        assert output_map[4] == 7, "MatmulDeviceOperation output should be tensor 7"
+        conn.close()
+
+    def test_buffer_sizes_are_per_bank_not_total(self, tmp_path):
+        """
+        Regression: the correct DB has per-bank sizes (176128, 6144, 4096).
+        The old bug stored total sizes (2097152, 65536, 26624).
+        """
+        conn, cursor = self._import_linear_graph(tmp_path)
+
+        cursor.execute("SELECT address, max_size_per_bank FROM buffers ORDER BY address")
+        rows = cursor.fetchall()
+        buf_by_addr = {r[0]: r[1] for r in rows}
+
+        assert (
+            buf_by_addr[1920032] == 176128
+        ), f"1024x1024 bf16 DRAM buffer should be 176128/bank, got {buf_by_addr[1920032]}"
+        assert (
+            buf_by_addr[2096160] == 176128
+        ), f"1024x1024 bf16 DRAM buffer should be 176128/bank, got {buf_by_addr[2096160]}"
+        assert buf_by_addr[2272288] == 6144, f"1x1024 bf16 DRAM buffer should be 6144/bank, got {buf_by_addr[2272288]}"
+        assert (
+            buf_by_addr[2278432] == 176128
+        ), f"output 1024x1024 DRAM buffer should be 176128/bank, got {buf_by_addr[2278432]}"
+        assert (
+            buf_by_addr[1073737728] == 4096
+        ), f"matmul intermediate DRAM buffer should be 4096/bank, got {buf_by_addr[1073737728]}"
+        conn.close()
+
+    def test_buffers_are_cumulative_per_operation(self, tmp_path):
+        """
+        Regression: the correct DB has cumulative buffer snapshots per operation.
+        op 1: 1 buffer, op 2: 2 buffers, op 3: 3 buffers, op 4 (matmul): 5 buffers.
+        Nested create_device_tensor is filtered, its buffers still tracked.
+        """
+        conn, cursor = self._import_linear_graph(tmp_path)
+
+        cursor.execute("SELECT operation_id, COUNT(*) FROM buffers GROUP BY operation_id ORDER BY operation_id")
+        rows = cursor.fetchall()
+
+        expected_counts = {1: 1, 2: 2, 3: 3, 4: 5}
+        actual_counts = {r[0]: r[1] for r in rows}
+
+        assert actual_counts == expected_counts, (
+            f"Buffer counts should be cumulative per operation. " f"Expected {expected_counts}, got {actual_counts}"
+        )
+        conn.close()
+
+    def test_device_tensors_have_correct_addresses_and_device_ids(self, tmp_path):
+        """Device tensor addresses and device_ids should match the correct DB (mesh_device_id=1)."""
+        conn, cursor = self._import_linear_graph(tmp_path)
+
+        cursor.execute("SELECT tensor_id, device_id, address FROM device_tensors ORDER BY CAST(tensor_id AS INTEGER)")
+        rows = cursor.fetchall()
+
+        expected = [
+            (1, 0, 1920032),
+            (3, 0, 2096160),
+            (5, 0, 2272288),
+            (7, 0, 2278432),
+        ]
+        assert len(rows) == len(expected), f"Expected {len(expected)} device_tensors, got {len(rows)}"
+        for row, (exp_tid, exp_dev, exp_addr) in zip(rows, expected):
+            tid = int(row[0]) if isinstance(row[0], str) else row[0]
+            assert tid == exp_tid, f"Expected tensor_id {exp_tid}, got {tid}"
+            assert row[1] == exp_dev, f"Tensor {tid}: expected device_id {exp_dev}, got {row[1]}"
+            assert row[2] == exp_addr, f"Tensor {tid}: expected address {exp_addr}, got {row[2]}"
+        conn.close()
+
+    def test_tensor_count_and_shapes(self, tmp_path):
+        """7 unique tensors (3 host + 4 device, tensor_id 6 is skipped) with correct shapes."""
+        conn, cursor = self._import_linear_graph(tmp_path)
+
+        cursor.execute("SELECT tensor_id, shape FROM tensors ORDER BY CAST(tensor_id AS INTEGER)")
+        rows = cursor.fetchall()
+
+        assert len(rows) == 7, f"Expected 7 tensors (ids 0-5,7), got {len(rows)}"
+
+        shapes = {int(r[0]) if isinstance(r[0], str) else r[0]: r[1] for r in rows}
+        for tid in [0, 1, 2, 3, 7]:
+            assert "1024, 1024" in str(shapes[tid]), f"Tensor {tid} should be 1024x1024, got {shapes[tid]}"
+        for tid in [4, 5]:
+            assert "1, 1024" in str(shapes[tid]), f"Tensor {tid} should be 1x1024, got {shapes[tid]}"
+        conn.close()
+
+
+class TestGraphCaptureToFile:
+    """Tests for end_graph_capture_to_file API."""
+
+    def test_basic_capture_to_file(self, device, tmp_report_dir):
+        """Test basic graph capture to JSON file."""
+        report_path = tmp_report_dir / "report.json"
+
+        torch_input = torch.rand((1, 1, 32, 32), dtype=torch.bfloat16)
+        tt_input = ttnn.from_torch(torch_input, layout=ttnn.TILE_LAYOUT, device=device)
+
+        ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+        _ = ttnn.relu(tt_input)
+        captured_graph = ttnn.graph.end_graph_capture_to_file(report_path)
+
+        # Verify file was created
+        assert report_path.exists(), "Report file should be created"
+
+        # Verify returned graph matches file contents
+        with open(report_path) as f:
+            report = json.load(f)
+
+        assert "graph" in report
+        assert "version" in report
+        assert report["graph"] == captured_graph
+
+    def test_capture_ends_when_report_file_cannot_be_written(self, device, tmp_report_dir, expect_error):
+        blocker = tmp_report_dir / "not_a_directory"
+        blocker.write_text("")
+        report_path = blocker / "report.json"
+
+        tt_input = ttnn.from_torch(
+            torch.rand((1, 1, 32, 32), dtype=torch.bfloat16), layout=ttnn.TILE_LAYOUT, device=device
+        )
+
+        tt_output = None
+        ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+        try:
+            tt_output = ttnn.relu(tt_input)
+            with expect_error(RuntimeError, "cannot create directories"):
+                ttnn.graph.end_graph_capture_to_file(report_path)
+            assert not ttnn.graph.is_graph_capture_active()
+            assert not ttnn.graph.is_python_io_recording_enabled()
+        finally:
+            if ttnn.graph.is_graph_capture_active():
+                ttnn.graph.end_graph_capture()
+            # The caught exception's traceback keeps this frame alive past device close;
+            # free the device buffers now so collecting it later touches no device.
+            ttnn.deallocate(tt_input)
+            if tt_output is not None:
+                ttnn.deallocate(tt_output)
+
+    def test_full_graph_capture_failed_write_keeps_outer_capture(self, device, tmp_report_dir, expect_error):
+        blocker = tmp_report_dir / "not_a_directory"
+        blocker.write_text("")
+
+        tt_input = ttnn.from_torch(
+            torch.rand((1, 1, 32, 32), dtype=torch.bfloat16), layout=ttnn.TILE_LAYOUT, device=device
+        )
+
+        tt_output = None
+        ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+        try:
+            with expect_error(RuntimeError, "cannot create directories"):
+                with ttnn.graph.full_graph_capture(blocker / "report.json"):
+                    tt_output = ttnn.relu(tt_input)
+            assert ttnn.graph.is_graph_capture_active()
+            ttnn.graph.end_graph_capture()
+            assert not ttnn.graph.is_graph_capture_active()
+        finally:
+            while ttnn.graph.is_graph_capture_active():
+                ttnn.graph.end_graph_capture()
+            # The caught exception's traceback keeps this frame alive past device close;
+            # free the device buffers now so collecting it later touches no device.
+            ttnn.deallocate(tt_input)
+            if tt_output is not None:
+                ttnn.deallocate(tt_output)
+
+    @skip_for_slow_dispatch()
+    def test_default_manager_execution_metadata_round_trip(self, device, tmp_report_dir):
+        report_path = tmp_report_dir / "default_manager_report.json"
+        db_dir = tmp_report_dir / "db"
+        torch_input = torch.rand((1, 1, 64, 64), dtype=torch.bfloat16)
+        lhs = ttnn.from_torch(torch_input, layout=ttnn.TILE_LAYOUT, device=device)
+        rhs = ttnn.from_torch(torch_input, layout=ttnn.TILE_LAYOUT, device=device)
+
+        with ttnn.manage_config("enable_fast_runtime_mode", False), ttnn.manage_config("enable_logging", True):
+            ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+            try:
+                _ = ttnn.add(lhs, rhs)
+                ttnn.synchronize_device(device)
+            finally:
+                captured_graph = ttnn.graph.end_graph_capture_to_file(report_path)
+
+        execution_nodes = [node for node in captured_graph if node.get("node_type") == "program_execution"]
+        assert len(execution_nodes) == 1
+        params = execution_nodes[0]["params"]
+        assert params["sub_device_id"] == 0
+        assert json.loads(params["worker_core_ranges"])
+        assert params["global_call_count"] == (params["runtime_id"] << 10) | params["physical_device_id"]
+        # device_id identifies the MeshDevice (joins the devices table); physical_device_id the chip.
+        assert params["device_id"] == device.id()
+        # Leaf node: no back-edge to the owning operation.
+        assert execution_nodes[0]["connections"] == []
+
+        manager_nodes = [node for node in captured_graph if node.get("node_type") == "sub_device_manager"]
+        assert len(manager_nodes) == 1, "the active manager's partition is snapshotted exactly once per capture"
+        manager_params = manager_nodes[0]["params"]
+        assert manager_params["device_id"] == device.id()
+        assert manager_params["sub_device_manager_id"] == params["sub_device_manager_id"]
+        assert [sub["sub_device_id"] for sub in json.loads(manager_params["sub_devices"])] == [0]
+
+        db_path = graph_report.import_report(report_path, db_dir)
+        with sqlite3.connect(db_path) as conn:
+            execution = conn.execute(
+                "SELECT e.physical_device_id, e.runtime_id, e.global_call_count, "
+                "x.sub_device_manager_id, x.sub_device_id, s.worker_core_ranges "
+                "FROM operation_executions e "
+                "JOIN execution_sub_devices x ON x.execution_id = e.execution_id AND x.rank = e.rank "
+                "JOIN sub_devices s ON s.device_id = x.device_id "
+                "AND s.sub_device_manager_id = x.sub_device_manager_id "
+                "AND s.sub_device_id = x.sub_device_id AND s.rank = x.rank"
+            ).fetchone()
+        assert execution[:5] == (
+            params["physical_device_id"],
+            params["runtime_id"],
+            params["global_call_count"],
+            params["sub_device_manager_id"],
+            0,
+        )
+        assert json.loads(execution[5]) == json.loads(params["worker_core_ranges"])
+
+    @skip_for_slow_dispatch()
+    @pytest.mark.parametrize("mesh_device", [pytest.param((2, 4), id="2x4_loudbox")], indirect=True)
+    def test_execution_fans_out_to_every_device_in_the_mesh(self, mesh_device, tmp_report_dir):
+        """One program_execution per physical device a single workload landed on.
+
+        On a single-device host the fan-out in track_mesh_workload_execution always yields
+        exactly one node, so nothing there distinguishes device_id from physical_device_id,
+        and one operation never produces enough executions to exercise execution_id's
+        per-operation stride. A replicated mesh workload covers both.
+        """
+        report_path = tmp_report_dir / "mesh_fanout_report.json"
+        db_dir = tmp_report_dir / "db"
+        num_devices = mesh_device.get_num_devices()
+        assert num_devices > 1, "fan-out is only observable on a multi-device mesh"
+
+        torch_input = torch.rand((1, 1, 64, 64), dtype=torch.bfloat16)
+        lhs, rhs = (
+            ttnn.from_torch(
+                torch_input,
+                layout=ttnn.TILE_LAYOUT,
+                device=mesh_device,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
+            )
+            for _ in range(2)
+        )
+
+        with ttnn.manage_config("enable_fast_runtime_mode", False), ttnn.manage_config("enable_logging", True):
+            ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+            try:
+                _ = ttnn.add(lhs, rhs)
+                ttnn.synchronize_device(mesh_device)
+            finally:
+                captured_graph = ttnn.graph.end_graph_capture_to_file(report_path)
+
+        execution_nodes = [node for node in captured_graph if node.get("node_type") == "program_execution"]
+        assert len(execution_nodes) == num_devices
+        params = [node["params"] for node in execution_nodes]
+
+        # device_id names the MeshDevice and so repeats across the fan-out; physical_device_id
+        # names the chip and so must not.
+        assert {param["device_id"] for param in params} == {mesh_device.id()}
+        assert len({param["physical_device_id"] for param in params}) == num_devices
+        # global_call_count encodes the chip, which is what keeps per-device profiler rows apart.
+        for param in params:
+            assert param["global_call_count"] == (param["runtime_id"] << 10) | param["physical_device_id"]
+        assert len({param["global_call_count"] for param in params}) == num_devices
+
+        # The manager partitions the mesh uniformly, so it is snapshotted once for the mesh
+        # rather than once per chip in the fan-out.
+        manager_nodes = [node for node in captured_graph if node.get("node_type") == "sub_device_manager"]
+        assert len(manager_nodes) == 1
+        assert manager_nodes[0]["params"]["device_id"] == mesh_device.id()
+
+        db_path = graph_report.import_report(report_path, db_dir)
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                "SELECT e.execution_id, e.operation_id, e.physical_device_id, e.global_call_count, x.sub_device_id "
+                "FROM operation_executions e "
+                "JOIN execution_sub_devices x ON x.execution_id = e.execution_id AND x.rank = e.rank "
+                "ORDER BY e.physical_device_id"
+            ).fetchall()
+            # Executions carry the remapped mesh id, so every row must resolve against devices.
+            dangling = conn.execute(
+                "SELECT COUNT(*) FROM operation_executions e "
+                "LEFT JOIN devices d ON d.device_id = e.device_id AND d.rank = e.rank "
+                "WHERE d.device_id IS NULL"
+            ).fetchone()[0]
+
+        assert len(rows) == num_devices
+        assert dangling == 0
+        # All of them hang off the one ttnn.add, which is what puts execution_id's stride under
+        # load: ids are operation_id * stride + index, so a collision here would drop a row.
+        assert len({row[1] for row in rows}) == 1
+        assert len({row[0] for row in rows}) == num_devices
+        assert {row[2] for row in rows} == {param["physical_device_id"] for param in params}
+        assert {row[3] for row in rows} == {param["global_call_count"] for param in params}
+        assert {row[4] for row in rows} == {0}
+
+    @skip_for_slow_dispatch()
+    @pytest.mark.skipif(not is_wormhole_b0(), reason="Sub-device graph-report coverage targets Wormhole")
+    def test_sub_device_execution_metadata_round_trip(self, device, tmp_report_dir):
+        report_path = tmp_report_dir / "sub_device_report.json"
+        db_dir = tmp_report_dir / "db"
+        sub_device_0_cores = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(3, 3))})
+        sub_device_1_cores = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(4, 0), ttnn.CoreCoord(4, 4))})
+        manager = device.create_sub_device_manager(
+            [ttnn.SubDevice([sub_device_0_cores]), ttnn.SubDevice([sub_device_1_cores])],
+            3200,
+        )
+        device.load_sub_device_manager(manager)
+        device.set_sub_device_stall_group([ttnn.SubDeviceId(0), ttnn.SubDeviceId(1)])
+
+        try:
+            torch_input = torch.rand((1, 1, 64, 64), dtype=torch.bfloat16)
+            lhs = ttnn.from_torch(torch_input, layout=ttnn.TILE_LAYOUT, device=device)
+            rhs = ttnn.from_torch(torch_input, layout=ttnn.TILE_LAYOUT, device=device)
+
+            with ttnn.manage_config("enable_fast_runtime_mode", False), ttnn.manage_config("enable_logging", True):
+                ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+                try:
+                    _ = ttnn.add(lhs, rhs, sub_device_id=ttnn.SubDeviceId(1))
+                    ttnn.synchronize_device(device)
+                finally:
+                    captured_graph = ttnn.graph.end_graph_capture_to_file(report_path)
+        finally:
+            device.reset_sub_device_stall_group()
+            device.clear_loaded_sub_device_manager()
+            device.remove_sub_device_manager(manager)
+
+        execution_nodes = [node for node in captured_graph if node.get("node_type") == "program_execution"]
+        assert len(execution_nodes) == 1
+        params = execution_nodes[0]["params"]
+        assert params["sub_device_id"] == 1
+        assert json.loads(params["worker_core_ranges"]) == [{"start": {"x": 4, "y": 0}, "end": {"x": 4, "y": 4}}]
+        assert params["global_call_count"] == (params["runtime_id"] << 10) | params["physical_device_id"]
+        assert params["command_queue_id"] == 0
+        assert params["device_id"] == device.id()
+        assert execution_nodes[0]["connections"] == []
+
+        db_path = graph_report.import_report(report_path, db_dir)
+        with sqlite3.connect(db_path) as conn:
+            execution = conn.execute(
+                "SELECT e.physical_device_id, e.runtime_id, e.global_call_count, e.command_queue_id, "
+                "x.sub_device_manager_id, x.sub_device_id, s.worker_core_ranges "
+                "FROM operation_executions e "
+                "JOIN execution_sub_devices x ON x.execution_id = e.execution_id AND x.rank = e.rank "
+                "JOIN sub_devices s ON s.device_id = x.device_id "
+                "AND s.sub_device_manager_id = x.sub_device_manager_id "
+                "AND s.sub_device_id = x.sub_device_id AND s.rank = x.rank"
+            ).fetchone()
+        assert execution[:6] == (
+            params["physical_device_id"],
+            params["runtime_id"],
+            params["global_call_count"],
+            0,
+            params["sub_device_manager_id"],
+            1,
+        )
+        assert json.loads(execution[6]) == [{"start": {"x": 4, "y": 0}, "end": {"x": 4, "y": 4}}]
+
+        # Sub-device 0 never ran an operation, but the manager snapshot must still describe it, so
+        # the visualizer can draw the full partition of the grid.
+        with sqlite3.connect(db_path) as conn:
+            topology = conn.execute(
+                "SELECT sub_device_id, worker_core_ranges FROM sub_devices "
+                "WHERE sub_device_manager_id = ? ORDER BY sub_device_id",
+                (params["sub_device_manager_id"],),
+            ).fetchall()
+        assert [sub_device_id for sub_device_id, _ in topology] == [0, 1]
+        assert json.loads(topology[0][1]) == [{"start": {"x": 0, "y": 0}, "end": {"x": 3, "y": 3}}]
+        assert json.loads(topology[1][1]) == [{"start": {"x": 4, "y": 0}, "end": {"x": 4, "y": 4}}]
+
+    @skip_for_slow_dispatch()
+    def test_unplaced_execution_from_a_real_program_is_still_recorded(self, device, tmp_report_dir):
+        """A real program the resolver cannot place still gets its row, with no sub-device link.
+
+        resolve_program_placement uses circular buffers as a proxy for kernel groups, so a program
+        that allocates none cannot be placed. The import-path tests feed synthetic nodes with
+        sub_device_id already omitted; this drives the C++ resolver itself with a real program and
+        checks the contract it promises -- record the execution, drop only the placement.
+
+        The other unresolved branch, an eth-only program (a CCL op), needs more than one chip and
+        so is not reachable here.
+        """
+        report_path = tmp_report_dir / "unplaced_report.json"
+        db_dir = tmp_report_dir / "db"
+        sub_device_0_cores = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(3, 3))})
+        sub_device_1_cores = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(4, 0), ttnn.CoreCoord(4, 4))})
+        manager = device.create_sub_device_manager(
+            [ttnn.SubDevice([sub_device_0_cores]), ttnn.SubDevice([sub_device_1_cores])],
+            3200,
+        )
+        device.load_sub_device_manager(manager)
+        device.set_sub_device_stall_group([ttnn.SubDeviceId(0), ttnn.SubDeviceId(1)])
+
+        try:
+            torch_input = torch.rand((1, 1, 64, 64), dtype=torch.bfloat16)
+            operand = ttnn.from_torch(torch_input, layout=ttnn.TILE_LAYOUT, device=device)
+
+            with ttnn.manage_config("enable_fast_runtime_mode", False), ttnn.manage_config("enable_logging", True):
+                ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+                try:
+                    # ttnn.clone allocates no circular buffers, so the proxy has nothing to match.
+                    _ = ttnn.clone(operand)
+                    ttnn.synchronize_device(device)
+                finally:
+                    captured_graph = ttnn.graph.end_graph_capture_to_file(report_path)
+        finally:
+            device.reset_sub_device_stall_group()
+            device.clear_loaded_sub_device_manager()
+            device.remove_sub_device_manager(manager)
+
+        execution_nodes = [node for node in captured_graph if node.get("node_type") == "program_execution"]
+        assert execution_nodes, "the operation must still produce a program_execution node"
+        manager_nodes = [node for node in captured_graph if node.get("node_type") == "sub_device_manager"]
+        assert len(manager_nodes) == 1
+        manager_params = manager_nodes[0]["params"]
+        unplaced = [node for node in execution_nodes if "sub_device_id" not in node["params"]]
+        if not unplaced:
+            # Premise guard rather than a failure: if clone starts allocating circular buffers the
+            # resolver can place it, and this test needs repointing at another CB-less program.
+            pytest.skip("ttnn.clone now resolves to a sub-device, so it no longer covers this branch")
+
+        for node in unplaced:
+            params = node["params"]
+            # Everything except the placement is still recorded.
+            assert params["device_id"] == device.id()
+            assert params["global_call_count"] == (params["runtime_id"] << 10) | params["physical_device_id"]
+            # Placement is dropped whole: no sub-device, and no worker cores standing in for one.
+            assert "worker_core_ranges" not in params
+            # The manager the program ran under is still known, only the sub-device within it is not.
+            assert params["sub_device_manager_id"] == manager_params["sub_device_manager_id"]
+
+        db_path = graph_report.import_report(report_path, db_dir)
+        with sqlite3.connect(db_path) as conn:
+            recorded = conn.execute(
+                "SELECT COUNT(*) FROM operation_executions e "
+                "LEFT JOIN execution_sub_devices x ON x.execution_id = e.execution_id AND x.rank = e.rank "
+                "WHERE x.execution_id IS NULL"
+            ).fetchone()[0]
+            dangling = conn.execute(
+                "SELECT COUNT(*) FROM operation_executions e "
+                "LEFT JOIN devices d ON d.device_id = e.device_id AND d.rank = e.rank "
+                "WHERE d.device_id IS NULL"
+            ).fetchone()[0]
+            # The manager snapshot is independent of placement, so the partition is still described.
+            topology = conn.execute("SELECT sub_device_id FROM sub_devices ORDER BY sub_device_id").fetchall()
+
+        assert recorded == len(unplaced), "an unplaced execution must keep its operation_executions row"
+        assert dangling == 0
+        assert [sub_device_id for (sub_device_id,) in topology] == [0, 1]
+
+    def test_report_contains_device_info(self, device, tmp_report_dir):
+        """Test that report contains device information."""
+        report_path = tmp_report_dir / "report.json"
+
+        torch_input = torch.rand((1, 1, 32, 32), dtype=torch.bfloat16)
+        tt_input = ttnn.from_torch(torch_input, layout=ttnn.TILE_LAYOUT, device=device)
+
+        ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+        _ = ttnn.relu(tt_input)
+        _ = ttnn.graph.end_graph_capture_to_file(report_path)
+
+        with open(report_path) as f:
+            report = json.load(f)
+
+        assert "devices" in report
+        assert len(report["devices"]) > 0
+
+        # Check device has expected fields
+        dev = report["devices"][0]
+        assert "device_id" in dev
+        assert "arch" in dev
+
+    def test_report_contains_duration(self, device, tmp_report_dir):
+        """Test that function_end nodes contain duration."""
+        report_path = tmp_report_dir / "report.json"
+
+        torch_input = torch.rand((1, 1, 32, 32), dtype=torch.bfloat16)
+        tt_input = ttnn.from_torch(torch_input, layout=ttnn.TILE_LAYOUT, device=device)
+
+        ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+        _ = ttnn.relu(tt_input)
+        captured_graph = ttnn.graph.end_graph_capture_to_file(report_path)
+
+        # Find function_end nodes
+        function_ends = [n for n in captured_graph if n.get("node_type") == "function_end"]
+        assert len(function_ends) > 0, "Should have function_end nodes"
+
+        # At least one should have duration
+        has_duration = any("duration_ns" in n for n in function_ends)
+        assert has_duration, "function_end nodes should have duration_ns"
+
+
+class TestDurationExtraction:
+    """Tests for duration extraction utilities."""
+
+    def test_extract_total_duration(self, device):
+        """Test extracting total capture duration."""
+        torch_input = torch.rand((1, 1, 32, 32), dtype=torch.bfloat16)
+        tt_input = ttnn.from_torch(torch_input, layout=ttnn.TILE_LAYOUT, device=device)
+
+        ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+        _ = ttnn.relu(tt_input)
+        captured_graph = ttnn.graph.end_graph_capture()
+
+        duration = graph_report.extract_total_duration_from_graph(captured_graph)
+        assert isinstance(duration, float)
+        assert duration > 0, "relu should have a positive duration"
+
+    def test_extract_operation_durations(self, device):
+        """Test extracting per-operation durations."""
+        torch_input = torch.rand((1, 1, 32, 32), dtype=torch.bfloat16)
+        tt_input = ttnn.from_torch(torch_input, layout=ttnn.TILE_LAYOUT, device=device)
+
+        ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+        _ = ttnn.relu(tt_input)
+        _ = ttnn.add(tt_input, tt_input)
+        captured_graph = ttnn.graph.end_graph_capture()
+
+        durations = graph_report.extract_operation_durations(captured_graph)
+        assert isinstance(durations, dict)
+        assert len(durations) >= 2, f"Should have at least 2 operation durations (relu, add), got {len(durations)}"
+        for name, dur in durations.items():
+            assert dur > 0, f"Duration for {name} should be positive"
+
+
+class TestGraphReportImport:
+    """Tests for the offline import functionality."""
+
+    def test_import_creates_database(self, device, tmp_report_dir):
+        """Test that import creates SQLite database."""
+        report_path = tmp_report_dir / "report.json"
+        db_dir = tmp_report_dir / "db"
+
+        torch_input = torch.rand((1, 1, 32, 32), dtype=torch.bfloat16)
+        tt_input = ttnn.from_torch(torch_input, layout=ttnn.TILE_LAYOUT, device=device)
+
+        ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+        _ = ttnn.relu(tt_input)
+        _ = ttnn.graph.end_graph_capture_to_file(report_path)
+
+        db_path = graph_report.import_report(report_path, db_dir)
+
+        assert db_path.exists()
+        assert db_path.name == "db.sqlite"
+
+    @skip_for_slow_dispatch()
+    @pytest.mark.parametrize("mesh_device", [pytest.param((2, 4), id="2x4_loudbox")], indirect=True)
+    def test_import_normalizes_buffer_chunk_device_ids_from_submesh_capture(self, mesh_device, tmp_report_dir):
+        report_path = tmp_report_dir / "submesh_report.json"
+        db_dir = tmp_report_dir / "db"
+        submesh = mesh_device.create_submesh(ttnn.MeshShape(1, 1), offset=ttnn.MeshCoordinate(0, 0))
+
+        assert submesh.id() != 0, "Submesh must have a nonzero raw ID to make normalization observable"
+
+        with ttnn.graph.full_graph_capture(str(report_path)):
+            input_tensor = ttnn.from_torch(
+                torch.ones((1, 1, 32, 32), dtype=torch.bfloat16),
+                device=submesh,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(submesh),
+                layout=ttnn.TILE_LAYOUT,
+                memory_config=ttnn.L1_MEMORY_CONFIG,
+            )
+            output_tensor = ttnn.relu(input_tensor, memory_config=ttnn.L1_MEMORY_CONFIG)
+            ttnn.synchronize_device(submesh)
+
+        assert output_tensor is not None
+        with open(report_path) as f:
+            report = json.load(f)
+
+        assert report.get("per_operation_buffers"), "Capture must exercise the per-operation buffer path"
+        assert report.get("buffer_pages_by_address"), "Capture must contain nested detailed buffer snapshots"
+
+        raw_device_ids = {device["device_id"] for device in report["devices"]}
+        raw_page_device_ids = {
+            page["device_id"]
+            for snapshots in report["buffer_pages_by_address"].values()
+            for snapshot in snapshots
+            for page in snapshot["pages"]
+        }
+        assert submesh.id() in raw_device_ids
+        assert raw_page_device_ids == {submesh.id()}
+
+        device_id_remap = {raw: normalized for normalized, raw in enumerate(sorted(raw_device_ids))}
+        expected_page_device_ids = {device_id_remap[raw] for raw in raw_page_device_ids}
+
+        db_path = graph_report.import_report(report_path, db_dir)
+        with sqlite3.connect(db_path) as conn:
+            normalized_device_ids = {row[0] for row in conn.execute("SELECT DISTINCT device_id FROM devices")}
+            normalized_buffer_ids = {row[0] for row in conn.execute("SELECT DISTINCT device_id FROM buffers")}
+            chunk_device_ids = {row[0] for row in conn.execute("SELECT DISTINCT device_id FROM buffer_chunks")}
+            orphan_count = conn.execute(
+                "SELECT COUNT(*) "
+                "FROM buffer_chunks c "
+                "LEFT JOIN devices d ON c.device_id = d.device_id AND c.rank = d.rank "
+                "WHERE d.device_id IS NULL"
+            ).fetchone()[0]
+
+        assert normalized_device_ids == set(device_id_remap.values())
+        assert normalized_buffer_ids == expected_page_device_ids
+        assert chunk_device_ids == expected_page_device_ids
+        assert orphan_count == 0
+
+    def test_import_populates_tables(self, device, tmp_report_dir):
+        """Test that import populates all expected tables."""
+        report_path = tmp_report_dir / "report.json"
+        db_dir = tmp_report_dir / "db"
+
+        torch_input = torch.rand((1, 1, 32, 32), dtype=torch.bfloat16)
+        tt_input = ttnn.from_torch(torch_input, layout=ttnn.TILE_LAYOUT, device=device)
+
+        ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+        _ = ttnn.relu(tt_input)
+        _ = ttnn.graph.end_graph_capture_to_file(report_path)
+
+        db_path = graph_report.import_report(report_path, db_dir)
+
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT COUNT(*) FROM devices")
+        assert cursor.fetchone()[0] >= 1, "devices table should have at least 1 device"
+
+        cursor.execute("SELECT COUNT(*) FROM operations")
+        op_count = cursor.fetchone()[0]
+        assert op_count >= 1, f"operations table should have at least 1 operation (relu), got {op_count}"
+
+        cursor.execute("SELECT COUNT(*) FROM captured_graph")
+        cg_count = cursor.fetchone()[0]
+        assert cg_count >= 1, f"captured_graph should have at least 1 entry, got {cg_count}"
+
+        cursor.execute("SELECT COUNT(*) FROM tensors")
+        assert cursor.fetchone()[0] >= 1, "tensors table should have at least 1 tensor"
+
+        conn.close()
+
+    def test_import_populates_comparison_records_from_runtime_sidecar(self, device, tmp_report_dir):
+        """Test comparison mode sidecar is produced at runtime and imported offline."""
+        report_path = tmp_report_dir / "report.json"
+        db_dir = tmp_report_dir / "db"
+
+        with (
+            ttnn.manage_config("enable_fast_runtime_mode", False),
+            ttnn.manage_config("enable_logging", True),
+            ttnn.manage_config("enable_comparison_mode", True),
+        ):
+            ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+            try:
+                torch_input = torch.rand((1024, 1024), dtype=torch.bfloat16)
+                input_tensor_a = ttnn.from_torch(
+                    torch_input, layout=ttnn.TILE_LAYOUT, device=device, memory_config=ttnn.L1_MEMORY_CONFIG
+                )
+                input_tensor_b = ttnn.from_torch(
+                    torch_input, layout=ttnn.TILE_LAYOUT, device=device, memory_config=ttnn.L1_MEMORY_CONFIG
+                )
+                output_tensor = ttnn.add(input_tensor_a, input_tensor_b, memory_config=ttnn.L1_MEMORY_CONFIG)
+                ttnn.to_torch(output_tensor)
+            finally:
+                if ttnn.graph.is_graph_capture_active():
+                    ttnn.graph.end_graph_capture_to_file(str(report_path))
+
+        sidecar_path = report_path.with_suffix(graph_report.COMPARISON_RECORDS_SIDECAR_SUFFIX)
+        assert sidecar_path.exists()
+
+        db_path = graph_report.import_report(report_path, db_dir)
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT tensor_id, golden_tensor_id, matches, desired_pcc, actual_pcc, rank "
+            "FROM local_tensor_comparison_records"
+        )
+        local_tensor_comparison_records = cursor.fetchall()
+
+        cursor.execute(
+            "SELECT tensor_id, golden_tensor_id, matches, desired_pcc, actual_pcc, rank "
+            "FROM global_tensor_comparison_records"
+        )
+        global_tensor_comparison_records = cursor.fetchall()
+
+        assert len(local_tensor_comparison_records) > 0
+        assert len(global_tensor_comparison_records) > 0
+
+        for tensor_id, golden_tensor_id, matches, desired_pcc, actual_pcc, record_rank in (
+            local_tensor_comparison_records + global_tensor_comparison_records
+        ):
+            assert record_rank == 0
+            assert matches
+            assert actual_pcc >= desired_pcc
+            cursor.execute("SELECT tensor_id FROM tensors WHERE tensor_id = ? AND rank = ?", (tensor_id, record_rank))
+            assert cursor.fetchone() is not None
+            cursor.execute(
+                "SELECT tensor_id FROM tensors WHERE tensor_id = ? AND rank = ?", (golden_tensor_id, record_rank)
+            )
+            assert cursor.fetchone() is not None
+
+        conn.close()
+
+    def test_import_includes_git_sha_and_url_in_report_metadata(self, device, tmp_report_dir):
+        """Importer stamps report_metadata with tt-metal origin URL and HEAD SHA when available."""
+        report_path = tmp_report_dir / "report.json"
+        db_dir = tmp_report_dir / "db"
+
+        torch_input = torch.rand((1, 1, 32, 32), dtype=torch.bfloat16)
+        tt_input = ttnn.from_torch(torch_input, layout=ttnn.TILE_LAYOUT, device=device)
+
+        ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+        _ = ttnn.relu(tt_input)
+        _ = ttnn.graph.end_graph_capture_to_file(report_path)
+
+        with open(report_path) as f:
+            report_json = json.load(f)
+        assert "metadata" in report_json
+        assert report_json["metadata"].get("git_sha")
+        assert len(report_json["metadata"]["git_sha"]) >= 40
+        assert report_json["metadata"].get("git_sha_short")
+        assert report_json["metadata"].get("version")
+        assert report_json["metadata"].get("build_type")
+        assert report_json["metadata"]["build_type"] != "Unknown"
+
+        db_path = graph_report.import_report(report_path, db_dir)
+
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT key, value FROM report_metadata WHERE key IN ('git_sha', 'git_url') ORDER BY key")
+        rows = dict(cursor.fetchall())
+        conn.close()
+
+        assert "git_sha" in rows and "git_url" in rows
+        git_meta = graph_report.get_tt_metal_git_report_metadata()
+        assert rows["git_sha"] == report_json["metadata"]["git_sha"]
+        assert rows["git_url"] == git_meta["git_url"]
+        if git_meta["git_sha"]:
+            assert len(rows["git_sha"]) >= 40
+
+
+class TestSanitizeGitRemoteUrl:
+    """``sanitize_git_remote_url`` must not persist credentials into report_metadata."""
+
+    def test_strips_userinfo_query_fragment_https(self):
+        assert (
+            graph_report.sanitize_git_remote_url("https://user:secret@github.com/org/repo.git?x=1#frag")
+            == "https://github.com/org/repo.git"
+        )
+
+    def test_strips_empty_userinfo(self):
+        assert graph_report.sanitize_git_remote_url("https://@github.com/org/repo.git") == (
+            "https://github.com/org/repo.git"
+        )
+
+    def test_strips_token_as_username(self):
+        assert graph_report.sanitize_git_remote_url("https://token@github.com/org/repo.git") == (
+            "https://github.com/org/repo.git"
+        )
+
+    def test_scp_style_drops_user(self):
+        assert graph_report.sanitize_git_remote_url("git@github.com:tenstorrent/tt-metal.git") == (
+            "github.com:tenstorrent/tt-metal.git"
+        )
+
+    def test_ssh_url_strips_userinfo(self):
+        assert graph_report.sanitize_git_remote_url("ssh://git@github.com/org/repo.git") == (
+            "ssh://github.com/org/repo.git"
+        )
+
+    def test_ipv6_host_preserved(self):
+        assert graph_report.sanitize_git_remote_url("http://[::1]:8080/path/to/repo") == (
+            "http://[::1]:8080/path/to/repo"
+        )
+
+    def test_whitespace_trimmed(self):
+        assert graph_report.sanitize_git_remote_url("  https://a@b/c  ") == "https://b/c"
+
+    def test_non_numeric_port_does_not_raise(self):
+        # urlparse parses ':org' as the port token; .port raises ValueError without the guard.
+        result = graph_report.sanitize_git_remote_url("ssh://git@github.com:org/repo.git")
+        assert "git@" not in result
+        assert "github.com" in result
+
+
+class TestReportVersion:
+    """Tests for report version handling."""
+
+    def test_version_constant_exposed(self):
+        """Test that REPORT_VERSION is exposed."""
+        assert hasattr(ttnn.graph, "REPORT_VERSION")
+        assert isinstance(ttnn.graph.REPORT_VERSION, int)
+        assert ttnn.graph.REPORT_VERSION >= 1
+
+    def test_report_has_matching_version(self, device, tmp_report_dir):
+        """Test that generated reports have correct version."""
+        report_path = tmp_report_dir / "report.json"
+
+        torch_input = torch.rand((1, 1, 32, 32), dtype=torch.bfloat16)
+        tt_input = ttnn.from_torch(torch_input, layout=ttnn.TILE_LAYOUT, device=device)
+
+        ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+        _ = ttnn.relu(tt_input)
+        _ = ttnn.graph.end_graph_capture_to_file(report_path)
+
+        with open(report_path) as f:
+            report = json.load(f)
+
+        assert report["version"] == ttnn.graph.REPORT_VERSION
+
+
+class TestBufferChunksSchemaAndAggregation:
+    """Schema, version, and per-(op, device, addr, bank, core) aggregation tests
+    for the ``buffer_chunks`` table that replaced the legacy ``buffer_pages``.
+
+    The schema/version tests drive the real ``import_report`` path via
+    ``_make_report`` + ``_import_to_db`` and verify behaviour by querying the
+    resulting database; the pure aggregation tests at the bottom exercise
+    ``_aggregate_pages_to_chunks`` directly with no DB."""
+
+    # Minimum buffer_chunks landed at "3.0"; any later 3.x is also acceptable.
+    # Pinning a literal would force lockstep edits on every unrelated schema
+    # bump, so we assert the floor instead.
+    MIN_SCHEMA_VERSION = (3, 0)
+
+    @staticmethod
+    def _semver_tuple(value):
+        """Parse a dotted version string (``"3.0"``, ``"3.1.4"``) into a tuple of ints."""
+        return tuple(int(p) for p in str(value).split("."))
+
+    @staticmethod
+    def _minimal_report():
+        """Smallest report ``import_report`` accepts: capture_start only, no buffers."""
+        return _make_report([{"counter": 0, "node_type": "capture_start", "params": {}, "connections": []}])
+
+    def test_schema_version_meets_minimum_for_buffer_chunks(self, tmp_path):
+        """The ``schema_version`` written by ``import_report`` is >= the buffer_chunks floor."""
+        conn, cursor = _import_to_db(self._minimal_report(), tmp_path)
+        try:
+            row = cursor.execute("SELECT value FROM report_metadata WHERE key = 'schema_version'").fetchone()
+            assert row is not None, "schema_version not persisted to report_metadata"
+            assert (
+                self._semver_tuple(row[0]) >= self.MIN_SCHEMA_VERSION
+            ), f"schema_version {row[0]!r} predates the buffer_chunks landing"
+        finally:
+            conn.close()
+
+    def test_buffer_chunks_table_is_queryable_with_expected_columns(self, tmp_path):
+        """A ``SELECT`` over every column ttnn-visualizer's ``BufferChunk`` reads succeeds.
+
+        Querying by name (rather than introspecting ``sqlite_master``/``PRAGMA``) means
+        a missing or renamed column raises ``OperationalError`` and fails the test."""
+        conn, cursor = _import_to_db(self._minimal_report(), tmp_path)
+        try:
+            cursor.execute(
+                "SELECT operation_id, device_id, address, bank_id, core_x, core_y, "
+                "chunk_address, chunk_size, page_size, num_pages, buffer_type FROM buffer_chunks"
+            )
+            cursor.fetchall()
+        finally:
+            conn.close()
+
+    def test_legacy_buffer_pages_table_is_not_created(self, tmp_path):
+        """The new importer must not create the legacy ``buffer_pages`` table."""
+        conn, cursor = _import_to_db(self._minimal_report(), tmp_path)
+        try:
+            tables = {
+                row[0] for row in cursor.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            assert "buffer_chunks" in tables
+            assert "buffer_pages" not in tables
+        finally:
+            conn.close()
+
+    def test_buffer_pages_fallback_populates_buffer_chunks(self, tmp_path):
+        """A legacy ``buffer_pages`` snapshot in the report is aggregated into ``buffer_chunks``.
+
+        Builds a tiny report with the fallback per-page format (no
+        ``buffer_pages_by_address`` / ``per_operation_buffers``), imports it,
+        and checks that the aggregated row carries the expected math: chunk
+        covers the page-address span, ``num_pages`` reflects input count."""
+        report = self._minimal_report()
+        report["devices"] = [{"device_id": 7}]
+        # Three contiguous L1 pages on one core at address 1000.
+        report["buffer_pages"] = [
+            {
+                "device_id": 7,
+                "address": 1000,
+                "core_x": 0,
+                "core_y": 0,
+                "bank_id": 64,
+                "page_index": i,
+                "page_address": i * 2048,
+                "page_size": 2048,
+                "buffer_type": 1,
+            }
+            for i in range(3)
+        ]
+        conn, cursor = _import_to_db(report, tmp_path)
+        try:
+            rows = cursor.execute(
+                "SELECT device_id, address, bank_id, core_x, core_y, "
+                "chunk_address, chunk_size, page_size, num_pages, buffer_type FROM buffer_chunks"
+            ).fetchall()
+            assert len(rows) == 1, f"expected 1 aggregated chunk, got {rows}"
+            dev, addr, bank, cx, cy, chunk_addr, chunk_size, page_size, num_pages, btype = rows[0]
+            assert (dev, addr, bank, cx, cy) == (0, 1000, 64, 0, 0)
+            assert (chunk_addr, chunk_size, page_size, num_pages, btype) == (0, 3 * 2048, 2048, 3, 1)
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _page(device_id, address, core_x, core_y, bank_id, page_index, page_address, page_size=2048, buffer_type=1):
+        """Build a page tuple in the order produced by ``_parse_page``:
+        ``(device_id, address, core_y, core_x, bank_id, page_index, page_address,
+        page_size, buffer_type)``."""
+        return (device_id, address, core_y, core_x, bank_id, page_index, page_address, page_size, buffer_type)
+
+    def test_aggregate_empty_pages(self):
+        """Empty input yields zero chunk rows."""
+        assert graph_report._aggregate_pages_to_chunks(op_id=1, pages=[]) == []
+
+    def test_aggregate_single_core_collapses_contiguous_pages(self):
+        """A single core's contiguous pages collapse to one chunk with correct math."""
+        pages = [
+            self._page(device_id=1, address=1000, core_x=0, core_y=0, bank_id=64, page_index=i, page_address=i * 2048)
+            for i in range(10)
+        ]
+        rows = graph_report._aggregate_pages_to_chunks(op_id=7, pages=pages)
+        assert len(rows) == 1
+        op, dev, addr, bank, cx, cy, chunk_addr, chunk_size, page_size, num_pages, btype, row_rank = rows[0]
+        assert (op, dev, addr, bank, cx, cy) == (7, 1, 1000, 64, 0, 0)
+        assert (chunk_addr, chunk_size, page_size, num_pages, btype, row_rank) == (0, 10 * 2048, 2048, 10, 1, 0)
+
+    def test_aggregate_preserves_per_core_asymmetry(self):
+        """Different cores hosting different page counts produce independent rows."""
+        pages = []
+        # Three cores with 10/10/3 pages — last core has a partial trailing shard.
+        for core_x, n_pages in [(0, 10), (1, 10), (2, 3)]:
+            for i in range(n_pages):
+                pages.append(
+                    self._page(
+                        device_id=1,
+                        address=1000,
+                        core_x=core_x,
+                        core_y=0,
+                        bank_id=64 + core_x,
+                        page_index=i,
+                        page_address=i * 2048,
+                    )
+                )
+
+        rows = graph_report._aggregate_pages_to_chunks(op_id=42, pages=pages)
+        by_core = {(r[4], r[5]): r for r in rows}
+        assert set(by_core.keys()) == {(0, 0), (1, 0), (2, 0)}
+
+        for (cx, _cy), expected_num in [((0, 0), 10), ((1, 0), 10), ((2, 0), 3)]:
+            row = by_core[(cx, 0)]
+            chunk_addr, chunk_size, page_size, num_pages = row[6], row[7], row[8], row[9]
+            assert num_pages == expected_num
+            assert chunk_addr == 0
+            assert chunk_size == expected_num * 2048
+            assert page_size == 2048
+
+    def test_aggregate_separates_groups_by_address_and_buffer_type(self):
+        """Distinct addresses (or buffer types) on the same core produce distinct rows."""
+        pages = [
+            # Two pages of L1 buffer at addr=1000 on core (0,0)/bank 64
+            self._page(1, 1000, 0, 0, 64, 0, 0, page_size=2048, buffer_type=1),
+            self._page(1, 1000, 0, 0, 64, 1, 2048, page_size=2048, buffer_type=1),
+            # One page of DRAM buffer at addr=5000 on same core (different bank)
+            self._page(1, 5000, 0, 0, 70, 0, 0, page_size=4096, buffer_type=0),
+        ]
+        rows = graph_report._aggregate_pages_to_chunks(op_id=1, pages=pages)
+        assert len(rows) == 2
+        by_addr = {r[2]: r for r in rows}
+        assert by_addr[1000][9] == 2 and by_addr[1000][10] == 1  # num_pages=2, buffer_type=1
+        assert by_addr[5000][9] == 1 and by_addr[5000][10] == 0  # num_pages=1, buffer_type=0
+
+
+class TestResNet50Patterns:
+    """
+    Tests for patterns observed in the ResNet50 reference database:
+    - Host weight tensors used as inputs to conv2d operations
+    - Deallocate operations (no output tensors)
+    - Multiple buffer types and layouts (DRAM, L1, L1_SMALL)
+    - Large number of cumulative buffers per operation
+    - Operations with multiple input/output tensors
+    """
+
+    MOCK_RESNET_GRAPH = [
+        # capture_start
+        {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1, 7, 13, 19, 25]},
+        # Op 1: ttnn.to_device (host tensor -> device tensor)
+        {
+            "counter": 1,
+            "node_type": "function_start",
+            "params": {"name": "ttnn.to_device", "inputs": "1"},
+            "connections": [],
+            "input_tensors": [2],
+        },
+        {
+            "counter": 2,
+            "node_type": "tensor",
+            "params": {
+                "tensor_id": "0",
+                "shape": "Shape([64, 16, 4, 4])",
+                "dtype": "DataType::FLOAT32",
+                "layout": "Layout::ROW_MAJOR",
+            },
+            "connections": [],
+        },
+        {
+            "counter": 3,
+            "node_type": "buffer_allocate",
+            "params": {
+                "size": "65536",
+                "type": "DRAM",
+                "buffer_type": "0",
+                "layout": "INTERLEAVED",
+                "device_id": "0",
+                "address": "1000",
+            },
+            "connections": [],
+        },
+        {
+            "counter": 4,
+            "node_type": "tensor",
+            "params": {
+                "tensor_id": "1",
+                "shape": "Shape([64, 16, 4, 4])",
+                "dtype": "DataType::BFLOAT16",
+                "layout": "Layout::TILE",
+                "device_id": "0",
+                "address": "1000",
+                "buffer_type": "0",
+                "memory_config": "MemoryConfig(DRAM)",
+            },
+            "connections": [],
+        },
+        {
+            "counter": 5,
+            "node_type": "function_end",
+            "params": {"name": "ttnn.to_device"},
+            "connections": [4],
+            "duration_ns": 100,
+        },
+        # Op 2: conv2d (host weight + device activation -> device output)
+        {
+            "counter": 6,
+            "node_type": "tensor",
+            "params": {
+                "tensor_id": "10",
+                "shape": "Shape([64, 64, 3, 3])",
+                "dtype": "DataType::FLOAT32",
+                "layout": "Layout::ROW_MAJOR",
+            },
+            "connections": [],
+        },
+        {
+            "counter": 7,
+            "node_type": "function_start",
+            "params": {"name": "ttnn::conv2d", "inputs": "3"},
+            "connections": [],
+            "input_tensors": [4, 6],
+            "arguments": ["activation_tensor", "weight_tensor", "bias_tensor"],
+        },
+        {
+            "counter": 8,
+            "node_type": "buffer_allocate",
+            "params": {
+                "size": "176128",
+                "type": "DRAM",
+                "buffer_type": "0",
+                "layout": "INTERLEAVED",
+                "device_id": "0",
+                "address": "2000",
+            },
+            "connections": [],
+        },
+        {
+            "counter": 9,
+            "node_type": "buffer_allocate",
+            "params": {
+                "size": "4096",
+                "type": "L1",
+                "buffer_type": "1",
+                "layout": "HEIGHT_SHARDED",
+                "device_id": "0",
+                "address": "5000",
+                "num_cores": "64",
+            },
+            "connections": [],
+        },
+        {
+            "counter": 10,
+            "node_type": "tensor",
+            "params": {
+                "tensor_id": "2",
+                "shape": "Shape([1, 1, 3136, 64])",
+                "dtype": "DataType::BFLOAT16",
+                "layout": "Layout::TILE",
+                "device_id": "0",
+                "address": "2000",
+                "buffer_type": "0",
+                "memory_config": "MemoryConfig(DRAM)",
+            },
+            "connections": [],
+        },
+        {
+            "counter": 11,
+            "node_type": "function_end",
+            "params": {"name": "ttnn::conv2d"},
+            "connections": [10],
+            "duration_ns": 5000,
+        },
+        # Op 3: add_ (two device tensors -> device output)
+        {
+            "counter": 12,
+            "node_type": "tensor",
+            "params": {
+                "tensor_id": "3",
+                "shape": "Shape([1, 1, 3136, 64])",
+                "dtype": "DataType::BFLOAT16",
+                "layout": "Layout::TILE",
+                "device_id": "0",
+                "address": "3000",
+                "buffer_type": "1",
+                "memory_config": "MemoryConfig(L1)",
+            },
+            "connections": [],
+        },
+        {
+            "counter": 13,
+            "node_type": "function_start",
+            "params": {"name": "ttnn::add_", "inputs": "2"},
+            "connections": [],
+            "input_tensors": [10, 12],
+        },
+        {
+            "counter": 14,
+            "node_type": "buffer_allocate",
+            "params": {
+                "size": "8192",
+                "type": "L1",
+                "buffer_type": "1",
+                "layout": "INTERLEAVED",
+                "device_id": "0",
+                "address": "4000",
+            },
+            "connections": [],
+        },
+        {
+            "counter": 15,
+            "node_type": "tensor",
+            "params": {
+                "tensor_id": "4",
+                "shape": "Shape([1, 1, 3136, 64])",
+                "dtype": "DataType::BFLOAT16",
+                "layout": "Layout::TILE",
+                "device_id": "0",
+                "address": "4000",
+                "buffer_type": "1",
+                "memory_config": "MemoryConfig(L1)",
+            },
+            "connections": [],
+        },
+        {
+            "counter": 16,
+            "node_type": "function_end",
+            "params": {"name": "ttnn::add_"},
+            "connections": [15],
+            "duration_ns": 200,
+        },
+        # Deallocate: C++ only emits buffer_deallocate (function tracking is not wrapped).
+        # The importer synthesizes an operation from this node.
+        # connections points to the buffer node (counter 8) which connects to tensor (counter 10).
+        {
+            "counter": 17,
+            "node_type": "buffer_deallocate",
+            "params": {"address": "2000", "size": "176128", "type": "DRAM", "buffer_type": "0", "device_id": "0"},
+            "connections": [8],
+        },
+        # capture_end
+        {"counter": 25, "node_type": "capture_end", "params": {}, "connections": []},
+    ]
+
+    MOCK_DEVICE_INFO = [
+        {
+            "device_id": 0,
+            "num_dram_channels": 12,
+            "l1_num_banks": 64,
+            "num_y_cores": 8,
+            "num_x_cores": 8,
+            "num_y_compute_cores": 8,
+            "num_x_compute_cores": 8,
+            "num_storage_cores": 0,
+            "worker_l1_size": 1499136,
+            "l1_bank_size": 23424,
+        }
+    ]
+
+    def _import_resnet(self, tmp_path):
+        report = _make_report(self.MOCK_RESNET_GRAPH, devices=self.MOCK_DEVICE_INFO)
+        return _import_to_db(report, tmp_path)
+
+    def test_host_weight_tensors_kept_in_compatible_mode(self, tmp_path):
+        """Host weight tensors referenced as inputs must be preserved in compatible mode."""
+        conn, cursor = self._import_resnet(tmp_path)
+
+        cursor.execute("SELECT tensor_id, device_id FROM tensors WHERE device_id IS NULL")
+        host_tensors = cursor.fetchall()
+        # tensor_id 0 (input to to_device) + tensor_id 10 (conv2d weight)
+        assert (
+            len(host_tensors) == 2
+        ), f"Expected 2 host tensors (to_device input + conv weight), got {len(host_tensors)}"
+
+        # Verify each host tensor is referenced in input_tensors
+        for tid, _ in host_tensors:
+            tid_int = int(tid) if isinstance(tid, str) else tid
+            cursor.execute("SELECT COUNT(*) FROM input_tensors WHERE tensor_id = ?", (tid_int,))
+            refs = cursor.fetchone()[0]
+            assert refs > 0, f"Host tensor {tid} should be referenced in input_tensors"
+        conn.close()
+
+    def test_deallocate_ops_have_no_output_tensors(self, tmp_path):
+        """Deallocate operations should have input tensors but no output tensors."""
+        conn, cursor = self._import_resnet(tmp_path)
+
+        cursor.execute("SELECT operation_id, name FROM operations WHERE name LIKE '%deallocate%'")
+        dealloc_ops = cursor.fetchall()
+        assert len(dealloc_ops) == 1, f"Expected 1 deallocate op, got {len(dealloc_ops)}"
+
+        op_id = dealloc_ops[0][0]
+
+        cursor.execute("SELECT COUNT(*) FROM input_tensors WHERE operation_id = ?", (op_id,))
+        input_count = cursor.fetchone()[0]
+        assert input_count == 1, f"Deallocate should have 1 input, got {input_count}"
+
+        cursor.execute("SELECT COUNT(*) FROM output_tensors WHERE operation_id = ?", (op_id,))
+        output_count = cursor.fetchone()[0]
+        assert output_count == 0, f"Deallocate should have 0 outputs, got {output_count}"
+        conn.close()
+
+    def test_conv2d_has_host_and_device_inputs(self, tmp_path):
+        """Conv2d should accept both host weight tensors and device activation tensors as inputs."""
+        conn, cursor = self._import_resnet(tmp_path)
+
+        cursor.execute("SELECT operation_id FROM operations WHERE name = 'ttnn::conv2d'")
+        conv_op = cursor.fetchone()
+        assert conv_op is not None, "Should have a conv2d operation"
+
+        cursor.execute(
+            """
+            SELECT t.tensor_id, t.device_id
+            FROM input_tensors it JOIN tensors t ON it.tensor_id = t.tensor_id
+            WHERE it.operation_id = ?
+            ORDER BY it.input_index
+        """,
+            (conv_op[0],),
+        )
+        inputs = cursor.fetchall()
+
+        device_inputs = [r for r in inputs if r[1] is not None]
+        host_inputs = [r for r in inputs if r[1] is None]
+        assert len(device_inputs) >= 1, f"Conv2d should have at least 1 device input, got {len(device_inputs)}"
+        assert len(host_inputs) >= 1, f"Conv2d should have at least 1 host weight input, got {len(host_inputs)}"
+        conn.close()
+
+    def test_multiple_buffer_types(self, tmp_path):
+        """Buffers should support DRAM and L1 buffer types."""
+        conn, cursor = self._import_resnet(tmp_path)
+
+        cursor.execute("SELECT DISTINCT buffer_type FROM buffers ORDER BY buffer_type")
+        type_values = {r[0] for r in cursor.fetchall()}
+        assert len(type_values) >= 2, f"Should have at least DRAM and L1 buffer types, got {type_values}"
+        assert 0 in type_values, "Missing buffer_type 0 (DRAM)"
+        assert 1 in type_values, "Missing buffer_type 1 (L1)"
+        conn.close()
+
+    def test_cumulative_buffers_reflect_allocations_and_deallocations(self, tmp_path):
+        """
+        Buffer counts should grow with allocations and shrink with deallocations.
+        Op 1 (to_device): 1 DRAM buffer allocated -> 1 total
+        Op 2 (conv2d): 2 more buffers (DRAM + L1) -> 3 total
+        Op 3 (add_): 1 more L1 buffer -> 4 total
+        Op 4 (deallocate): 1 DRAM buffer deallocated before op -> 3 total
+        """
+        conn, cursor = self._import_resnet(tmp_path)
+
+        cursor.execute(
+            """
+            SELECT operation_id, COUNT(*) FROM buffers
+            GROUP BY operation_id ORDER BY operation_id
+        """
+        )
+        rows = cursor.fetchall()
+        counts_by_op = {r[0]: r[1] for r in rows}
+        assert len(counts_by_op) >= 3, f"Should have at least 3 ops with buffers, got {len(counts_by_op)}"
+
+        op_ids = sorted(counts_by_op.keys())
+        assert counts_by_op[op_ids[0]] == 1, f"First op should have 1 buffer, got {counts_by_op[op_ids[0]]}"
+        assert counts_by_op[op_ids[1]] == 3, f"Second op should have 3 buffers, got {counts_by_op[op_ids[1]]}"
+        assert counts_by_op[op_ids[2]] == 4, f"Third op should have 4 buffers, got {counts_by_op[op_ids[2]]}"
+        if len(op_ids) >= 4:
+            assert (
+                counts_by_op[op_ids[3]] == 3
+            ), f"Fourth op (post-dealloc) should have 3 buffers, got {counts_by_op[op_ids[3]]}"
+        conn.close()
+
+    def test_captured_graph_per_operation(self, tmp_path):
+        """Each operation should have a captured_graph entry."""
+        conn, cursor = self._import_resnet(tmp_path)
+
+        cursor.execute("SELECT COUNT(*) FROM operations")
+        op_count = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM captured_graph")
+        cg_count = cursor.fetchone()[0]
+        assert cg_count == op_count, f"Expected {op_count} captured_graph rows, got {cg_count}"
+        conn.close()
+
+    def test_operation_ids_start_at_one(self, tmp_path):
+        """Operation IDs should start at 1 (1-based indexing)."""
+        conn, cursor = self._import_resnet(tmp_path)
+
+        cursor.execute("SELECT MIN(operation_id), MAX(operation_id), COUNT(*) FROM operations")
+        min_id, max_id, count = cursor.fetchone()
+        assert min_id == 1, f"First operation_id should be 1, got {min_id}"
+        conn.close()
+
+    def test_all_input_output_tensors_reference_valid_ids(self, tmp_path):
+        """All tensor references in input/output tables should exist in the tensors table."""
+        conn, cursor = self._import_resnet(tmp_path)
+
+        cursor.execute("SELECT tensor_id FROM tensors")
+        valid_ids = {int(r[0]) if isinstance(r[0], str) else r[0] for r in cursor.fetchall()}
+
+        cursor.execute("SELECT operation_id, tensor_id FROM input_tensors")
+        for op_id, tid in cursor.fetchall():
+            tid_int = int(tid) if isinstance(tid, str) else tid
+            assert tid_int in valid_ids, f"input_tensors op={op_id} references tensor {tid} not in tensors table"
+
+        cursor.execute("SELECT operation_id, tensor_id FROM output_tensors")
+        for op_id, tid in cursor.fetchall():
+            tid_int = int(tid) if isinstance(tid, str) else tid
+            assert tid_int in valid_ids, f"output_tensors op={op_id} references tensor {tid} not in tensors table"
+        conn.close()
+
+
+@pytest.mark.skipif(not is_wormhole_b0(), reason="Requires Wormhole B0")
+class TestLinearModelE2E:
+    """
+    End-to-end test: run ttnn.ones + ttnn.linear on real hardware,
+    capture graph to JSON, import to SQLite, and validate structural properties.
+    """
+
+    def test_linear_model_structural_properties(self, device, tmp_path):
+        report_path = tmp_path / "linear_report.json"
+
+        ttnn.graph.enable_python_stack_traces()
+        try:
+            with ttnn.manage_config("enable_fast_runtime_mode", False), ttnn.manage_config(
+                "enable_logging", True
+            ), ttnn.manage_config("enable_graph_report", True):
+                ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+                a = ttnn.ones([1024, 1024], layout=ttnn.TILE_LAYOUT, device=device)
+                b = ttnn.ones([1024, 1024], layout=ttnn.TILE_LAYOUT, device=device)
+                c = ttnn.ones([1, 1024], layout=ttnn.TILE_LAYOUT, device=device)
+                ttnn.linear(a, b, bias=c)
+                ttnn.graph.end_graph_capture_to_file(report_path)
+        finally:
+            ttnn.graph.disable_python_stack_traces()
+
+        assert report_path.exists(), "Report JSON should be created"
+
+        output_dir = tmp_path / "output"
+        db_path = graph_report.import_report(report_path, output_dir)
+        assert db_path.exists(), "Imported DB should be created"
+
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+
+        c.execute("SELECT COUNT(*) FROM operations")
+        op_count = c.fetchone()[0]
+        assert op_count >= 4, f"Expected at least 4 operations, got {op_count}"
+
+        c.execute("SELECT COUNT(*) FROM tensors WHERE device_id IS NOT NULL")
+        device_count = c.fetchone()[0]
+        assert device_count >= 4, f"Expected at least 4 device tensors, got {device_count}"
+
+        c.execute("SELECT COUNT(*) FROM input_tensors")
+        input_count = c.fetchone()[0]
+        assert input_count >= 3, f"Expected at least 3 input_tensor rows, got {input_count}"
+
+        c.execute("SELECT COUNT(*) FROM output_tensors")
+        output_count = c.fetchone()[0]
+        assert output_count >= 4, f"Expected at least 4 output_tensor rows, got {output_count}"
+
+        c.execute(
+            """
+            SELECT COUNT(*) FROM input_tensors it
+            LEFT JOIN tensors t ON it.tensor_id = t.tensor_id
+            WHERE t.tensor_id IS NULL
+        """
+        )
+        dangling = c.fetchone()[0]
+        assert dangling == 0, f"{dangling} dangling input_tensors references"
+
+        c.execute(
+            """
+            SELECT COUNT(*) FROM output_tensors ot
+            LEFT JOIN tensors t ON ot.tensor_id = t.tensor_id
+            WHERE t.tensor_id IS NULL
+        """
+        )
+        dangling = c.fetchone()[0]
+        assert dangling == 0, f"{dangling} dangling output_tensors references"
+
+        c.execute("SELECT COUNT(*) FROM buffers")
+        buf_count = c.fetchone()[0]
+        assert buf_count >= 5, f"Expected at least 5 buffer rows, got {buf_count}"
+
+        c.execute("SELECT max_size_per_bank FROM buffers")
+        for (size,) in c.fetchall():
+            assert size < 10_000_000, f"max_size_per_bank={size} looks like a total size, not per-bank"
+
+        c.execute("SELECT COUNT(*) FROM captured_graph")
+        cg_count = c.fetchone()[0]
+        assert cg_count == op_count, f"Expected {op_count} captured_graph rows, got {cg_count}"
+
+        c.execute("SELECT COUNT(*) FROM stack_traces")
+        st_count = c.fetchone()[0]
+        assert st_count > 0, f"Expected at least one stack_trace row (from Python), got {st_count}"
+
+        conn.close()
+
+
+@pytest.fixture
+def imagenet_label_dict():
+    import ast
+
+    path = Path("models/sample_data/imagenet_class_labels.txt")
+    assert path.exists(), f"ImageNet labels not found at {path}"
+    with open(path, "r") as f:
+        return ast.literal_eval(f.read())
+
+
+@pytest.mark.skipif(not is_wormhole_b0(), reason="Requires Wormhole B0")
+@pytest.mark.timeout(600)
+@pytest.mark.parametrize("device_params", [{"l1_small_size": 24576}], indirect=True)
+@pytest.mark.parametrize(
+    "batch_size, input_loc",
+    ((16, "models/demos/vision/classification/resnet50/ttnn_resnet/demo/images/"),),
+)
+def test_resnet50_e2e_graph_capture(
+    mesh_device, batch_size, input_loc, imagenet_label_dict, model_location_generator, tmp_path
+):
+    """Run ResNet50 inference, capture graph, import to DB, and validate structural properties."""
+    from models.demos.vision.classification.resnet50.ttnn_resnet.demo.demo import run_resnet_inference
+
+    report_path = tmp_path / "resnet50_report.json"
+
+    ttnn.graph.enable_python_stack_traces()
+    try:
+        with ttnn.manage_config("enable_fast_runtime_mode", False):
+            ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+            run_resnet_inference(batch_size, input_loc, imagenet_label_dict, mesh_device, model_location_generator)
+            ttnn.graph.end_graph_capture_to_file(report_path)
+    finally:
+        ttnn.graph.disable_python_stack_traces()
+
+    assert report_path.exists(), "Report JSON should be created"
+
+    output_dir = tmp_path / "output"
+    db_path = graph_report.import_report(report_path, output_dir)
+    assert db_path.exists(), "Imported DB should be created"
+
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+
+    c.execute("SELECT COUNT(*) FROM operations")
+    op_count = c.fetchone()[0]
+    assert op_count >= 300, f"Expected at least 300 operations, got {op_count}"
+
+    c.execute("SELECT name, COUNT(*) FROM operations GROUP BY name ORDER BY COUNT(*) DESC")
+    op_dist = dict(c.fetchall())
+    assert op_dist.get("ttnn.conv2d", 0) == 159, f"Expected 159 conv2d ops, got {op_dist.get('ttnn.conv2d', 0)}"
+    assert (
+        op_dist.get("ttnn.deallocate", 0) == 51
+    ), f"Expected 51 deallocate ops, got {op_dist.get('ttnn.deallocate', 0)}"
+    assert op_dist.get("ttnn.add_", 0) == 48, f"Expected 48 add_ ops, got {op_dist.get('ttnn.add_', 0)}"
+
+    c.execute("SELECT COUNT(*) FROM tensors WHERE device_id IS NULL")
+    host_count = c.fetchone()[0]
+    assert host_count > 0, "Expected host tensors (weights)"
+
+    c.execute("SELECT COUNT(*) FROM tensors WHERE device_id IS NOT NULL")
+    device_count = c.fetchone()[0]
+    assert device_count > 0, "Expected device tensors"
+
+    c.execute("SELECT COUNT(*) FROM input_tensors")
+    input_count = c.fetchone()[0]
+    assert input_count >= 600, f"Expected at least 600 input_tensor rows, got {input_count}"
+
+    c.execute("SELECT COUNT(*) FROM output_tensors")
+    output_count = c.fetchone()[0]
+    assert output_count >= 300, f"Expected at least 300 output_tensor rows, got {output_count}"
+
+    c.execute(
+        """
+        SELECT COUNT(*) FROM input_tensors it
+        LEFT JOIN tensors t ON it.tensor_id = t.tensor_id
+        WHERE t.tensor_id IS NULL
+    """
+    )
+    dangling = c.fetchone()[0]
+    assert dangling == 0, f"{dangling} dangling input_tensors references"
+
+    c.execute(
+        """
+        SELECT COUNT(*) FROM output_tensors ot
+        LEFT JOIN tensors t ON ot.tensor_id = t.tensor_id
+        WHERE t.tensor_id IS NULL
+    """
+    )
+    dangling = c.fetchone()[0]
+    assert dangling == 0, f"{dangling} dangling output_tensors references"
+
+    c.execute(
+        """
+        SELECT COUNT(*) FROM operations o
+        WHERE o.name = 'ttnn.deallocate'
+        AND EXISTS (SELECT 1 FROM input_tensors it WHERE it.operation_id = o.operation_id)
+        AND NOT EXISTS (SELECT 1 FROM output_tensors ot WHERE ot.operation_id = o.operation_id)
+    """
+    )
+    dealloc_correct = c.fetchone()[0]
+    assert dealloc_correct == 51, f"Expected 51 deallocate ops with input+no-output, got {dealloc_correct}"
+
+    c.execute("SELECT COUNT(*) FROM buffers")
+    buf_count = c.fetchone()[0]
+    assert buf_count > 0, "Expected non-zero buffers"
+
+    c.execute("SELECT COUNT(*) FROM captured_graph")
+    cg_count = c.fetchone()[0]
+    assert cg_count == op_count, f"Expected {op_count} captured_graph rows, got {cg_count}"
+
+    c.execute("SELECT COUNT(*) FROM stack_traces")
+    st_count = c.fetchone()[0]
+    assert st_count > 0, f"Expected at least one stack_trace row (from Python), got {st_count}"
+
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for Python-level graph helpers (graph.py)
+# ---------------------------------------------------------------------------
+class TestSafeArgStr:
+    """Tests for ttnn.graph._safe_arg_str - safe argument stringification."""
+
+    def test_plain_int(self):
+        from ttnn.graph import _safe_arg_str
+
+        assert _safe_arg_str(42) == "42"
+
+    def test_plain_string(self):
+        from ttnn.graph import _safe_arg_str
+
+        assert _safe_arg_str("hello") == "hello"
+
+    def test_plain_float(self):
+        from ttnn.graph import _safe_arg_str
+
+        assert _safe_arg_str(3.14) == "3.14"
+
+    def test_none(self):
+        from ttnn.graph import _safe_arg_str
+
+        assert _safe_arg_str(None) == "None"
+
+    def test_bool(self):
+        from ttnn.graph import _safe_arg_str
+
+        assert _safe_arg_str(True) == "True"
+
+    def test_torch_tensor(self):
+        from ttnn.graph import _safe_arg_str
+
+        t = torch.randn(2, 3)
+        result = _safe_arg_str(t)
+        assert "torch.Tensor" in result
+        assert "[2, 3]" in result
+        assert "float32" in result
+
+    def test_torch_tensor_does_not_print_data(self):
+        from ttnn.graph import _safe_arg_str
+
+        t = torch.randn(100, 100)
+        result = _safe_arg_str(t)
+        assert len(result) < 200, "Should be compact, not the full tensor data"
+
+    def test_list_not_recursed(self):
+        from ttnn.graph import _safe_arg_str
+
+        result = _safe_arg_str([1, 2, 3])
+        assert result == "[1, 2, 3]"
+
+    def test_enum_value(self):
+        from ttnn.graph import _safe_arg_str
+
+        result = _safe_arg_str(ttnn.TILE_LAYOUT)
+        assert "TILE" in result
+
+    def test_unprintable_str_fallback(self):
+        """An exception from __str__ produces a diagnostic placeholder."""
+        from ttnn.graph import _safe_arg_str
+
+        class BadStr:
+            def __str__(self):
+                """Raise to exercise the safe stringification fallback."""
+                raise ValueError("boom")
+
+        assert _safe_arg_str(BadStr()) == "<unprintable BadStr: ValueError: boom>"
+
+    def test_tensor_sequence_is_summarized_not_dumped(self, device):
+        """A list of ttnn.Tensors is summarized element-wise, never str()'d.
+
+        str() on the list would repr() each tensor, reading it back to host -- fatal inside a
+        device trace capture and a tensor-content dump in the report otherwise.
+        """
+        from ttnn.graph import _safe_arg_str
+
+        tensors = [
+            ttnn.from_torch(torch.rand(32, 32), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+            for _ in range(2)
+        ]
+        result = _safe_arg_str(tensors)
+
+        assert result.startswith("[ttnn.Tensor(") and result.endswith(")]"), f"unexpected summary: {result}"
+        assert result.count("ttnn.Tensor(") == 2, f"expected 2 tensor summaries: {result}"
+        assert "shape=Shape([32, 32])" in result, f"tensor shape missing from summary: {result}"
+        # No raw tensor data: a dumped tensor renders its rows as "ttnn.Tensor([[".
+        assert "ttnn.Tensor([[" not in result, f"tensor contents dumped into the summary: {result}"
+
+    def test_nested_sequence_is_summarized_not_dumped(self, device):
+        """A tensor nested inside a sequence is summarized too, never str()'d.
+
+        The recursion matters as much as the top-level case: str() on the outer list reprs the
+        inner one, which reprs the tensor -- the same forbidden device read.
+        """
+        from ttnn.graph import _safe_arg_str
+
+        tensor = ttnn.from_torch(torch.rand(32, 32), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        result = _safe_arg_str([[tensor], (tensor,)])
+
+        assert result.count("ttnn.Tensor(") == 2, f"expected both nested tensors summarized: {result}"
+        assert "[[ttnn.Tensor(" in result, f"list nesting not preserved: {result}"
+        assert "(ttnn.Tensor(" in result, f"tuple nesting not preserved: {result}"
+        assert "ttnn.Tensor([[" not in result, f"tensor contents dumped into the summary: {result}"
+
+    def test_torch_tensor_sequence_is_summarized_not_dumped(self):
+        """A sequence of torch tensors is summarized: no contents in the report."""
+        from ttnn.graph import _safe_arg_str
+
+        result = _safe_arg_str([torch.rand(4, 4), torch.rand(4, 4)])
+
+        assert result.count("torch.Tensor(shape=[4, 4]") == 2, f"expected 2 torch summaries: {result}"
+        assert "tensor(" not in result, f"torch tensor contents dumped into the summary: {result}"
+
+    def test_long_tensor_sequence_is_elided(self, device):
+        """Past the element cap the tail is elided, and the marker says so.
+
+        The generator keys on that marker to refuse a partially-recorded sequence, so its exact
+        shape is part of the contract.
+        """
+        from ttnn.graph import _MAX_SEQUENCE_ELEMENTS, _safe_arg_str
+
+        tensor = ttnn.from_torch(torch.rand(32, 32), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        count = _MAX_SEQUENCE_ELEMENTS + 3
+        result = _safe_arg_str([tensor] * count)
+
+        assert result.count("ttnn.Tensor(") == _MAX_SEQUENCE_ELEMENTS, f"wrong number summarized: {result[:200]}"
+        assert result.endswith("... +3 more]"), f"missing elision marker: {result[-40:]}"
+
+
+class TestRecordPythonOperation:
+    """Tests for ttnn.graph.record_python_operation."""
+
+    def setup_method(self):
+        import ttnn.graph as g
+
+        g._python_io_data = []
+        g.enable_python_stack_traces()
+
+    def test_records_kwargs(self):
+        import ttnn.graph as g
+
+        g.record_python_operation("ttnn.relu", (), {"memory_config": "DRAM"})
+        assert len(g._python_io_data) == 1
+        entry = g._python_io_data[0]
+        assert entry["name"] == "ttnn.relu"
+        assert entry["arguments"]["memory_config"] == "DRAM"
+
+    def test_records_positional_args(self):
+        import ttnn.graph as g
+
+        g.record_python_operation("ttnn.add", (10, 20), {})
+        entry = g._python_io_data[0]
+        assert entry["arguments"]["0"] == "10"
+        assert entry["arguments"]["1"] == "20"
+
+    def test_mixed_args_and_kwargs(self):
+        import ttnn.graph as g
+
+        g.record_python_operation("ttnn.linear", ("pos0",), {"bias": "bias_val"})
+        entry = g._python_io_data[0]
+        assert entry["arguments"]["0"] == "pos0"
+        assert entry["arguments"]["bias"] == "bias_val"
+
+    def test_torch_tensor_arg_compact(self):
+        import ttnn.graph as g
+
+        t = torch.randn(4, 8)
+        g.record_python_operation("ttnn.from_torch", (t,), {})
+        entry = g._python_io_data[0]
+        val = entry["arguments"]["0"]
+        assert "torch.Tensor" in val
+        assert "[4, 8]" in val
+
+    def test_multiple_records_append(self):
+        import ttnn.graph as g
+
+        g.record_python_operation("op1", (), {})
+        g.record_python_operation("op2", (), {})
+        g.record_python_operation("op3", (), {})
+        assert len(g._python_io_data) == 3
+        assert [e["name"] for e in g._python_io_data] == ["op1", "op2", "op3"]
+
+    def test_empty_args(self):
+        import ttnn.graph as g
+
+        g.record_python_operation("ttnn.deallocate", (), {})
+        entry = g._python_io_data[0]
+        assert entry["arguments"] == {}
+
+    def test_error_attaches_only_to_the_returned_record(self):
+        import ttnn.graph as g
+
+        first = g.record_python_operation("ttnn.add", (), {})
+        second = g.record_python_operation("ttnn.add", (), {})
+        g.record_python_operation_error(second, "RuntimeError", "boom")
+        assert "error" not in first
+        assert second["error"] == {"type": "RuntimeError", "message": "boom"}
+
+    def test_error_is_noop_when_no_current_record(self):
+        import ttnn.graph as g
+
+        first = g.record_python_operation("ttnn.add", (), {})
+        g.record_python_operation_error(None, "RuntimeError", "python_io setup failed")
+        assert "error" not in first
+
+    def test_append_then_populate_mutates_the_same_record(self):
+        import ttnn.graph as g
+
+        reserved = g.append_python_io_record("ttnn.add")
+        filled = g.record_python_operation("ttnn.add", (), {"bias": "1"}, record=reserved)
+        assert filled is reserved
+        assert len(g._python_io_data) == 1
+        assert reserved["arguments"]["bias"] == "1"
+
+    def test_populate_failure_keeps_the_reserved_record(self, expect_error, monkeypatch):
+        import ttnn.graph as g
+
+        reserved = g.append_python_io_record("ttnn.add")
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("stringify failed")
+
+        monkeypatch.setattr(g, "_safe_arg_str", boom)
+        with expect_error(RuntimeError, "stringify failed"):
+            g.record_python_operation("ttnn.add", (1,), {}, record=reserved)
+        assert len(g._python_io_data) == 1
+        assert g._python_io_data[0] is reserved
+        assert reserved["name"] == "ttnn.add"
+
+    def test_python_stack_trace_captured_when_enabled(self):
+        import ttnn.graph as g
+
+        g.enable_python_stack_traces()
+        try:
+            g.record_python_operation("ttnn.relu", (), {"x": "val"})
+            entry = g._python_io_data[0]
+            assert "python_stack_trace" in entry
+            assert len(entry["python_stack_trace"]) > 0
+            joined = "\n".join(entry["python_stack_trace"])
+            assert "test_graph_report.py" in joined
+        finally:
+            g.disable_python_stack_traces()
+
+    def test_python_stack_trace_absent_when_disabled(self):
+        import ttnn.graph as g
+
+        g.disable_python_stack_traces()
+        g.record_python_operation("ttnn.relu", (), {})
+        entry = g._python_io_data[0]
+        assert "python_stack_trace" not in entry
+
+    def test_python_stack_trace_filters_internals(self):
+        import ttnn.graph as g
+
+        g.enable_python_stack_traces()
+        try:
+            g.record_python_operation("ttnn.add", (1,), {})
+            entry = g._python_io_data[0]
+            joined = "\n".join(entry["python_stack_trace"])
+            assert "graph.py" not in joined, "Internal graph.py frames should be filtered"
+            assert "decorators.py" not in joined, "Internal decorators.py frames should be filtered"
+        finally:
+            g.disable_python_stack_traces()
+
+    def test_enable_disable_toggle(self):
+        import ttnn.graph as g
+
+        assert g.is_python_stack_trace_enabled()
+        g.disable_python_stack_traces()
+        assert not g.is_python_stack_trace_enabled()
+        g.enable_python_stack_traces()
+        assert g.is_python_stack_trace_enabled()
+
+
+class TestStoreCapturedGraph:
+    """Tests for ttnn.graph.store_captured_graph."""
+
+    def setup_method(self):
+        import ttnn.graph as g
+
+        g._python_io_data = []
+
+    def test_attaches_to_last_entry(self):
+        import ttnn.graph as g
+
+        g._python_io_data.append({"name": "op1"})
+        g._python_io_data.append({"name": "op2"})
+        mock_cg = [{"node_type": "capture_start"}]
+        g.store_captured_graph(mock_cg)
+        assert "captured_graph" not in g._python_io_data[0]
+        assert g._python_io_data[1]["captured_graph"] == mock_cg
+
+    def test_noop_on_empty_list(self):
+        import ttnn.graph as g
+
+        g.store_captured_graph([{"node_type": "capture_start"}])
+        assert len(g._python_io_data) == 0
+
+    def test_overwrites_existing(self):
+        import ttnn.graph as g
+
+        g._python_io_data.append({"name": "op1", "captured_graph": "old"})
+        g.store_captured_graph("new")
+        assert g._python_io_data[0]["captured_graph"] == "new"
+
+
+class TestBeginGraphCaptureClearing:
+    """Tests for begin_graph_capture clearing behavior."""
+
+    @pytest.fixture(autouse=True)
+    def isolate_outer_graph_capture(self):
+        """Root conftest may start capture before these tests; reset for outermost begin behavior."""
+        with ttnn.manage_config("enable_graph_report", False):
+            while ttnn.graph.is_graph_capture_active():
+                ttnn.graph.end_graph_capture()
+            yield
+
+    @pytest.fixture(autouse=True)
+    def restore_python_stack_trace_state(self):
+        was_enabled = ttnn.graph.is_python_stack_trace_enabled()
+        yield
+        if was_enabled:
+            ttnn.graph.enable_python_stack_traces()
+        else:
+            ttnn.graph.disable_python_stack_traces()
+
+    def test_clears_python_io_when_not_active(self):
+        ttnn.graph._python_io_data = [{"name": "stale"}]
+        ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+        assert ttnn.graph._python_io_data == []
+        ttnn.graph.end_graph_capture()
+
+    def test_load_config_dictionary_enables_python_stack_traces_on_begin_graph_capture(self):
+        """TTNN_CONFIG_OVERRIDES loads via load_config_from_dictionary (same code path)."""
+        if not hasattr(ttnn.CONFIG, "enable_graph_python_stack_traces"):
+            pytest.skip("CONFIG lacks enable_graph_python_stack_traces (rebuild and install _ttnn)")
+
+        original = ttnn.CONFIG.enable_graph_python_stack_traces
+        try:
+            ttnn.graph.disable_python_stack_traces()
+            assert not ttnn.graph.is_python_stack_trace_enabled()
+            ttnn.load_config_from_dictionary({"enable_graph_python_stack_traces": True}, from_file=False)
+            assert ttnn.CONFIG.enable_graph_python_stack_traces is True
+
+            ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+            try:
+                ttnn.graph.record_python_operation("ttnn.relu", (), {})
+                entry = ttnn.graph._python_io_data[0]
+                assert "python_stack_trace" in entry
+                assert len(entry["python_stack_trace"]) > 0
+            finally:
+                ttnn.graph.end_graph_capture()
+
+            assert not ttnn.graph.is_python_stack_trace_enabled()
+        finally:
+            ttnn.CONFIG.enable_graph_python_stack_traces = original
+
+    def test_begin_graph_capture_auto_enables_python_stack_traces_when_config_true(self):
+        with ttnn.manage_config("enable_graph_python_stack_traces", True):
+            ttnn.graph.disable_python_stack_traces()
+            assert not ttnn.graph.is_python_stack_trace_enabled()
+
+            ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+            try:
+                ttnn.graph.record_python_operation("ttnn.relu", (), {})
+                assert len(ttnn.graph._python_io_data) == 1
+                entry = ttnn.graph._python_io_data[0]
+                assert "python_stack_trace" in entry
+                assert len(entry["python_stack_trace"]) > 0
+            finally:
+                ttnn.graph.end_graph_capture()
+
+            assert not ttnn.graph.is_python_stack_trace_enabled()
+
+    def test_end_graph_capture_to_file_auto_disables_python_stack_traces_when_config_true(self, tmp_path, monkeypatch):
+        """end_graph_capture_to_file mirrors end_graph_capture auto-disable for stack traces."""
+        report_path = tmp_path / "report.json"
+
+        def fake_end_graph_capture_to_file(_report_path):
+            # Avoid cluster/device init in C++ report serialization (not under test here).
+            ttnn.graph._cpp_end_graph_capture()
+            return "{}"
+
+        monkeypatch.setattr(ttnn.graph, "_cpp_end_graph_capture_to_file", fake_end_graph_capture_to_file)
+
+        with ttnn.manage_config("enable_graph_python_stack_traces", True):
+            ttnn.graph.disable_python_stack_traces()
+            assert not ttnn.graph.is_python_stack_trace_enabled()
+
+            ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+            ttnn.graph.record_python_operation("ttnn.relu", (), {})
+            ttnn.graph.end_graph_capture_to_file(str(report_path))
+
+            assert not ttnn.graph.is_python_stack_trace_enabled()
+
+        sidecar_path = report_path.with_suffix(".python_io.json")
+        assert sidecar_path.exists()
+        python_io = json.loads(sidecar_path.read_text())
+        assert len(python_io) == 1
+        assert "python_stack_trace" in python_io[0]
+        assert len(python_io[0]["python_stack_trace"]) > 0
+
+    def test_begin_graph_capture_default_no_python_stack_traces(self):
+        with ttnn.manage_config("enable_graph_python_stack_traces", False), ttnn.manage_config(
+            "enable_detailed_tensor_report", False
+        ):
+            ttnn.graph.disable_python_stack_traces()
+            assert not ttnn.graph.is_python_stack_trace_enabled()
+
+            ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+            try:
+                ttnn.graph.record_python_operation("ttnn.relu", (), {})
+                assert len(ttnn.graph._python_io_data) == 1
+                entry = ttnn.graph._python_io_data[0]
+                assert "python_stack_trace" not in entry
+            finally:
+                ttnn.graph.end_graph_capture()
+
+            assert not ttnn.graph.is_python_stack_trace_enabled()
+
+    def test_begin_graph_capture_respects_disable_graph_python_stack_traces_config(self):
+        with ttnn.manage_config("enable_graph_python_stack_traces", False), ttnn.manage_config(
+            "enable_detailed_tensor_report", False
+        ):
+            ttnn.graph.disable_python_stack_traces()
+            assert not ttnn.graph.is_python_stack_trace_enabled()
+
+            ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+            try:
+                ttnn.graph.record_python_operation("ttnn.relu", (), {})
+                assert len(ttnn.graph._python_io_data) == 1
+                entry = ttnn.graph._python_io_data[0]
+                assert "python_stack_trace" not in entry
+            finally:
+                ttnn.graph.end_graph_capture()
+
+            assert not ttnn.graph.is_python_stack_trace_enabled()
+
+    def test_begin_graph_capture_auto_enables_python_stack_traces_when_detailed_tensor_report_true(self):
+        """enable_detailed_tensor_report also turns on stacks for tensor_lifetime source columns."""
+        with ttnn.manage_config("enable_graph_python_stack_traces", False), ttnn.manage_config(
+            "enable_detailed_tensor_report", True
+        ):
+            ttnn.graph.disable_python_stack_traces()
+            assert not ttnn.graph.is_python_stack_trace_enabled()
+
+            ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+            try:
+                ttnn.graph.record_python_operation("ttnn.relu", (), {})
+                entry = ttnn.graph._python_io_data[0]
+                assert "python_stack_trace" in entry
+                assert len(entry["python_stack_trace"]) > 0
+            finally:
+                ttnn.graph.end_graph_capture()
+
+            assert not ttnn.graph.is_python_stack_trace_enabled()
+
+    def test_begin_graph_capture_keeps_pre_enabled_python_stack_traces_when_config_false(self):
+        """Stacks enabled before begin are not overridden when config auto-enable is off."""
+        with ttnn.manage_config("enable_graph_python_stack_traces", False), ttnn.manage_config(
+            "enable_detailed_tensor_report", False
+        ):
+            ttnn.graph.disable_python_stack_traces()
+            ttnn.graph.enable_python_stack_traces()
+            ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+            try:
+                ttnn.graph.record_python_operation("ttnn.relu", (), {})
+                entry = ttnn.graph._python_io_data[0]
+                assert "python_stack_trace" in entry
+                assert len(entry["python_stack_trace"]) > 0
+            finally:
+                ttnn.graph.end_graph_capture()
+
+    def test_configure_stack_traces_defaults_false_when_config_attr_missing(self):
+        import types
+
+        ttnn.graph.disable_python_stack_traces()
+        fake_ttnn = types.SimpleNamespace(CONFIG=types.SimpleNamespace())
+        ttnn.graph._configure_python_stack_traces_for_outer_graph_capture(fake_ttnn)
+        assert not ttnn.graph.is_python_stack_trace_enabled()
+
+    def test_preserves_python_io_when_active(self):
+        ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+        ttnn.graph._python_io_data = [{"name": "keep_me"}]
+        ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+        assert len(ttnn.graph._python_io_data) == 1
+        assert ttnn.graph._python_io_data[0]["name"] == "keep_me"
+        ttnn.graph.end_graph_capture()
+        ttnn.graph.end_graph_capture()
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for graph_report.py import_graph - new features
+# ---------------------------------------------------------------------------
+class TestPythonIOArgumentImport:
+    """Tests that python_io arguments are preferred over C++ arguments."""
+
+    def test_python_io_arguments_used_when_present(self, tmp_path):
+        """When python_io has arguments, they should be used instead of C++ ones."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1, 3]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn.relu"},
+                "connections": [],
+                "input_tensors": [],
+                "arguments": ["cpp_arg0", "cpp_arg1"],
+            },
+            {
+                "counter": 2,
+                "node_type": "function_end",
+                "params": {"name": "ttnn.relu"},
+                "connections": [],
+                "duration_ns": 100,
+            },
+            {"counter": 3, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+        python_io = [
+            {
+                "name": "ttnn.relu",
+                "arguments": {"0": "ttnn.Tensor(shape=[1,32], dtype=bfloat16)", "memory_config": "DRAM"},
+                "input_tensor_ids": [],
+            }
+        ]
+
+        report = _make_report(mock_graph, python_io=python_io)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT name, value FROM operation_arguments ORDER BY name")
+        rows = cursor.fetchall()
+        values = {r[0]: r[1] for r in rows}
+
+        assert "memory_config" in values, "Named kwarg should appear"
+        assert values["memory_config"] == "DRAM"
+        assert values["0"] == "ttnn.Tensor(shape=[1,32], dtype=bfloat16)"
+        assert "cpp_arg0" not in [r[1] for r in rows], "C++ args should be overridden"
+        conn.close()
+
+    def test_cpp_arguments_fallback_when_no_python_io(self, tmp_path):
+        """When no python_io is provided, C++ arguments should be used."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1, 3]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn.relu"},
+                "connections": [],
+                "input_tensors": [],
+                "arguments": ["tensor_a", "alpha=1.0"],
+            },
+            {
+                "counter": 2,
+                "node_type": "function_end",
+                "params": {"name": "ttnn.relu"},
+                "connections": [],
+                "duration_ns": 100,
+            },
+            {"counter": 3, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+        report = _make_report(mock_graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT name, value FROM operation_arguments ORDER BY name")
+        rows = cursor.fetchall()
+        assert len(rows) == 2
+        assert "tensor_a" in [r[1] for r in rows]
+        conn.close()
+
+
+class TestPerOpCapturedGraphImport:
+    """Tests that per-op captured_graph from python_io is used directly."""
+
+    def test_per_op_captured_graph_used_when_available(self, tmp_path):
+        """captured_graph from python_io should be stored with id fields injected."""
+        per_op_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "InnerOp"},
+                "connections": [2],
+            },
+            {
+                "counter": 2,
+                "node_type": "function_end",
+                "params": {"name": "InnerOp"},
+                "connections": [3],
+            },
+            {"counter": 3, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+        expected_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1], "id": 0},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "InnerOp"},
+                "connections": [2],
+                "id": 1,
+            },
+            {
+                "counter": 2,
+                "node_type": "function_end",
+                "params": {"name": "InnerOp"},
+                "connections": [3],
+                "id": 2,
+            },
+            {"counter": 3, "node_type": "capture_end", "params": {}, "connections": [], "id": 3},
+        ]
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1, 3]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn.relu"},
+                "connections": [],
+                "input_tensors": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "function_end",
+                "params": {"name": "ttnn.relu"},
+                "connections": [],
+                "duration_ns": 100,
+            },
+            {"counter": 3, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+        python_io = [
+            {
+                "name": "ttnn.relu",
+                "arguments": {},
+                "input_tensor_ids": [],
+                "captured_graph": per_op_graph,
+            }
+        ]
+
+        report = _make_report(mock_graph, python_io=python_io)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT captured_graph FROM captured_graph")
+        rows = cursor.fetchall()
+        assert len(rows) == 1
+        stored = json.loads(rows[0][0])
+        assert stored == expected_graph, "Per-op graph should have id fields injected from counter"
+        conn.close()
+
+    def test_fallback_extraction_when_no_per_op_graph(self, tmp_path):
+        """Without captured_graph in python_io, importer should extract from global graph."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1, 3]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn.relu"},
+                "connections": [3],
+                "input_tensors": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "function_end",
+                "params": {"name": "ttnn.relu"},
+                "connections": [],
+                "duration_ns": 100,
+            },
+            {"counter": 3, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+        python_io = [{"name": "ttnn.relu", "arguments": {}, "input_tensor_ids": []}]
+
+        report = _make_report(mock_graph, python_io=python_io)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT captured_graph FROM captured_graph")
+        rows = cursor.fetchall()
+        assert len(rows) == 1
+        stored = json.loads(rows[0][0])
+        assert stored[0]["node_type"] == "capture_start"
+        assert stored[-1]["node_type"] == "capture_end"
+        conn.close()
+
+
+class TestFromTorchFiltering:
+    """Tests for the smart from_torch filtering (leading block only)."""
+
+    def _make_graph(self, op_names):
+        """Helper: build a simple graph with given operation names."""
+        nodes = [{"counter": 0, "node_type": "capture_start", "params": {}, "connections": []}]
+        c = 1
+        for name in op_names:
+            nodes.append(
+                {
+                    "counter": c,
+                    "node_type": "function_start",
+                    "params": {"name": name},
+                    "connections": [],
+                    "input_tensors": [],
+                }
+            )
+            c += 1
+            nodes.append(
+                {
+                    "counter": c,
+                    "node_type": "function_end",
+                    "params": {"name": name},
+                    "connections": [],
+                    "duration_ns": 100,
+                }
+            )
+            c += 1
+        nodes.append({"counter": c, "node_type": "capture_end", "params": {}, "connections": []})
+        return nodes
+
+    def test_leading_from_torch_filtered(self, tmp_path):
+        """from_torch before any compute op should be filtered out."""
+        graph = self._make_graph(["ttnn.from_torch", "ttnn.from_torch", "ttnn.conv2d"])
+
+        report = _make_report(graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT name FROM operations ORDER BY operation_id")
+        ops = [r[0] for r in cursor.fetchall()]
+        assert "ttnn.from_torch" not in ops, "Leading from_torch should be filtered"
+        assert "ttnn.conv2d" in ops
+        conn.close()
+
+    def test_from_torch_after_compute_kept(self, tmp_path):
+        """from_torch after a compute op should be kept."""
+        graph = self._make_graph(["ttnn.conv2d", "ttnn.from_torch"])
+
+        report = _make_report(graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT name FROM operations ORDER BY operation_id")
+        ops = [r[0] for r in cursor.fetchall()]
+        assert ops == ["ttnn.conv2d", "ttnn.from_torch"]
+        conn.close()
+
+    def test_mixed_leading_block(self, tmp_path):
+        """from_torch interleaved with filtered ops before compute should all be filtered."""
+        graph = self._make_graph(
+            [
+                "ttnn.from_torch",
+                "Tensor::to_device",
+                "ttnn.from_torch",
+                "ttnn.conv2d",
+                "ttnn.from_torch",
+            ]
+        )
+
+        report = _make_report(graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT name FROM operations ORDER BY operation_id")
+        ops = [r[0] for r in cursor.fetchall()]
+        assert ops == ["ttnn.conv2d", "ttnn.from_torch"]
+        conn.close()
+
+
+class TestFilteredOpPrefixes:
+    """Tests that _FILTERED_OP_PREFIXES operations are transparent."""
+
+    @staticmethod
+    def _make_flat_graph(op_names):
+        nodes = [{"counter": 0, "node_type": "capture_start", "params": {}, "connections": []}]
+        c = 1
+        for name in op_names:
+            nodes.append(
+                {
+                    "counter": c,
+                    "node_type": "function_start",
+                    "params": {"name": name},
+                    "connections": [],
+                    "input_tensors": [],
+                }
+            )
+            c += 1
+            nodes.append(
+                {
+                    "counter": c,
+                    "node_type": "function_end",
+                    "params": {"name": name},
+                    "connections": [],
+                    "duration_ns": 100,
+                }
+            )
+            c += 1
+        nodes.append({"counter": c, "node_type": "capture_end", "params": {}, "connections": []})
+        return nodes
+
+    @pytest.mark.parametrize(
+        "filtered_op",
+        [
+            "Tensor::deallocate",
+            "Tensor::to_device",
+            "Tensor::reshape",
+            "tt::tt_metal::to_dtype",
+            "ttnn::convert_python_tensor_to_tt_tensor",
+            "tt::tt_metal::detail::convert_tt_tensor_to_framework_tensor",
+        ],
+    )
+    def test_filtered_op_prefix_excluded(self, tmp_path, filtered_op):
+        """Each _FILTERED_OP_PREFIXES entry should be excluded from operations."""
+        graph = self._make_flat_graph([filtered_op, "ttnn.relu"])
+        report = _make_report(graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT name FROM operations")
+        ops = [r[0] for r in cursor.fetchall()]
+        assert filtered_op not in ops, f"{filtered_op} should be filtered"
+        assert "ttnn.relu" in ops, "Non-filtered op should remain"
+        conn.close()
+
+
+class TestPythonIONameMatching:
+    """Tests that python_io records are matched to graph nodes by name."""
+
+    def test_multiple_ops_same_name_matched_in_order(self, tmp_path):
+        """Two ops with the same name should consume python_io records in order."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": []},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn.relu"},
+                "connections": [],
+                "input_tensors": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "function_end",
+                "params": {"name": "ttnn.relu"},
+                "connections": [],
+                "duration_ns": 100,
+            },
+            {
+                "counter": 3,
+                "node_type": "function_start",
+                "params": {"name": "ttnn.relu"},
+                "connections": [],
+                "input_tensors": [],
+            },
+            {
+                "counter": 4,
+                "node_type": "function_end",
+                "params": {"name": "ttnn.relu"},
+                "connections": [],
+                "duration_ns": 200,
+            },
+            {"counter": 5, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+        python_io = [
+            {"name": "ttnn.relu", "arguments": {"alpha": "1.0"}, "input_tensor_ids": []},
+            {"name": "ttnn.relu", "arguments": {"alpha": "2.0"}, "input_tensor_ids": []},
+        ]
+
+        report = _make_report(mock_graph, python_io=python_io)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute(
+            """
+            SELECT oa.value FROM operation_arguments oa
+            JOIN operations o ON oa.operation_id = o.operation_id
+            WHERE oa.name = 'alpha'
+            ORDER BY o.operation_id
+        """
+        )
+        values = [r[0] for r in cursor.fetchall()]
+        assert values == ["1.0", "2.0"], f"Expected ordered matching, got {values}"
+        conn.close()
+
+    def test_setup_failure_slot_does_not_take_the_next_same_name_record(self, tmp_path):
+        """A reserved empty/error slot must be consumed by the failed start, not by the next op."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": []},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn.relu"},
+                "connections": [],
+                "input_tensors": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "function_end",
+                "params": {"name": "ttnn.relu"},
+                "connections": [],
+                "duration_ns": 100,
+            },
+            {
+                "counter": 3,
+                "node_type": "function_start",
+                "params": {"name": "ttnn.relu"},
+                "connections": [],
+                "input_tensors": [],
+            },
+            {
+                "counter": 4,
+                "node_type": "function_end",
+                "params": {"name": "ttnn.relu"},
+                "connections": [],
+                "duration_ns": 200,
+            },
+            {"counter": 5, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+        python_io = [
+            {
+                "name": "ttnn.relu",
+                "arguments": {},
+                "input_tensor_ids": [],
+                "error": {"type": "RuntimeError", "message": "python_io setup failed"},
+            },
+            {"name": "ttnn.relu", "arguments": {"alpha": "ok"}, "input_tensor_ids": []},
+        ]
+
+        report = _make_report(mock_graph, python_io=python_io)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT operation_id FROM operations ORDER BY operation_id")
+        first_id, second_id = (row[0] for row in cursor.fetchall())
+
+        cursor.execute("SELECT error_message FROM errors WHERE operation_id = ?", (first_id,))
+        assert cursor.fetchone() == ("python_io setup failed",)
+
+        cursor.execute("SELECT COUNT(*) FROM errors WHERE operation_id = ?", (second_id,))
+        assert cursor.fetchone() == (0,)
+
+        cursor.execute(
+            "SELECT value FROM operation_arguments WHERE operation_id = ? AND name = 'alpha'",
+            (second_id,),
+        )
+        assert cursor.fetchone() == ("ok",)
+        cursor.execute(
+            "SELECT COUNT(*) FROM operation_arguments WHERE operation_id = ? AND name = 'alpha'",
+            (first_id,),
+        )
+        assert cursor.fetchone() == (0,)
+        conn.close()
+
+    def test_unmatched_python_io_ignored(self, tmp_path):
+        """python_io records for non-existent ops should be silently ignored."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": []},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn.relu"},
+                "connections": [],
+                "input_tensors": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "function_end",
+                "params": {"name": "ttnn.relu"},
+                "connections": [],
+                "duration_ns": 100,
+            },
+            {"counter": 3, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+        python_io = [
+            {"name": "ttnn.relu", "arguments": {"x": "tensor"}, "input_tensor_ids": []},
+            {"name": "ttnn.nonexistent", "arguments": {"y": "other"}, "input_tensor_ids": []},
+        ]
+
+        report = _make_report(mock_graph, python_io=python_io)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT COUNT(*) FROM operations")
+        assert cursor.fetchone()[0] == 1
+        conn.close()
+
+
+class TestCapturedGraphFallbackExtraction:
+    """Tests for the global-graph extraction fallback (when no per-op captured_graph)."""
+
+    def test_extracted_graph_has_sequential_counters(self, tmp_path):
+        """Fallback extraction should renumber counters to be sequential."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [100]},
+            {
+                "counter": 100,
+                "node_type": "function_start",
+                "params": {"name": "ttnn.relu"},
+                "connections": [102],
+                "input_tensors": [],
+            },
+            {"counter": 101, "node_type": "tensor", "params": {"tensor_id": "1"}, "connections": [100]},
+            {
+                "counter": 102,
+                "node_type": "function_end",
+                "params": {"name": "ttnn.relu"},
+                "connections": [103],
+                "duration_ns": 100,
+            },
+            {"counter": 103, "node_type": "tensor", "params": {"tensor_id": "2"}, "connections": []},
+            {"counter": 999, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+        report = _make_report(mock_graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT captured_graph FROM captured_graph")
+        rows = cursor.fetchall()
+        assert len(rows) == 1
+        cg = json.loads(rows[0][0])
+        counters = [n["counter"] for n in cg]
+        assert counters == list(range(len(cg))), f"Counters should be sequential: {counters}"
+        assert cg[0]["node_type"] == "capture_start"
+        assert cg[-1]["node_type"] == "capture_end"
+        conn.close()
+
+    def test_extracted_graph_connections_remapped(self, tmp_path):
+        """Connections in extracted graph should reference local counters."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [50]},
+            {
+                "counter": 50,
+                "node_type": "function_start",
+                "params": {"name": "ttnn.relu"},
+                "connections": [52],
+                "input_tensors": [51],
+            },
+            {"counter": 51, "node_type": "tensor", "params": {"tensor_id": "1"}, "connections": [50]},
+            {
+                "counter": 52,
+                "node_type": "function_end",
+                "params": {"name": "ttnn.relu"},
+                "connections": [],
+                "duration_ns": 100,
+            },
+            {"counter": 999, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+        report = _make_report(mock_graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT captured_graph FROM captured_graph")
+        cg = json.loads(cursor.fetchone()[0])
+        max_counter = max(n["counter"] for n in cg)
+        for node in cg:
+            for conn_id in node.get("connections", []):
+                assert conn_id <= max_counter, (
+                    f"Connection {conn_id} exceeds max counter {max_counter} "
+                    f"in node {node['counter']} ({node['node_type']})"
+                )
+        conn.close()
+
+    def test_parent_wrapper_included_in_captured_graph(self, tmp_path):
+        """The parent function_start/end should appear in the extracted subgraph."""
+        mock_graph = [
+            {"counter": 0, "node_type": "capture_start", "params": {}, "connections": [1]},
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn.relu"},
+                "connections": [2, 4],
+                "input_tensors": [],
+            },
+            {
+                "counter": 2,
+                "node_type": "function_start",
+                "params": {"name": "InnerOp"},
+                "connections": [3],
+                "input_tensors": [],
+            },
+            {
+                "counter": 3,
+                "node_type": "function_end",
+                "params": {"name": "InnerOp"},
+                "connections": [],
+                "duration_ns": 50,
+            },
+            {
+                "counter": 4,
+                "node_type": "function_end",
+                "params": {"name": "ttnn.relu"},
+                "connections": [],
+                "duration_ns": 100,
+            },
+            {"counter": 5, "node_type": "capture_end", "params": {}, "connections": []},
+        ]
+
+        report = _make_report(mock_graph)
+        conn, cursor = _import_to_db(report, tmp_path)
+
+        cursor.execute("SELECT captured_graph FROM captured_graph")
+        cg = json.loads(cursor.fetchone()[0])
+        fn_names = [
+            n.get("params", {}).get("name", "") for n in cg if n["node_type"] in ("function_start", "function_end")
+        ]
+        assert "ttnn.relu" in fn_names, f"Parent wrapper should be included in captured_graph, found: {fn_names}"
+        conn.close()
+
+
+class TestFastOperationGraphTracking:
+    """Tests that FastOperation emits track_function_start/end during graph capture."""
+
+    def test_python_op_names_in_graph(self, device, tmp_path):
+        """FastOperation.__call__ should produce Python-level function_start/end nodes."""
+        torch_input = torch.randn(1, 32)
+        tt_input = ttnn.from_torch(torch_input, layout=ttnn.TILE_LAYOUT, device=device)
+
+        report_path = str(tmp_path / "report.json")
+        ttnn.graph.begin_graph_capture()
+        with ttnn.manage_config("enable_fast_runtime_mode", True):
+            ttnn.add(tt_input, tt_input)
+        ttnn.graph.end_graph_capture_to_file(report_path)
+
+        with open(report_path) as f:
+            report = json.load(f)
+
+        fn_names = [
+            n["params"]["name"]
+            for n in report["graph"]
+            if n.get("node_type") == "function_start" and "name" in n.get("params", {})
+        ]
+        assert "ttnn.add" in fn_names, f"Expected 'ttnn.add' in function_start names, got: {fn_names}"
+
+    def test_python_io_records_tensor_ids(self, device, tmp_path):
+        """FastOperation should record input_tensor_ids and output_tensor_ids in python_io."""
+        report_path = str(tmp_path / "report.json")
+
+        with ttnn.manage_config("enable_fast_runtime_mode", True):
+            ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+            a = ttnn.ones([1, 32], layout=ttnn.TILE_LAYOUT, device=device)
+            b = ttnn.add(a, a)
+            ttnn.graph.end_graph_capture_to_file(report_path)
+
+        report_path = Path(report_path)
+        sidecar_path = report_path.with_suffix(".python_io.json")
+        assert sidecar_path.exists(), f"python_io sidecar file not found at {sidecar_path}"
+
+        with open(sidecar_path) as f:
+            py_io = json.load(f)
+
+        names = [r["name"] for r in py_io]
+        assert "ttnn.ones" in names, f"Expected ttnn.ones in python_io, got {names}"
+        assert "ttnn.add" in names, f"Expected ttnn.add in python_io, got {names}"
+
+        add_record = next(r for r in py_io if r["name"] == "ttnn.add")
+        assert len(add_record.get("input_tensor_ids", [])) > 0, "ttnn.add should have input_tensor_ids"
+        assert len(add_record.get("output_tensor_ids", [])) > 0, "ttnn.add should have output_tensor_ids"
+
+    def test_tensor_connectivity_across_operations(self, device, tmp_path):
+        """Output tensor ID of op A should appear as input tensor ID of op B."""
+        report_path = tmp_path / "report.json"
+
+        with ttnn.manage_config("enable_fast_runtime_mode", True):
+            ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+            a = ttnn.ones([1, 32], layout=ttnn.TILE_LAYOUT, device=device)
+            b = ttnn.add(a, a)
+            ttnn.graph.end_graph_capture_to_file(report_path)
+
+        db_path = graph_report.import_report(report_path, tmp_path / "output")
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+
+        c.execute(
+            """SELECT COUNT(DISTINCT ot.tensor_id)
+               FROM output_tensors ot
+               INNER JOIN input_tensors it ON ot.tensor_id = it.tensor_id"""
+        )
+        connected = c.fetchone()[0]
+        assert connected >= 1, f"Expected at least 1 connected tensor ID, got {connected}"
+        conn.close()
+
+    def test_setup_failure_closes_scope_so_later_ops_stay_top_level(self, monkeypatch, expect_error):
+        """A Python-I/O setup failure must close its scope so later operations stay top-level."""
+        from ttnn.decorators import FastOperation
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("python_io setup failed")
+
+        monkeypatch.setattr(ttnn.graph, "record_python_operation", boom)
+
+        op = FastOperation(
+            python_fully_qualified_name="ttnn.dummy_setup_fail",
+            function=lambda *a, **k: None,
+            preprocess_golden_function_inputs=lambda x: x,
+            golden_function=None,
+            postprocess_golden_function_outputs=lambda x: x,
+            is_cpp_operation=True,
+            is_experimental=False,
+        )
+
+        ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+        try:
+            with (
+                ttnn.manage_config("enable_fast_runtime_mode", True),
+                ttnn.manage_config("enable_logging", False),
+                ttnn.manage_config("enable_comparison_mode", False),
+            ):
+                with expect_error(RuntimeError, "python_io setup failed"):
+                    op()
+            assert ttnn.graph._operation_scope_depth.value == 0
+            ttnn.graph.track_function_start("ttnn.add")
+            ttnn.graph.track_function_end()
+        finally:
+            graph = ttnn.graph.end_graph_capture()
+
+        dummy_ends = [
+            n for n in graph if n["node_type"] == "function_end" and n["params"].get("name") == "ttnn.dummy_setup_fail"
+        ]
+        assert dummy_ends, "setup failure must still close the FastOperation scope"
+        add_starts = [n for n in graph if n["node_type"] == "function_start" and n["params"].get("name") == "ttnn.add"]
+        assert add_starts, "successor operation must appear in the capture"
+        assert add_starts[0]["stacking_level"] == 1, "ttnn.add must not be nested under the failed FastOperation setup"
+
+    def test_setup_failure_does_not_mark_earlier_same_name_record(self, monkeypatch, expect_error):
+        """A later record_python_operation failure must not rewrite an earlier success."""
+        from ttnn.decorators import FastOperation
+
+        original = ttnn.graph.record_python_operation
+        calls = {"n": 0}
+
+        def maybe_boom(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise RuntimeError("python_io setup failed")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(ttnn.graph, "record_python_operation", maybe_boom)
+
+        op = FastOperation(
+            python_fully_qualified_name="ttnn.dummy_setup_fail",
+            function=lambda *a, **k: None,
+            preprocess_golden_function_inputs=lambda x: x,
+            golden_function=None,
+            postprocess_golden_function_outputs=lambda x: x,
+            is_cpp_operation=True,
+            is_experimental=False,
+        )
+
+        ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+        try:
+            with (
+                ttnn.manage_config("enable_fast_runtime_mode", True),
+                ttnn.manage_config("enable_logging", False),
+                ttnn.manage_config("enable_comparison_mode", False),
+            ):
+                op()
+                with expect_error(RuntimeError, "python_io setup failed"):
+                    op()
+            records = [r for r in ttnn.graph._python_io_data if r["name"] == "ttnn.dummy_setup_fail"]
+            assert len(records) == 2
+            assert "error" not in records[0]
+            assert records[1]["error"] == {"type": "RuntimeError", "message": "python_io setup failed"}
+        finally:
+            ttnn.graph.end_graph_capture()
+
+    def test_setup_failure_does_not_assign_next_same_name_record(self, monkeypatch, expect_error, tmp_path):
+        """A recording failure must not give the next same-name op's python_io to the failed start."""
+        from ttnn.decorators import FastOperation
+
+        original = ttnn.graph.record_python_operation
+        calls = {"n": 0}
+
+        def maybe_boom(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("python_io setup failed")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(ttnn.graph, "record_python_operation", maybe_boom)
+
+        op = FastOperation(
+            python_fully_qualified_name="ttnn.dummy_setup_fail",
+            function=lambda *a, **k: None,
+            preprocess_golden_function_inputs=lambda x: x,
+            golden_function=None,
+            postprocess_golden_function_outputs=lambda x: x,
+            is_cpp_operation=True,
+            is_experimental=False,
+        )
+
+        ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+        try:
+            with (
+                ttnn.manage_config("enable_fast_runtime_mode", True),
+                ttnn.manage_config("enable_logging", False),
+                ttnn.manage_config("enable_comparison_mode", False),
+            ):
+                with expect_error(RuntimeError, "python_io setup failed"):
+                    op(tag="failed")
+                op(tag="ok")
+            python_io = [dict(r) for r in ttnn.graph._python_io_data if r["name"] == "ttnn.dummy_setup_fail"]
+        finally:
+            graph = ttnn.graph.end_graph_capture()
+
+        assert len(python_io) == 2
+        assert python_io[0]["error"] == {"type": "RuntimeError", "message": "python_io setup failed"}
+        assert "error" not in python_io[1]
+        assert python_io[1]["arguments"]["tag"] == "ok"
+
+        report = _make_report(graph, python_io=python_io)
+        conn, cursor = _import_to_db(report, tmp_path)
+        cursor.execute("SELECT operation_id FROM operations WHERE name = 'ttnn.dummy_setup_fail' ORDER BY operation_id")
+        ids = [row[0] for row in cursor.fetchall()]
+        assert len(ids) == 2
+        cursor.execute("SELECT error_message FROM errors WHERE operation_id = ?", (ids[0],))
+        assert cursor.fetchone() == ("python_io setup failed",)
+        cursor.execute("SELECT COUNT(*) FROM errors WHERE operation_id = ?", (ids[1],))
+        assert cursor.fetchone() == (0,)
+        cursor.execute(
+            "SELECT value FROM operation_arguments WHERE operation_id = ? AND name = 'tag'",
+            (ids[1],),
+        )
+        assert cursor.fetchone() == ("ok",)
+        conn.close()
+
+
+class TestUnwindAbandonedScopes:
+    """Issue #28836: a top-level operation closes the scopes an earlier failure left open.
+
+    An operation that throws from a call site with no scope guard never emits its
+    ``function_end``.  Everything captured afterwards then lands inside a scope that is
+    already dead, and the importer, which only lists top-level scopes as operations, drops it.
+    """
+
+    @staticmethod
+    def _capture_with_an_abandoned_scope():
+        """Capture the exact shape a failure leaves behind, without needing one to happen.
+
+        ``ttnn.conv2d`` dies inside an unguarded C++ scope, so that scope reports no end; the
+        decorator's ``finally`` still runs and closes it instead of its own, which is what
+        leaves ``ttnn.conv2d`` open.  The raw binding is the C++ entry point those call sites
+        use, so calling it here reproduces the leak faithfully.
+        """
+        from ttnn._ttnn.graph import track_function_start as cpp_track_function_start
+
+        ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+        try:
+            ttnn.graph.track_function_start("ttnn.conv2d")
+            cpp_track_function_start("Conv2dDeviceOperation")
+            ttnn.graph.track_function_end()
+
+            ttnn.graph.track_function_start("ttnn.add")
+            ttnn.graph.track_function_end()
+        finally:
+            graph = ttnn.graph.end_graph_capture()
+        return graph
+
+    @staticmethod
+    def _nodes(graph, node_type, name):
+        return [n for n in graph if n["node_type"] == node_type and n["params"].get("name") == name]
+
+    def test_operation_after_a_failure_stays_top_level(self):
+        graph = self._capture_with_an_abandoned_scope()
+
+        (add_start,) = self._nodes(graph, "function_start", "ttnn.add")
+        assert add_start["stacking_level"] == 1, "ttnn.add must not be recorded as a child of the failed ttnn.conv2d"
+
+    def test_abandoned_scope_is_closed_as_aborted(self):
+        graph = self._capture_with_an_abandoned_scope()
+
+        (conv_end,) = self._nodes(graph, "function_end", "ttnn.conv2d")
+        assert conv_end["params"].get("aborted") == "true"
+        assert "ttnn.add" in conv_end["params"].get("abort_reason", ""), "the reason should name what closed the scope"
+
+    def test_balanced_capture_is_left_alone(self):
+        """Nothing is open when a top-level operation starts, so the unwind is a no-op."""
+        ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+        try:
+            for name in ("ttnn.conv2d", "ttnn.add"):
+                ttnn.graph.track_function_start(name)
+                ttnn.graph.track_function_end()
+        finally:
+            graph = ttnn.graph.end_graph_capture()
+
+        aborted = [n for n in graph if (n["params"] or {}).get("aborted")]
+        assert aborted == [], f"a healthy capture must not report aborts, got {aborted}"
+
+    def test_failing_operation_and_its_successor_both_reach_the_report(self, device, tmp_path, expect_error):
+        """End to end: ttnn.to_dtype fails, and the operation after it is still in the report.
+
+        ``ttnn.to_dtype`` reads the tensor's host storage inside a tracked C++ scope with no
+        guard (``ttnn/core/tensor/tensor_ops.cpp:535-540``), so passing a device tensor throws
+        with that scope open — the same situation as the circular buffer / L1 clash from the
+        issue.
+        """
+        report_path = tmp_path / "report.json"
+        tt_input = ttnn.from_torch(torch.randn(1, 32), layout=ttnn.TILE_LAYOUT, device=device)
+
+        ttnn.graph.begin_graph_capture(ttnn.graph.RunMode.NORMAL)
+        try:
+            with expect_error(RuntimeError, "Expected Tensor with HostStorage"):
+                ttnn.to_dtype(tt_input, ttnn.float32)
+            ttnn.add(tt_input, tt_input)
+        finally:
+            ttnn.graph.end_graph_capture_to_file(str(report_path))
+
+        db_path = graph_report.import_report(report_path, tmp_path / "output")
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT name FROM operations ORDER BY operation_id")
+        names = [row[0] for row in cursor.fetchall()]
+        assert names == ["ttnn.to_dtype", "ttnn.add"], f"expected both operations in the report, got {names}"
+
+        cursor.execute("SELECT operation_name, error_type FROM errors")
+        assert cursor.fetchall() == [("ttnn.to_dtype", "RuntimeError")]
+
+        conn.close()
+
+
+class TestPyIdToCppTensorReconciliation:
+    """Tests that Python-assigned output tensor IDs get proper tensor entries
+    even when they don't appear in any C++ graph tensor node."""
+
+    def test_missing_pyid_created_from_cpp_tensor_node(self, tmp_path):
+        """When python_io output_tensor_ids references an ID not in the graph,
+        the import should create a tensor entry by cloning from the function_end
+        node's connected C++ tensor."""
+        graph = [
+            {
+                "counter": 0,
+                "node_type": "capture_start",
+                "params": {},
+                "connections": [1],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn.relu"},
+                "connections": [2, 5],
+                "arguments": [],
+                "input_tensors": [3],
+                "stacking_level": 0,
+            },
+            {
+                "counter": 2,
+                "node_type": "function_start",
+                "params": {"name": "ReluOp"},
+                "connections": [4],
+                "arguments": [],
+                "input_tensors": [3],
+                "stacking_level": 1,
+            },
+            {
+                "counter": 3,
+                "node_type": "tensor",
+                "params": {
+                    "tensor_id": "100",
+                    "shape": "[1,32]",
+                    "dtype": "BFLOAT16",
+                    "layout": "TILE",
+                    "memory_config": "",
+                    "device_id": 0,
+                    "address": 1000,
+                },
+                "connections": [2],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+            {
+                "counter": 4,
+                "node_type": "function_end",
+                "params": {"name": "ReluOp"},
+                "connections": [6],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 1,
+            },
+            {
+                "counter": 5,
+                "node_type": "function_end",
+                "params": {"name": "ttnn.relu"},
+                "connections": [6],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+            {
+                "counter": 6,
+                "node_type": "tensor",
+                "params": {
+                    "tensor_id": "200",
+                    "shape": "[1,32]",
+                    "dtype": "BFLOAT16",
+                    "layout": "TILE",
+                    "memory_config": "",
+                    "device_id": 0,
+                    "address": 2000,
+                },
+                "connections": [],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+            {
+                "counter": 7,
+                "node_type": "capture_end",
+                "params": {},
+                "connections": [],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+        ]
+        python_io = [
+            {"name": "ttnn.relu", "arguments": {}, "input_tensor_ids": [100], "output_tensor_ids": [999]},
+        ]
+        report = _make_report(graph, python_io=python_io)
+        conn, c = _import_to_db(report, tmp_path)
+
+        c.execute("SELECT tensor_id FROM output_tensors")
+        out_ids = {r[0] for r in c.fetchall()}
+        assert 999 in out_ids, f"Python-assigned output ID 999 should be in output_tensors, got {out_ids}"
+
+        c.execute("SELECT tensor_id FROM tensors WHERE tensor_id = 999")
+        row = c.fetchone()
+        assert row is not None, "Reconciliation should create a tensor entry for Python-assigned ID 999"
+        conn.close()
+
+
+class TestPythonStackTraceImport:
+    """Tests that Python stack traces from python_io are stored in the stack_traces table."""
+
+    def test_python_stack_trace_stored_alone(self, tmp_path):
+        """Python stack trace stored when no C++ stack trace exists."""
+        graph = [
+            {
+                "counter": 0,
+                "node_type": "capture_start",
+                "params": {},
+                "connections": [1],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::add", "inputs": 2},
+                "connections": [],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+            {
+                "counter": 2,
+                "node_type": "function_end",
+                "params": {"name": "ttnn::add"},
+                "connections": [],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+            {
+                "counter": 3,
+                "node_type": "capture_end",
+                "params": {},
+                "connections": [],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+        ]
+        python_io = [
+            {
+                "name": "ttnn::add",
+                "arguments": {"a": "tensor_a", "b": "tensor_b"},
+                "input_tensor_ids": [],
+                "python_stack_trace": [
+                    '  File "my_model.py", line 42, in forward\n    out = ttnn.add(x, y)',
+                    '  File "train.py", line 10, in main\n    model.forward(batch)',
+                ],
+            }
+        ]
+        report = _make_report(graph, python_io=python_io)
+        conn, c = _import_to_db(report, tmp_path)
+        c.execute("SELECT stack_trace FROM stack_traces WHERE operation_id = 1")
+        row = c.fetchone()
+        assert row is not None, "Stack trace should be stored"
+        assert "my_model.py" in row[0]
+        assert "train.py" in row[0]
+        assert "--- C++ ---" not in row[0], "No C++ separator when only Python trace"
+        conn.close()
+
+    def test_python_stack_trace_replaces_cpp(self, tmp_path):
+        """Python stack trace is stored for Python-level ops."""
+        graph = [
+            {
+                "counter": 0,
+                "node_type": "capture_start",
+                "params": {},
+                "connections": [1],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::add", "inputs": 2},
+                "connections": [],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+            {
+                "counter": 2,
+                "node_type": "function_end",
+                "params": {"name": "ttnn::add"},
+                "connections": [],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+            {
+                "counter": 3,
+                "node_type": "capture_end",
+                "params": {},
+                "connections": [],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+        ]
+        python_io = [
+            {
+                "name": "ttnn::add",
+                "arguments": {},
+                "input_tensor_ids": [],
+                "python_stack_trace": ['  File "model.py", line 5, in run\n    ttnn.add(a, b)'],
+            }
+        ]
+        report = _make_report(graph, python_io=python_io)
+        conn, c = _import_to_db(report, tmp_path)
+        c.execute("SELECT stack_trace FROM stack_traces WHERE operation_id = 1")
+        row = c.fetchone()
+        assert row is not None
+        trace = row[0]
+        assert "model.py" in trace, "Python trace should be stored"
+        conn.close()
+
+    def test_no_python_stack_trace_uses_cpp_only(self, tmp_path):
+        """When python_io has no stack trace, no trace is stored."""
+        graph = [
+            {
+                "counter": 0,
+                "node_type": "capture_start",
+                "params": {},
+                "connections": [1],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::add", "inputs": 2},
+                "connections": [],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+            {
+                "counter": 2,
+                "node_type": "function_end",
+                "params": {"name": "ttnn::add"},
+                "connections": [],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+            {
+                "counter": 3,
+                "node_type": "capture_end",
+                "params": {},
+                "connections": [],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+        ]
+        python_io = [{"name": "ttnn::add", "arguments": {}, "input_tensor_ids": []}]
+        report = _make_report(graph, python_io=python_io)
+        conn, c = _import_to_db(report, tmp_path)
+        c.execute("SELECT stack_trace FROM stack_traces WHERE operation_id = 1")
+        row = c.fetchone()
+        assert row is None, "No stack trace should be stored when Python trace is absent"
+        conn.close()
+
+    def test_operation_source_file_stored_from_python_trace(self, tmp_path):
+        source_file = tmp_path / "model.py"
+        source_file.write_text("def run():\n    return 1\n", encoding="utf-8")
+
+        graph = [
+            {
+                "counter": 0,
+                "node_type": "capture_start",
+                "params": {},
+                "connections": [1],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::add", "inputs": 2},
+                "connections": [],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+            {
+                "counter": 2,
+                "node_type": "function_end",
+                "params": {"name": "ttnn::add"},
+                "connections": [],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+            {
+                "counter": 3,
+                "node_type": "capture_end",
+                "params": {},
+                "connections": [],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+        ]
+        python_io = [
+            {
+                "name": "ttnn::add",
+                "arguments": {},
+                "input_tensor_ids": [],
+                "python_stack_trace": [f'  File "{source_file}", line 2, in run\n    return 1'],
+            }
+        ]
+        report = _make_report(graph, python_io=python_io)
+        conn, c = _import_to_db(report, tmp_path)
+
+        c.execute(
+            """
+            SELECT st.operation_id, sf.path
+            FROM stack_traces st
+            JOIN source_files sf ON st.source_file_id = sf.id
+            """
+        )
+        assert c.fetchall() == [(1, str(source_file.resolve()))]
+
+        c.execute("SELECT path, contents FROM source_files")
+        source_rows = c.fetchall()
+        assert source_rows == [(str(source_file.resolve()), "def run():\n    return 1\n")]
+        conn.close()
+
+    def test_stack_traces_share_source_file_id_when_same_path(self, tmp_path):
+        source_file = tmp_path / "shared_source.py"
+        source_file.write_text("x = 1\n", encoding="utf-8")
+
+        graph = [
+            {
+                "counter": 0,
+                "node_type": "capture_start",
+                "params": {},
+                "connections": [1, 3],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::add", "inputs": 2},
+                "connections": [],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+            {
+                "counter": 2,
+                "node_type": "function_end",
+                "params": {"name": "ttnn::add"},
+                "connections": [],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+            {
+                "counter": 3,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::mul", "inputs": 2},
+                "connections": [],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+            {
+                "counter": 4,
+                "node_type": "function_end",
+                "params": {"name": "ttnn::mul"},
+                "connections": [],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+            {
+                "counter": 5,
+                "node_type": "capture_end",
+                "params": {},
+                "connections": [],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+        ]
+        python_io = [
+            {
+                "name": "ttnn::add",
+                "arguments": {},
+                "input_tensor_ids": [],
+                "python_stack_trace": [f'  File "{source_file}", line 1, in run\n    x = 1'],
+            },
+            {
+                "name": "ttnn::mul",
+                "arguments": {},
+                "input_tensor_ids": [],
+                "python_stack_trace": [f'  File "{source_file}", line 1, in run\n    x = 1'],
+            },
+        ]
+        report = _make_report(graph, python_io=python_io)
+        conn, c = _import_to_db(report, tmp_path)
+
+        c.execute("SELECT COUNT(*) FROM source_files")
+        assert c.fetchone()[0] == 1
+
+        c.execute("SELECT operation_id, source_file_id FROM stack_traces ORDER BY operation_id")
+        op_rows = c.fetchall()
+        assert op_rows[0][0] == 1 and op_rows[1][0] == 2
+        assert op_rows[0][1] == op_rows[1][1]
+        c.execute("SELECT path FROM source_files WHERE id = ?", (op_rows[0][1],))
+        assert c.fetchone()[0] == str(source_file.resolve())
+        conn.close()
+
+    def test_missing_source_file_is_skipped(self, tmp_path):
+        missing_file = tmp_path / "does_not_exist.py"
+        graph = [
+            {
+                "counter": 0,
+                "node_type": "capture_start",
+                "params": {},
+                "connections": [1],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::add", "inputs": 2},
+                "connections": [],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+            {
+                "counter": 2,
+                "node_type": "function_end",
+                "params": {"name": "ttnn::add"},
+                "connections": [],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+            {
+                "counter": 3,
+                "node_type": "capture_end",
+                "params": {},
+                "connections": [],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+        ]
+        python_io = [
+            {
+                "name": "ttnn::add",
+                "arguments": {},
+                "input_tensor_ids": [],
+                "python_stack_trace": [f'  File "{missing_file}", line 10, in run\n    ttnn.add(a, b)'],
+            }
+        ]
+        report = _make_report(graph, python_io=python_io)
+        conn, c = _import_to_db(report, tmp_path)
+
+        c.execute("SELECT COUNT(*) FROM source_files")
+        assert c.fetchone()[0] == 0
+        c.execute("SELECT source_file_id FROM stack_traces")
+        assert c.fetchone()[0] is None
+        conn.close()
+
+    def test_path_colon_line_trace_is_supported(self, tmp_path):
+        source_file = tmp_path / "colon_format.py"
+        source_file.write_text("value = 42\n", encoding="utf-8")
+
+        graph = [
+            {
+                "counter": 0,
+                "node_type": "capture_start",
+                "params": {},
+                "connections": [1],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+            {
+                "counter": 1,
+                "node_type": "function_start",
+                "params": {"name": "ttnn::add", "inputs": 2},
+                "connections": [],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+            {
+                "counter": 2,
+                "node_type": "function_end",
+                "params": {"name": "ttnn::add"},
+                "connections": [],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+            {
+                "counter": 3,
+                "node_type": "capture_end",
+                "params": {},
+                "connections": [],
+                "arguments": [],
+                "input_tensors": [],
+                "stacking_level": 0,
+            },
+        ]
+        python_io = [
+            {"name": "ttnn::add", "arguments": {}, "input_tensor_ids": [], "python_stack_trace": [f"{source_file}:12"]}
+        ]
+        report = _make_report(graph, python_io=python_io)
+        conn, c = _import_to_db(report, tmp_path)
+
+        c.execute(
+            """
+            SELECT st.operation_id, sf.path
+            FROM stack_traces st
+            JOIN source_files sf ON st.source_file_id = sf.id
+            """
+        )
+        assert c.fetchall() == [(1, str(source_file.resolve()))]
+        conn.close()
+
+
+class _ModelTensor(torch.Tensor):
+    """A torch.Tensor subclass defined outside the torch package, as model-side wrappers are."""
+
+
+_FROM_TORCH_CONVERSION_CASES = pytest.mark.parametrize(
+    "make_tensor, dtype",
+    [
+        # BN folded into a conv weight outside no_grad: requires_grad=True, non-leaf.
+        (lambda: torch.nn.Parameter(torch.rand((8, 8), dtype=torch.float32)) * 2.0, ttnn.float32),
+        # Rotary matrices and similar: float32 and non-contiguous, converted to bfloat16.
+        (lambda: torch.zeros((8, 8), dtype=torch.float32).T.unsqueeze(0), ttnn.bfloat16),
+        # Control: needs no conversion at all, so it passed even while the tracer was on.
+        (lambda: torch.rand((8, 8), dtype=torch.bfloat16), ttnn.bfloat16),
+        # Model weights as loaded: a torch.nn.Parameter is itself a torch.Tensor subclass, so it takes the
+        # normalization branch in from_torch on every model; it must keep converting.
+        (lambda: torch.nn.Parameter(torch.rand((8, 8), dtype=torch.float32)), ttnn.bfloat16),
+        # A subclass from outside torch: nanobind cannot convert it directly (the raw ttnn.Tensor constructor
+        # fails on this input), so from_torch has to hand it over as a plain torch.Tensor.
+        (lambda: torch.zeros((8, 8), dtype=torch.float32).T.as_subclass(_ModelTensor), ttnn.bfloat16),
+    ],
+    ids=[
+        "requires_grad",
+        "noncontiguous_float32_to_bfloat16",
+        "no_conversion",
+        "parameter_float32_to_bfloat16",
+        "foreign_subclass_noncontiguous_float32_to_bfloat16",
+    ],
+)
+
+
+@pytest.fixture
+def collect_stale_devices():
+    # A closed MeshDevice from an earlier test may still await GC. Its destructor frees cached programs, which calls
+    # into the graph processor of whatever capture is active then; the tracer tests below make GC likely mid-op.
+    gc.collect()
+
+
+@pytest.mark.usefixtures("collect_stale_devices")
+class TestReportConfigDoesNotEnableLegacyTracer:
+    """
+    enable_graph_report used to switch on the legacy ttnn.tracer, which replaced every torch
+    argument with a TracedTorchTensor. nanobind selects its framework conversion fallbacks by
+    string-matching type(obj).__module__, so that subclass ("ttnn.torch_tracer") lost them and
+    any ttnn.from_torch needing a dtype/layout conversion, or carrying requires_grad, failed.
+    """
+
+    @_FROM_TORCH_CONVERSION_CASES
+    def test_from_torch_conversions_under_report_config(self, make_tensor, dtype):
+        with ttnn.manage_config("enable_fast_runtime_mode", False), ttnn.manage_config(
+            "enable_logging", True
+        ), ttnn.manage_config("enable_graph_report", True):
+            output = ttnn.from_torch(make_tensor(), dtype=dtype)
+            assert (
+                output.dtype == dtype
+            ), f"from_torch under the report config returned {output.dtype}, expected {dtype}"
+            assert not ttnn.tracer.is_tracing_enabled(), "enable_graph_report switched the legacy tracer on"
+
+    def test_explicit_tracer_still_works(self):
+        """Fixing the above must not disable ttnn.tracer for callers that ask for it directly."""
+        with ttnn.manage_config("enable_fast_runtime_mode", False):
+            with ttnn.tracer.trace():
+                assert ttnn.tracer.is_tracing_enabled(), "ttnn.tracer.trace() did not enable tracing"
+            assert not ttnn.tracer.is_tracing_enabled(), "tracing still enabled after leaving ttnn.tracer.trace()"
+
+    @_FROM_TORCH_CONVERSION_CASES
+    def test_from_torch_conversions_under_explicit_tracer(self, make_tensor, dtype):
+        """
+        Under the tracer every torch argument is still a TracedTorchTensor, so from_torch has to hand nanobind a
+        plain torch.Tensor or the same conversions fail the same way they did under enable_graph_report.
+        """
+        with ttnn.manage_config("enable_fast_runtime_mode", False):
+            with ttnn.tracer.trace():
+                output = ttnn.from_torch(make_tensor(), dtype=dtype)
+                assert output.dtype == dtype, f"from_torch under the tracer returned {output.dtype}, expected {dtype}"
+
+
+@pytest.mark.usefixtures("collect_stale_devices")
+class TestTracerStateSurvivesFailure:
+    """
+    A raising operation used to leave its graph on GRAPH_STACK, a failing torch side used to leave
+    tracing half-enabled, and an error escaping ttnn.tracer.trace() used to leave tracing on, so the
+    next trace started from corrupted state.
+    """
+
+    def test_graph_stack_is_popped_when_a_ttnn_operation_raises(self, expect_error):
+        def boom():
+            raise RuntimeError("boom")
+
+        with ttnn.manage_config("enable_fast_runtime_mode", False):
+            with ttnn.tracer.trace():
+                depth = len(ttnn.torch_tracer.GRAPH_STACK)
+                with expect_error(RuntimeError, "boom"):
+                    ttnn.tracer.trace_ttnn_operation("boom", boom)()
+                assert (
+                    len(ttnn.torch_tracer.GRAPH_STACK) == depth
+                ), f"raising operation left its graph behind: depth {len(ttnn.torch_tracer.GRAPH_STACK)}, expected {depth}"
+
+    def test_graph_stack_is_popped_when_a_torch_module_raises(self, expect_error):
+        class Boom(torch.nn.Module):
+            def forward(self, tensor):
+                raise RuntimeError("boom")
+
+        with ttnn.manage_config("enable_fast_runtime_mode", False):
+            with ttnn.tracer.trace():
+                depth = len(ttnn.torch_tracer.GRAPH_STACK)
+                with expect_error(RuntimeError, "boom"):
+                    Boom()(torch.rand((8, 8)))
+                assert (
+                    len(ttnn.torch_tracer.GRAPH_STACK) == depth
+                ), f"raising module left its graph behind: depth {len(ttnn.torch_tracer.GRAPH_STACK)}, expected {depth}"
+
+    def test_tracer_is_disabled_when_the_traced_block_raises(self, expect_error):
+        with ttnn.manage_config("enable_fast_runtime_mode", False):
+            with expect_error(RuntimeError, "boom"):
+                with ttnn.tracer.trace():
+                    raise RuntimeError("boom")
+            assert not ttnn.tracer.is_tracing_enabled(), "error escaping trace() left tracing enabled"
+            assert ttnn.torch_tracer.GRAPH_STACK is None, "error escaping trace() left the torch graph stack in place"
+
+    def test_tracing_stays_disabled_when_the_torch_side_fails(self, monkeypatch, expect_error):
+        def boom():
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(ttnn.torch_tracer, "enable_tracing", boom)
+        with ttnn.manage_config("enable_fast_runtime_mode", False):
+            with expect_error(RuntimeError, "boom"):
+                ttnn.tracer.enable_tracing()
+            assert not ttnn.tracer.ENABLE_TRACER, "a failed torch-side enable left tracing half-enabled"
+
+
+class TestReportNameDerivedFromTestId:
+    """
+    A report asked for without report_name is named after the test. The root autouse fixture has to derive the name
+    itself: tests/ttnn/conftest.py sets one too (through the same function), but it runs after that fixture has
+    already read report_name, and tests outside tests/ttnn never see it.
+    """
+
+    _NODEID = "tests/ttnn/unit_tests/base_functionality/test_graph_report.py::TestReportNameDerivedFromTestId::test_x"
+
+    def test_derived_name_is_unique_per_case_and_fits_the_report_path(self):
+        """ttnn::Config keeps only the first 64 characters of report_name, so the unique part has to sit inside them."""
+        names = {graph_report.derive_report_name(f"{self._NODEID}[{case}]") for case in ("a", "b")}
+        assert len(names) == 2, f"parametrized cases of one test share a report_name: {names}"
+        for name in names:
+            assert len(name) <= 64, f"derived report_name is cut by ttnn::Config: {name!r} ({len(name)} chars)"
+            assert name.startswith(
+                "test_graph_report_test_x"
+            ), f"derived report_name lacks file stem and test name: {name!r}"
+
+        long_nodeid = f"{self._NODEID}[{'p' * 80}]"
+        name = graph_report.derive_report_name(long_nodeid)
+        digest = hashlib.sha1(long_nodeid.encode()).hexdigest()[:8]
+        assert len(name) <= 64 and name.endswith(digest), f"hash does not survive the 64-character cut: {name!r}"
+
+    def test_report_is_written_without_report_name(self, request, device, tmp_path):
+        if ttnn.graph.is_graph_capture_active():
+            pytest.skip("graph reporting is already on for this run, so the nested fixture would join that capture")
+        with ttnn.manage_config("enable_fast_runtime_mode", False), ttnn.manage_config(
+            "enable_logging", True
+        ), ttnn.manage_config("enable_graph_report", True), ttnn.manage_config(
+            "root_report_path", tmp_path
+        ), ttnn.manage_config(
+            "report_name", None
+        ):
+            with contextlib.contextmanager(graph_report.run_pytest_graph_report_fixture)(request):
+                report_name = str(ttnn.CONFIG.report_name)
+                expected_name = graph_report.derive_report_name(request.node.nodeid)
+                assert report_name == expected_name, f"report_name {report_name!r} not derived from the test id"
+                report_path = Path(ttnn.CONFIG.report_path)
+                assert report_path.is_relative_to(tmp_path), f"report not under root_report_path: {report_path}"
+                ttnn.relu(
+                    ttnn.from_torch(torch.rand((32, 32), dtype=torch.bfloat16), layout=ttnn.TILE_LAYOUT, device=device)
+                )
+            assert (report_path / "db.sqlite").exists(), f"no db.sqlite written under {report_path}"
+            assert ttnn.CONFIG.report_name is None, "fixture leaked its derived report_name into the config"
+
+
+class TestConfigHelpersUsedByTheReportFixture:
+    """The derived report_name goes through manage_config, and configs written by ttnn spell an unset one as null."""
+
+    def test_manage_config_restores_when_the_block_raises(self, expect_error):
+        original = ttnn.CONFIG.report_name
+        with expect_error(RuntimeError, "boom"):
+            with ttnn.manage_config("report_name", "leaked"):
+                raise RuntimeError("boom")
+        assert (
+            ttnn.CONFIG.report_name == original
+        ), f"report_name left as {ttnn.CONFIG.report_name!r} after the block raised"
+
+    def test_null_report_name_in_a_config_dictionary_unsets_it(self):
+        """save_config_to_json_file writes "report_name": null; reloading it used to try PosixPath(None)."""
+        with ttnn.manage_config("report_name", "previous"):
+            ttnn.load_config_from_dictionary({"report_name": None})
+            assert ttnn.CONFIG.report_name is None, f"null report_name loaded as {ttnn.CONFIG.report_name!r}"
+
+
+@skip_for_slow_dispatch()
+@pytest.mark.skipif(not is_wormhole_b0(), reason="Requires Wormhole B0")
+@pytest.mark.parametrize("device_params", [{"trace_region_size": 200000, "num_command_queues": 2}], indirect=True)
+class TestReportModesDuringTraceCapture:
+    """
+    enable_logging synchronizes the device around every op and enable_comparison_mode reads its tensors back to
+    host. Both are TT_FATAL while a metal trace is being captured, so both must stay off the device there.
+    """
+
+    @pytest.mark.parametrize("cq_id", [0, 1])
+    def test_is_trace_capture_active_tracks_capture(self, device, cq_id):
+        """The check polls every hw command queue, so a capture on either one must register."""
+        assert not ttnn.is_trace_capture_active(device), "capture reported active before begin_trace_capture"
+        trace_id = ttnn.begin_trace_capture(device, cq_id=cq_id)
+        try:
+            assert ttnn.is_trace_capture_active(device), f"capture on cq{cq_id} not reported active"
+        finally:
+            ttnn.end_trace_capture(device, trace_id, cq_id=cq_id)
+            ttnn.release_trace(device, trace_id)
+        assert not ttnn.is_trace_capture_active(device), "capture still reported active after end_trace_capture"
+
+    def test_op_inside_trace_capture_with_logging(self, device):
+        shape = (1, 1, 32, 32)
+        a = ttnn.allocate_tensor_on_device(ttnn.Shape(shape), ttnn.bfloat16, ttnn.TILE_LAYOUT, device)
+        with ttnn.manage_config("enable_fast_runtime_mode", False), ttnn.manage_config("enable_logging", True):
+            ttnn.add(a, a)  # compile the program binaries before capturing
+            trace_id = ttnn.begin_trace_capture(device, cq_id=0)
+            try:
+                ttnn.add(a, a)
+            finally:
+                # A failed op must not leave capture open, or every later test on this device fails.
+                ttnn.end_trace_capture(device, trace_id, cq_id=0)
+                ttnn.release_trace(device, trace_id)
+        ttnn.synchronize_device(device)
+
+    def test_op_inside_trace_capture_with_comparison_mode(self, device):
+        shape = (1, 1, 32, 32)
+        a = ttnn.from_torch(torch.rand(shape, dtype=torch.bfloat16), layout=ttnn.TILE_LAYOUT, device=device)
+        with ttnn.manage_config("enable_fast_runtime_mode", False), ttnn.manage_config(
+            "enable_comparison_mode", True
+        ), ttnn.manage_config("comparison_mode_should_raise_exception", True):
+            ttnn.add(a, a)  # compile before capturing; outside a capture the comparison itself must still run
+            trace_id = ttnn.begin_trace_capture(device, cq_id=0)
+            try:
+                ttnn.add(a, a)
+            finally:
+                ttnn.end_trace_capture(device, trace_id, cq_id=0)
+                ttnn.release_trace(device, trace_id)
+        ttnn.synchronize_device(device)
+
+
+# mesh_device depends on silicon_arch_name, which conftest only parametrizes for tests that name it at collection.
+@pytest.mark.usefixtures("silicon_arch_name")
+def test_multihost_graph_report(request):
+    """
+    Smoke test for graph reports in a multi-process (multi-host) run: every rank captures its own graph and rank 0
+    merges all of them into one db.sqlite, with each rank's rows tagged by rank. The report is left under
+    generated/ttnn/reports, so this test also serves as a quick way to produce a small multi-rank report.
+
+    Skipped unless launched with tt-run on at least two ranks, e.g. on a T3K:
+        tt-run --rank-binding tests/tt_metal/distributed/config/2x4_multiprocess_rank_bindings.yaml \\
+            pytest tests/ttnn/unit_tests/base_functionality/test_graph_report.py::test_multihost_graph_report
+    """
+    if not ttnn.using_distributed_env():
+        pytest.skip("needs a multi-process run launched with tt-run")
+    if ttnn.graph.is_graph_capture_active():
+        pytest.skip("graph reporting is already on for this run, so the nested fixture would join that capture")
+    # Requested here rather than as an argument so a single-process run skips without opening the mesh.
+    mesh_device = request.getfixturevalue("mesh_device")
+    rank = int(ttnn.distributed_context_get_rank())
+    world_size = int(ttnn.distributed_context_get_size())
+
+    with ttnn.manage_config("enable_fast_runtime_mode", False), ttnn.manage_config(
+        "enable_logging", True
+    ), ttnn.manage_config("enable_graph_report", True), ttnn.manage_config("report_name", None):
+        # The report directory is stamped with the current minute, so start every rank together.
+        ttnn.distributed_context_barrier()
+        with contextlib.contextmanager(graph_report.run_pytest_graph_report_fixture)(request):
+            report_path = Path(ttnn.CONFIG.report_path)
+            # Build on host and then move to device: from_torch(device=...) would touch the other ranks' chips.
+            x = ttnn.from_torch(
+                torch.rand((32, 32), dtype=torch.bfloat16),
+                layout=ttnn.TILE_LAYOUT,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
+            )
+            # A few cheap ops, so each rank's part of the report has more than one operation.
+            x = ttnn.to_device(x, mesh_device)
+            y = ttnn.relu(x)
+            y = ttnn.add(y, x)
+            ttnn.multiply(y, x)
+            ttnn.synchronize_device(mesh_device)
+
+    config_path = report_path / f"config_{rank + 1}_of_{world_size}.json"
+    assert config_path.exists(), f"rank {rank} wrote no {config_path.name} under {report_path}"
+    if rank != 0:
+        return
+
+    db_path = report_path / "db.sqlite"
+    assert db_path.exists(), f"no db.sqlite written under {report_path}"
+    op_names = ("ttnn.relu", "ttnn.add", "ttnn.multiply")
+    conn = sqlite3.connect(db_path)
+    try:
+        cursor = conn.cursor()
+        op_counts = {}
+        for op_name in op_names:
+            cursor.execute("SELECT rank, COUNT(*) FROM operations WHERE name = ? GROUP BY rank", (op_name,))
+            op_counts[op_name] = dict(cursor.fetchall())
+        cursor.execute("SELECT rank, COUNT(*) FROM devices GROUP BY rank")
+        device_counts = dict(cursor.fetchall())
+    finally:
+        conn.close()
+    # Exact counts rather than presence, so an op recorded more than once or a rank missing devices is caught.
+    for op_name in op_names:
+        expected = {r: 1 for r in range(world_size)}
+        assert op_counts[op_name] == expected, f"{op_name} count per rank {op_counts[op_name]}, expected {expected}"
+    # Each rank records only its own local devices: get_num_devices() counts the whole mesh across all ranks, while
+    # get_device_ids() lists this rank's local ones. Assumes every rank owns the same number of devices, as each half
+    # of the T3K two-rank binding does.
+    # TODO(tenstorrent/ttnn-visualizer#2225): the count matches only because the MeshDevice's id 0 collides with chip 0
+    # in the report's devices list. Fixing that adds the mesh as its own entry, and this expectation has to change.
+    expected = {r: len(mesh_device.get_device_ids()) for r in range(world_size)}
+    assert device_counts == expected, (
+        f"device count per rank {device_counts}, expected {expected} "
+        "(if the MeshDevice id collision is fixed, see tenstorrent/ttnn-visualizer#2225)"
+    )

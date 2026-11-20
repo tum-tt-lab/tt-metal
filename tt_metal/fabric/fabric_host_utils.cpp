@@ -1,0 +1,462 @@
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include <tt-metalium/experimental/fabric/control_plane.hpp>
+#include "fabric_host_utils.hpp"
+
+#include <tt-metalium/experimental/fabric/fabric.hpp>
+#include <tt-metalium/experimental/fabric/fabric_types.hpp>
+#include <tt-metalium/experimental/fabric/topology_mapper.hpp>
+#include <tt_stl/assert.hpp>
+#include <tt-umd/types/cluster_descriptor_types.hpp>  // ChipId
+#include <vector>
+#include <algorithm>
+#include <cctype>
+#include <cstring>
+#include <unordered_map>
+#include <set>
+#include <filesystem>
+#include <fstream>
+#include <fmt/format.h>
+#include <yaml-cpp/yaml.h>
+#include <tt-logger/tt-logger.hpp>
+#include <llrt/tt_cluster.hpp>
+#include "dispatch/kernel_config/relay_mux.hpp"
+
+namespace tt::tt_fabric {
+
+namespace {
+
+// The export key is the machine name. Ranks that share a machine already share it; the MPI rank on
+// each chip is what separates them.
+HostName hostname_for_mapping_export(const HostName& hostname, bool /*mock_enabled*/) { return hostname; }
+
+// yaml-cpp does not terminate a document. Files copied into the repo as goldens are rejected by
+// pre-commit's end-of-file-fixer without a trailing newline.
+void write_yaml_document(std::ostream& out, const YAML::Emitter& emitter) {
+    const char* text = emitter.c_str();
+    out << text;
+    if (emitter.size() == 0 || text[emitter.size() - 1] != '\n') {
+        out << '\n';
+    }
+}
+
+}  // namespace
+
+bool is_tt_fabric_config(tt::tt_fabric::FabricConfig fabric_config) {
+    return is_1d_fabric_config(fabric_config) || is_2d_fabric_config(fabric_config);
+}
+
+FabricType get_fabric_type(tt::tt_fabric::FabricConfig fabric_config, bool is_ubb_galaxy) {
+    switch (fabric_config) {
+        // Issue: 32146, Special case for T3k WH devices to use Mesh fabric type instead of Torus_XY
+        // WH T3K currently do not support Torus_XY fabric type, because they do not have wrapping connections.
+        // If you want to use 1D Ring on t3k please use 1x8 MGD.
+        case tt::tt_fabric::FabricConfig::FABRIC_1D_NEIGHBOR_EXCHANGE:
+        case tt::tt_fabric::FabricConfig::FABRIC_1D_RING: {
+            if (is_ubb_galaxy) {
+                return FabricType::TORUS_XY;
+            }
+            return FabricType::MESH;
+        }
+        case tt::tt_fabric::FabricConfig::FABRIC_2D_TORUS_X: return FabricType::TORUS_X;
+        case tt::tt_fabric::FabricConfig::FABRIC_2D_TORUS_Y: return FabricType::TORUS_Y;
+        case tt::tt_fabric::FabricConfig::FABRIC_2D_TORUS_XY: return FabricType::TORUS_XY;
+        default: return FabricType::MESH;
+    }
+}
+
+bool requires_more_connectivity(FabricType requested_type, FabricType available_type, const MeshShape& mesh_shape) {
+    for (uint32_t axis = 0; axis < 2; ++axis) {
+        if (has_genuine_torus_axis(requested_type, mesh_shape, axis) &&
+            !has_genuine_torus_axis(available_type, mesh_shape, axis)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+uint32_t compute_max_1d_hops(const std::vector<MeshShape>& mesh_shapes) {
+    if (mesh_shapes.empty()) {
+        return 0;
+    }
+
+    uint32_t max_dimension = 0;
+    for (const auto& shape : mesh_shapes) {
+        // For 1D routing, find the maximum dimension (either rows or cols)
+        // Hops = max_dimension - 1 (e.g., 8 chips in a line = 7 hops)
+        uint32_t rows = shape[0];
+        uint32_t cols = shape[1];
+        uint32_t mesh_max_dim = std::max(rows, cols);
+        max_dimension = std::max(max_dimension, mesh_max_dim);
+    }
+
+    return (max_dimension > 0) ? (max_dimension - 1) : 0;
+}
+
+uint32_t compute_max_2d_hops(const std::vector<MeshShape>& mesh_shapes) {
+    if (mesh_shapes.empty()) {
+        return 0;
+    }
+
+    uint32_t max_hops = 0;
+    for (const auto& shape : mesh_shapes) {
+        // For 2D routing, compute Manhattan distance from corner to corner
+        // Hops = (rows - 1) + (cols - 1)
+        uint32_t rows = shape[0];
+        uint32_t cols = shape[1];
+        uint32_t mesh_hops = (rows - 1) + (cols - 1);
+        max_hops = std::max(max_hops, mesh_hops);
+    }
+
+    return max_hops;
+}
+
+std::vector<uint32_t> get_forwarding_link_indices_in_direction(
+    const ControlPlane& control_plane,
+    const FabricNodeId& src_fabric_node_id,
+    const FabricNodeId& dst_fabric_node_id,
+    RoutingDirection direction) {
+    const std::vector<chan_id_t>& fabric_channels =
+        control_plane.get_active_fabric_eth_channels_in_direction(src_fabric_node_id, direction);
+
+    // the subset of routers that support forwarding b/w those chips
+    std::vector<chan_id_t> forwarding_channels;
+    forwarding_channels =
+        control_plane.get_forwarding_eth_chans_to_chip(src_fabric_node_id, dst_fabric_node_id, direction);
+
+    std::vector<uint32_t> link_indices;
+    link_indices.reserve(forwarding_channels.size());
+    for (uint32_t i = 0; i < fabric_channels.size(); i++) {
+        if (std::find(forwarding_channels.begin(), forwarding_channels.end(), fabric_channels[i]) !=
+            forwarding_channels.end()) {
+            link_indices.push_back(i);
+        }
+    }
+
+    return link_indices;
+}
+
+std::vector<uint32_t> get_forwarding_link_indices(
+    const ControlPlane& control_plane, const FabricNodeId& src_fabric_node_id, const FabricNodeId& dst_fabric_node_id) {
+    // find the forwarding direction b/w src and dest chip
+    const auto forwarding_direction = control_plane.get_forwarding_direction(src_fabric_node_id, dst_fabric_node_id);
+    if (!forwarding_direction.has_value()) {
+        return {};
+    }
+
+    return get_forwarding_link_indices_in_direction(
+        control_plane, src_fabric_node_id, dst_fabric_node_id, forwarding_direction.value());
+}
+
+std::map<ChipId, std::set<chan_id_t>> get_remote_transfer_dispatch_channels(
+    const ControlPlane& control_plane, const tt::Cluster& cluster) {
+    std::map<ChipId, std::set<chan_id_t>> dispatch_chans_per_mmio_chip;
+    if (cluster.arch() != tt::ARCH::WORMHOLE_B0 || cluster.is_galaxy_cluster()) {
+        return dispatch_chans_per_mmio_chip;
+    }
+    // Only chips this host's fabric mesh uses. The mesh can be smaller than the physical cluster, and looking up a chip
+    // outside it is fatal on silicon.
+    std::unordered_map<ChipId, FabricNodeId> local_fabric_nodes;
+    for (const auto& [fabric_node, physical_chip] :
+         control_plane.get_topology_mapper().get_local_logical_mesh_chip_id_to_physical_chip_id_mapping()) {
+        local_fabric_nodes.emplace(physical_chip, fabric_node);
+    }
+    for (const auto mmio_chip : cluster.mmio_chip_ids()) {
+        const auto mmio_node_it = local_fabric_nodes.find(mmio_chip);
+        if (mmio_node_it == local_fabric_nodes.end()) {
+            continue;
+        }
+        const auto mmio_node = mmio_node_it->second;
+        std::set<chan_id_t> dispatch_chans;
+        for (const auto remote_chip : cluster.get_devices_controlled_by_mmio_device(mmio_chip)) {
+            const auto remote_node_it = local_fabric_nodes.find(remote_chip);
+            if (remote_chip == mmio_chip || remote_node_it == local_fabric_nodes.end()) {
+                continue;
+            }
+            const auto remote_node = remote_node_it->second;
+            const auto direction = control_plane.get_forwarding_direction(mmio_node, remote_node);
+            if (!direction.has_value()) {
+                continue;
+            }
+            const auto neighbors = control_plane.get_chip_neighbors(mmio_node, *direction);
+            const auto same_mesh = neighbors.find(remote_node.mesh_id);
+            if (same_mesh == neighbors.end() ||
+                std::find(same_mesh->second.begin(), same_mesh->second.end(), remote_node.chip_id) ==
+                    same_mesh->second.end()) {
+                continue;  // only remote chips one hop away
+            }
+            if (get_forwarding_link_indices(control_plane, mmio_node, remote_node).empty()) {
+                continue;
+            }
+            // The link FabricBuilder::discover_channels configures for dispatch. Galaxy is excluded above, and the
+            // device argument is only read on Galaxy.
+            const auto dispatch_link_idx = tt::tt_metal::RelayMux::get_dispatch_link_index(
+                control_plane, /*is_galaxy_cluster=*/false, mmio_node, remote_node, /*device=*/nullptr);
+            for (const auto eth_chan :
+                 control_plane.get_active_fabric_eth_routing_planes_in_direction(mmio_node, *direction)) {
+                if (control_plane.get_routing_plane_id(mmio_node, eth_chan) == dispatch_link_idx) {
+                    dispatch_chans.insert(eth_chan);
+                }
+            }
+        }
+        if (!dispatch_chans.empty()) {
+            dispatch_chans_per_mmio_chip.emplace(mmio_chip, std::move(dispatch_chans));
+        }
+    }
+    return dispatch_chans_per_mmio_chip;
+}
+
+void serialize_mesh_coordinates_to_file(
+    const TopologyMapper& topology_mapper, const std::filesystem::path& output_file_path) {
+    // Ensure output directory exists
+    std::filesystem::create_directories(output_file_path.parent_path());
+
+    // Get the mapping from TopologyMapper
+    const auto& mapping = topology_mapper.get_local_logical_mesh_chip_id_to_physical_chip_id_mapping();
+    const auto& mesh_graph = topology_mapper.get_mesh_graph();
+
+    // Write to file using emitter with Flow style for inline sequences
+    std::ofstream out_file(output_file_path);
+    if (!out_file.is_open()) {
+        TT_THROW("Failed to open output file: {}", output_file_path.string());
+    }
+
+    YAML::Emitter emitter;
+    emitter << YAML::BeginMap;
+    emitter << YAML::Key << "chips";
+    emitter << YAML::Value << YAML::BeginMap;
+
+    // Emit each chip with flow style for the coordinate array
+    for (const auto& [fabric_node_id, physical_chip_id] : mapping) {
+        MeshCoordinate mesh_coord = mesh_graph.chip_to_coordinate(fabric_node_id.mesh_id, fabric_node_id.chip_id);
+        emitter << YAML::Key << physical_chip_id;
+        emitter << YAML::Value;
+        emitter << YAML::Flow << YAML::BeginSeq;
+        for (size_t dim = 0; dim < mesh_coord.dims(); ++dim) {
+            emitter << mesh_coord[dim];
+        }
+        emitter << YAML::EndSeq;
+    }
+
+    emitter << YAML::EndMap;
+    emitter << YAML::EndMap;
+    out_file << emitter.c_str();
+    out_file.close();
+
+    log_debug(tt::LogFabric, "Serialized physical chip mesh coordinate mapping to file: {}", output_file_path.string());
+}
+
+void serialize_asic_to_fabric_node_mapping_to_file(
+    const TopologyMapper& topology_mapper, const std::filesystem::path& output_file_path, bool mock_enabled) {
+    // Ensure output directory exists
+    std::filesystem::create_directories(output_file_path.parent_path());
+
+    const auto& mesh_graph = topology_mapper.get_mesh_graph();
+
+    // Structure: hostname -> mesh_id -> umd_chip_id -> {asic_position, fabric_node_id, asic_id}
+    struct AsicMapping {
+        tt::tt_metal::TrayID tray_id;
+        tt::tt_metal::ASICLocation asic_location;
+        FabricNodeId fabric_node_id;
+        tt::tt_metal::AsicID asic_id;
+    };
+    std::map<HostName, std::map<MeshId, std::map<ChipId, AsicMapping>>> mappings_by_host_mesh_and_chip;
+
+    // Iterate through all meshes
+    for (const auto& mesh_id : mesh_graph.get_all_mesh_ids()) {
+        // Iterate through all fabric nodes in this mesh
+        for (const auto& [_, chip_id] : mesh_graph.get_chip_ids(mesh_id)) {
+            FabricNodeId fabric_node_id(mesh_id, chip_id);
+
+            try {
+                // Get ASIC ID for this fabric node
+                tt::tt_metal::AsicID asic_id = topology_mapper.get_asic_id_from_fabric_node_id(fabric_node_id);
+
+                // Get physical chip ID (UMD chip ID) for this fabric node
+                ChipId umd_chip_id = topology_mapper.get_physical_chip_id_from_fabric_node_id(fabric_node_id);
+
+                // ASIC position straight from the mapper's address for this node. Asking the descriptor
+                // by asic_id instead would work only when the descriptor being solved on is also the one
+                // that labelled the chip -- on the factory path asic_id is a UMD id the descriptor has
+                // never heard of, and the catch below would silently drop every chip from the export.
+                const auto address = topology_mapper.get_physical_node_id_from_fabric_node_id(fabric_node_id);
+                tt::tt_metal::TrayID tray_id = address.tray;
+                tt::tt_metal::ASICLocation asic_location = address.loc;
+
+                // Get hostname for this fabric node (mock: cluster descriptor filename)
+                HostName hostname = hostname_for_mapping_export(
+                    topology_mapper.get_hostname_for_fabric_node_id(fabric_node_id), mock_enabled);
+
+                // Add to the mapping structure, indexed by umd_chip_id (physical chip ID)
+                AsicMapping mapping{tray_id, asic_location, fabric_node_id, asic_id};
+                mappings_by_host_mesh_and_chip[hostname][mesh_id].emplace(umd_chip_id, mapping);
+            } catch (...) {
+                // Skip unmapped fabric nodes
+                continue;
+            }
+        }
+    }
+
+    // Write to file using YAML emitter
+    std::ofstream out_file(output_file_path);
+    if (!out_file.is_open()) {
+        TT_THROW("Failed to open output file: {}", output_file_path.string());
+    }
+
+    YAML::Emitter emitter;
+    emitter << YAML::BeginMap;
+    emitter << YAML::Key << "asic_to_fabric_node_mapping";
+    emitter << YAML::Value;
+    emitter << YAML::BeginMap;
+    emitter << YAML::Key << "hostnames";
+    emitter << YAML::Value << YAML::BeginSeq;
+
+    // Emit each hostname as a list item
+    for (const auto& [hostname, mesh_mappings] : mappings_by_host_mesh_and_chip) {
+        emitter << YAML::BeginMap;
+        emitter << YAML::Key << "hostname";
+        emitter << YAML::Value << hostname;
+
+        // Emit mesh as a key with a list value
+        emitter << YAML::Key << "mesh";
+        emitter << YAML::Value << YAML::BeginSeq;
+
+        // Emit each mesh within this hostname
+        for (const auto& [mesh_id, chip_mappings] : mesh_mappings) {
+            // First emit mesh entry
+            emitter << YAML::BeginMap;
+            emitter << YAML::Key << "mesh";
+            emitter << YAML::Value << *mesh_id;
+            emitter << YAML::EndMap;
+
+            // Then emit chips entry
+            emitter << YAML::BeginMap;
+            emitter << YAML::Key << "chips";
+            emitter << YAML::Value << YAML::BeginSeq;
+
+            // Emit each umd_chip_id mapping (physical chip ID)
+            for (const auto& [umd_chip_id, mapping] : chip_mappings) {
+                emitter << YAML::BeginMap;
+
+                // Emit umd_chip_id field
+                emitter << YAML::Key << "umd_chip_id";
+                emitter << YAML::Value << umd_chip_id;
+
+                // Emit asic_position
+                emitter << YAML::Key << "asic_position";
+                emitter << YAML::Value;
+                emitter << YAML::BeginMap;
+                emitter << YAML::Key << "tray_id";
+                emitter << YAML::Value << *mapping.tray_id;
+                emitter << YAML::Key << "asic_location";
+                emitter << YAML::Value << *mapping.asic_location;
+                emitter << YAML::EndMap;
+
+                // Emit fabric_node_id
+                emitter << YAML::Key << "fabric_node_id";
+                emitter << YAML::Value;
+                emitter << YAML::BeginMap;
+                emitter << YAML::Key << "mesh_id";
+                emitter << YAML::Value << *mapping.fabric_node_id.mesh_id;
+                emitter << YAML::Key << "chip_id";
+                emitter << YAML::Value << mapping.fabric_node_id.chip_id;
+                emitter << YAML::EndMap;
+
+                // Emit asic_id as the last field
+                emitter << YAML::Key << "asic_id";
+                emitter << YAML::Value << *mapping.asic_id;
+
+                emitter << YAML::EndMap;
+            }
+
+            emitter << YAML::EndSeq;
+            emitter << YAML::EndMap;
+        }
+
+        emitter << YAML::EndSeq;
+        emitter << YAML::EndMap;
+    }
+
+    emitter << YAML::EndSeq;
+    emitter << YAML::EndMap;
+    emitter << YAML::EndMap;
+    write_yaml_document(out_file, emitter);
+    out_file.close();
+
+    log_debug(tt::LogFabric, "Serialized ASIC to Fabric node ID mapping to file: {}", output_file_path.string());
+}
+
+void serialize_intermesh_port_assignment_to_file(
+    const std::map<FabricNodeId, std::unordered_map<chan_id_t, RoutingDirection>>& exit_node_directions,
+    const std::map<FabricNodeId, std::unordered_map<chan_id_t, std::pair<FabricNodeId, chan_id_t>>>&
+        intermesh_chan_to_peer,
+    const std::filesystem::path& output_file_path) {
+    auto dir_to_str = [](RoutingDirection d) -> const char* {
+        switch (d) {
+            case RoutingDirection::N: return "N";
+            case RoutingDirection::E: return "E";
+            case RoutingDirection::S: return "S";
+            case RoutingDirection::W: return "W";
+            case RoutingDirection::Z: return "Z";
+            case RoutingDirection::C: return "C";
+            default: return "NONE";
+        }
+    };
+
+    std::map<std::string, std::vector<std::string>> intermesh_port_assignment;
+    for (const auto& [my_fn, chan_map] : intermesh_chan_to_peer) {
+        std::vector<chan_id_t> chans;
+        chans.reserve(chan_map.size());
+        for (const auto& [c, _peer] : chan_map) {
+            chans.push_back(c);
+        }
+        std::sort(chans.begin(), chans.end());
+        for (auto c : chans) {
+            const auto& [peer_fn, peer_chan] = chan_map.at(c);
+            RoutingDirection dir = RoutingDirection::NONE;
+            if (auto dit = exit_node_directions.find(my_fn); dit != exit_node_directions.end()) {
+                if (auto cit = dit->second.find(c); cit != dit->second.end()) {
+                    dir = cit->second;
+                }
+            }
+            intermesh_port_assignment[fmt::format("M{}->M{}", *my_fn.mesh_id, *peer_fn.mesh_id)].push_back(fmt::format(
+                "D{}ch{}({})>M{}D{}ch{}",
+                my_fn.chip_id,
+                c,
+                dir_to_str(dir),
+                *peer_fn.mesh_id,
+                peer_fn.chip_id,
+                peer_chan));
+        }
+    }
+    for (auto& [_boundary, entries] : intermesh_port_assignment) {
+        std::sort(entries.begin(), entries.end());
+    }
+
+    std::filesystem::create_directories(output_file_path.parent_path());
+
+    std::ofstream out_file(output_file_path);
+    if (!out_file.is_open()) {
+        TT_THROW("Failed to open output file: {}", output_file_path.string());
+    }
+    YAML::Emitter emitter;
+    emitter << YAML::BeginMap;
+    emitter << YAML::Key << "intermesh_port_assignment" << YAML::Value << YAML::BeginMap;
+    for (const auto& [boundary, entries] : intermesh_port_assignment) {
+        emitter << YAML::Key << boundary << YAML::Value << YAML::Flow << YAML::BeginSeq;
+        for (const auto& entry : entries) {
+            emitter << entry;
+        }
+        emitter << YAML::EndSeq;
+    }
+    emitter << YAML::EndMap;
+    emitter << YAML::EndMap;
+    write_yaml_document(out_file, emitter);
+    out_file.close();
+
+    log_debug(tt::LogFabric, "Serialized inter-mesh port assignment to file: {}", output_file_path.string());
+}
+
+}  // namespace tt::tt_fabric

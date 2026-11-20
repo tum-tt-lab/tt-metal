@@ -1,0 +1,266 @@
+# SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
+
+# SPDX-License-Identifier: Apache-2.0
+
+import ttnn
+import torch
+from loguru import logger
+
+
+def test_concat(device):
+    # Create two tensors to concatenate
+    tensor1 = ttnn.rand([1, 1, 64, 32], dtype=ttnn.bfloat16, device=device)
+    tensor2 = ttnn.rand([1, 1, 64, 32], dtype=ttnn.bfloat16, device=device)
+
+    # Concatenate along dimension 3
+    concatenated_tensor = ttnn.concat([tensor1, tensor2], dim=3)
+    logger.info(f"Concatenated Tensor Shape: {concatenated_tensor.shape}")  # Shape([1, 1, 64, 64])
+
+
+def test_nonzero(device):
+    # Create a rank-4 tensor with three non-zero elements
+    input_tensor = torch.zeros((1, 1, 1, 32), dtype=torch.bfloat16)
+    input_tensor[0, 0, 0, [3, 10, 20]] = 1
+    input_tensor_ttnn = ttnn.from_torch(input_tensor, device=device)
+
+    # Find the non-zero elements: the first output holds the count, the second the (n, c, h, w) indices
+    count_tensor, indices_tensor = ttnn.nonzero(input_tensor_ttnn)
+    count = int(ttnn.to_torch(count_tensor)[0, 0, 0, 0])
+    indices = ttnn.to_torch(indices_tensor)[0, 0, 0, : 4 * count].reshape(count, 4)
+    logger.info(f"Non-zero count: {count}")  # 3
+    logger.info(f"Non-zero indices: {indices.tolist()}")  # [[0, 0, 0, 3], [0, 0, 0, 10], [0, 0, 0, 20]]
+
+
+def test_pad(device):
+    # Create a tensor to pad
+    input_tensor = ttnn.rand((1, 1, 4, 4), dtype=ttnn.bfloat16, device=device)
+
+    # Pad the last two dimensions with 12 zeros at the end
+    padded_tensor = ttnn.pad(input_tensor, [(0, 0), (0, 0), (0, 12), (0, 12)], 0)
+    logger.info(f"Padded Tensor Shape: {padded_tensor.shape}")  # Shape([1, 1, 16, 16])
+
+
+def test_permute(device):
+    # Create a tensor to permute
+    input_tensor = ttnn.rand((1, 1, 64, 32), dtype=ttnn.bfloat16, device=device)
+
+    # Permute the tensor dimensions
+    permuted_tensor = ttnn.permute(input_tensor, (0, 1, 3, 2))
+    logger.info(f"Permuted Tensor Shape: {permuted_tensor.shape}")  # Shape([1, 1, 32, 64])
+
+
+def test_reshape(device):
+    # Create a tensor to reshape
+    input_tensor = torch.arange(4, dtype=torch.bfloat16)
+    input_tensor_tt = ttnn.from_torch(input_tensor, device=device)
+
+    # Reshape the tensor
+    reshaped_tensor = ttnn.reshape(input_tensor_tt, (1, 1, 2, 2))
+    logger.info(f"Reshaped Tensor Shape: {reshaped_tensor.shape}")  # Shape([1, 1, 2, 2])
+
+
+def test_scatter(device):
+    # Create input, index, and source tensors
+    input_torch = torch.randn([10, 20, 30, 20, 10], dtype=torch.float32)
+    index_torch = torch.randint(0, 10, [10, 20, 30, 20, 5], dtype=torch.int64)
+    source_torch = torch.randn([10, 20, 30, 20, 10], dtype=input_torch.dtype)
+
+    input_ttnn = ttnn.from_torch(input_torch, dtype=ttnn.bfloat16, device=device, layout=ttnn.ROW_MAJOR_LAYOUT)
+    index_ttnn = ttnn.from_torch(index_torch, dtype=ttnn.int32, device=device, layout=ttnn.ROW_MAJOR_LAYOUT)
+    source_ttnn = ttnn.from_torch(source_torch, dtype=ttnn.bfloat16, device=device, layout=ttnn.ROW_MAJOR_LAYOUT)
+    dim = -1
+
+    # Perform scatter operation
+    output = ttnn.scatter(input_ttnn, dim, index_ttnn, source_ttnn)
+    logger.debug(f"Scatter operation result: {output}")
+
+
+def test_scatter_add(device):
+    # Create input, index, and source tensors for scatter_add
+    input_torch = torch.tensor([[1, 2], [3, 4]], dtype=torch.float32)
+    index_torch = torch.tensor([[0, 1], [1, 0]], dtype=torch.int64)
+    source_torch = torch.tensor([[5, 6], [7, 8]], dtype=torch.float32)
+
+    input_ttnn = ttnn.from_torch(input_torch, dtype=ttnn.float32, device=device, layout=ttnn.ROW_MAJOR_LAYOUT)
+    index_ttnn = ttnn.from_torch(index_torch, dtype=ttnn.int32, device=device, layout=ttnn.ROW_MAJOR_LAYOUT)
+    source_ttnn = ttnn.from_torch(source_torch, dtype=ttnn.float32, device=device, layout=ttnn.ROW_MAJOR_LAYOUT)
+    dim = 1
+
+    # Perform scatter_add operation (adds source values to input at specified indices)
+    output = ttnn.scatter_add(input_ttnn, dim, index_ttnn, source_ttnn)
+    logger.debug(f"Scatter add operation result: {output}")
+
+
+def test_repeat(device):
+    # Create a tensor to repeat
+    input_tensor = torch.tensor([[1, 2], [3, 4]])
+    input_tensor_tt = ttnn.from_torch(input_tensor, device=device)
+
+    # Repeat the tensor along specified dimensions
+    repeated_tensor = ttnn.repeat(input_tensor_tt, (1, 2))
+    logger.info(f"Repeated Tensor Shape: {repeated_tensor.shape}")  # Shape([2, 4])
+
+
+def test_repeat_interleave(device):
+    # Create a tensor to repeat interleave
+    input_tensor = ttnn.rand((10, 10), dtype=ttnn.bfloat16, layout=ttnn.Layout.TILE, device=device)
+
+    # Repeat interleave the tensor
+    repeated_tensor = ttnn.repeat_interleave(input_tensor, repeats=2, dim=0)
+    logger.info(f"Repeat Interleave Tensor Shape: {repeated_tensor.shape}")  # Shape([20, 10])
+
+
+def test_slice(device):
+    # Create a tensor to slice
+    input_tensor = ttnn.rand((1, 1, 64, 32), dtype=ttnn.bfloat16, layout=ttnn.Layout.TILE, device=device)
+
+    # Slice the tensor
+    sliced_tensor = ttnn.slice(input_tensor, [0, 0, 0, 0], [1, 1, 64, 16], [1, 1, 2, 1])
+    logger.info(f"Sliced Tensor Shape: {sliced_tensor.shape}")  # Shape([1, 1, 32, 16])
+
+    # Create a tensor to slice without step
+    input_tensor = ttnn.rand((1, 1, 64, 32), dtype=ttnn.bfloat16, layout=ttnn.Layout.TILE, device=device)
+    output = ttnn.slice(input_tensor, [0, 0, 0, 0], [1, 1, 32, 32])
+    logger.info(f"Sliced Tensor Shape: {output.shape}")  # Shape([1, 1, 32, 32])
+
+
+def test_tilize(device):
+    # Create a tensor to tilize
+    input_tensor = ttnn.rand((1, 1, 64, 32), dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
+
+    # Tilize the tensor
+    tilized_tensor = ttnn.tilize(input_tensor)
+    logger.info(f"Tilized Tensor Layout: {tilized_tensor.layout}")  # Layout.TILE
+
+
+def test_tilize_with_val_padding(device):
+    # Create a tensor to tilize with value padding
+    input_tensor = ttnn.rand((1, 1, 64, 32), dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
+
+    # Tilize the tensor, padding its last dimension to 64 with zeros
+    tilized_tensor = ttnn.tilize_with_val_padding(input_tensor, output_tensor_shape=[1, 1, 64, 64], pad_value=0.0)
+    logger.debug(f"Tilized Tensor Shape: {tilized_tensor.shape}")  # Shape([1, 1, 64, 32])
+    logger.debug(f"Tilized Tensor Padded Shape: {tilized_tensor.padded_shape}")  # Shape([1, 1, 64, 64])
+
+
+def test_fill_rm(device):
+    # Define tensor dimensions
+    N = 2
+    C = 3
+    H = 64
+    W = 96
+
+    # Define fill dimensions
+    hOnes = 33
+    wOnes = 31
+
+    # Define fill values
+    val_hi = 1.0
+    val_lo = 0.0
+
+    # Create input tensor
+    input = torch.zeros((N, C, H, W))
+    xt = ttnn.from_torch(input, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT).to(device)
+
+    # Fill the tensor
+    output = ttnn.fill_rm(N, C, H, W, hOnes, wOnes, xt, val_hi, val_lo)
+    logger.info(f"Filled Tensor Shape: {output.shape}")  # Shape([2, 3, 64, 96])
+
+
+def test_fill_ones_rm(device):
+    # Define tensor dimensions
+    N = 2
+    C = 3
+    H = 64
+    W = 96
+
+    # Define fill dimensions
+    hOnes = 33
+    wOnes = 31
+
+    # Create input tensor
+    input = torch.zeros((N, C, H, W))
+    xt = ttnn.from_torch(input, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT).to(device)
+
+    # Fill the tensor
+    output = ttnn.fill_ones_rm(N, C, H, W, hOnes, wOnes, xt)
+    logger.info(f"Filled Ones Tensor Shape: {output.shape}")  # Shape([2, 3, 64, 96])
+
+
+def test_untilize(device):
+    # Create a tilized tensor
+    tilized_tensor = ttnn.rand((1, 1, 64, 32), dtype=ttnn.bfloat16, layout=ttnn.Layout.TILE, device=device)
+
+    # Untilize the tensor
+    untilized_tensor = ttnn.untilize(tilized_tensor)
+    logger.info(f"Untilized Tensor Layout: {untilized_tensor.layout}")  # Layout.ROW_MAJOR
+
+
+def test_untilize_with_unpadding(device):
+    # Create a tilized tensor with padding
+    tilized_tensor = ttnn.rand((1, 1, 64, 64), dtype=ttnn.bfloat16, layout=ttnn.Layout.TILE, device=device)
+
+    # Untilize the tensor and keep its first 32 columns; output_tensor_end holds inclusive end indices
+    untilized_tensor = ttnn.untilize_with_unpadding(tilized_tensor, output_tensor_end=(0, 0, 63, 31))
+    logger.debug(f"Untilized Tensor with Unpadding Shape: {untilized_tensor.shape}")  # Shape([1, 1, 64, 32])
+
+
+def test_indexed_fill(device):
+    # Define shapes for input tensors
+    input_a_shape = (32, 1, 1, 4)
+    input_b_shape = (6, 1, 1, 4)
+
+    # Create a tensors to perform indexed fill
+    batch_id = torch.randint(0, (32 - 1), (1, 1, 1, 6))
+    batch_id_ttnn = ttnn.Tensor(batch_id, ttnn.uint32).to(
+        device, ttnn.MemoryConfig(ttnn.TensorMemoryLayout.INTERLEAVED, ttnn.BufferType.L1)
+    )
+    input_tensor_a = ttnn.rand(input_a_shape, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
+    input_tensor_b = ttnn.rand(input_b_shape, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT, device=device)
+
+    # Perform indexed fill
+    output_tensor = ttnn.indexed_fill(batch_id_ttnn, input_tensor_a, input_tensor_b)
+    logger.info("Indexed Fill Output Tensor Shape:", output_tensor.shape)
+
+
+def test_gather(device):
+    # Create a tensor and an index tensor
+    ttnn_input = ttnn.rand((4, 4), dtype=ttnn.bfloat16, layout=ttnn.Layout.TILE, device=device)
+    ttnn_index = ttnn.from_torch(
+        torch.tensor([[0, 1], [1, 2], [2, 3], [3, 0]], dtype=torch.int32),
+        dtype=ttnn.uint16,
+        layout=ttnn.Layout.TILE,
+        device=device,
+    )
+
+    # Gather elements along dimension 1 using the index tensor
+    gathered_tensor = ttnn.gather(ttnn_input, 1, index=ttnn_index)
+    logger.info(f"Gathered Tensor Shape: {gathered_tensor.shape}")  # Shape([4, 2])
+
+
+def test_sort(device):
+    # Create a tensor
+    input_tensor = torch.Tensor([[3, 1, 2], [3, 1, 2]])
+
+    # Convert tensor to ttnn format
+    input_tensor_ttnn = ttnn.from_torch(input_tensor, dtype=ttnn.bfloat16, layout=ttnn.Layout.TILE, device=device)
+
+    # Sort the tensor in ascending order
+    sorted_tensor, indices = ttnn.sort(input_tensor_ttnn)
+    logger.info(f"Sorted Tensor: {sorted_tensor}, Indices: {indices}")
+
+    # Sort the tensor in descending order
+    sorted_tensor_desc, indices_desc = ttnn.sort(input_tensor_ttnn, descending=True)
+    logger.info(f"Sorted Tensor Descending: {sorted_tensor_desc}, Indices: {indices_desc}")
+
+    # Sort along a specific dimension
+    input_tensor_2d = torch.Tensor([[3, 1, 2], [6, 5, 4]])
+    input_tensor_2d_ttnn = ttnn.from_torch(input_tensor_2d, dtype=ttnn.bfloat16, layout=ttnn.Layout.TILE, device=device)
+    sorted_tensor_dim, indices_dim = ttnn.sort(input_tensor_2d_ttnn, dim=1)
+    logger.info(f"Sorted Tensor along dim 1: {sorted_tensor_dim}, Indices: {indices_dim}")
+
+
+def test_narrow(device):
+    input_tensor = ttnn.rand((32, 16, 16, 4), dtype=ttnn.bfloat16, device=device)
+    narrowed_tensor = ttnn.narrow(input_tensor, 0, 0, 12)
+    logger.info("Narrowed Tensor Shape:", narrowed_tensor.shape)
