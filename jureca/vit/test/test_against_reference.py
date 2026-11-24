@@ -33,7 +33,7 @@ torch.set_num_threads(int(os.environ.get("SLURM_CPUS_PER_TASK", 4)))
 
 
 def timm_vit(depth, dim, heads, mlp_dim):
-    """The reference model. Second line: as in reference/deit/models.py L65-66. Third line: our two
+    """The reference model. Second line: as in reference/deit/models.py.txt L65-66. Third line: our two
     deviations (patch size 4 on 32x32 images; mean pooling after the final norm instead of a class token)."""
     return VisionTransformer(
         embed_dim=dim, depth=depth, num_heads=heads, mlp_ratio=mlp_dim / dim, num_classes=100,
@@ -57,7 +57,7 @@ def to_timm(weights):
 
 
 def deit_args(epochs, warmup_epochs, batch_size):
-    """The defaults of reference/deit/main.py (L56-92) that the optimizer and scheduler factories read."""
+    """The defaults of reference/deit/main.py.txt (L56-92) that the optimizer and scheduler factories read."""
     return argparse.Namespace(
         opt="adamw", opt_eps=1e-8, opt_betas=None, momentum=0.9, weight_decay=0.05,
         lr=5e-4 * batch_size / 512,  # main.py L350
@@ -75,7 +75,7 @@ def check(name, difference, tolerance):
 
 def test_normalisation():
     ours = torch.cat([common.MEAN.flatten(), common.STD.flatten()])
-    reference = torch.tensor(IMAGENET_DEFAULT_MEAN + IMAGENET_DEFAULT_STD)  # reference/deit/datasets.py L108
+    reference = torch.tensor(IMAGENET_DEFAULT_MEAN + IMAGENET_DEFAULT_STD)  # reference/deit/datasets.py.txt L108
     return check("normalisation constants", (ours - reference).abs().max().item(), 0)
 
 
@@ -104,7 +104,7 @@ def test_model(size, images, labels):
 
 
 def test_schedule(epochs, warmup_epochs, batch_size):
-    """Our learning rate of every epoch against timm's scheduler, created as in reference/deit/main.py L355."""
+    """Our learning rate of every epoch against timm's scheduler, created as in reference/deit/main.py.txt L355."""
     args = deit_args(epochs, warmup_epochs, batch_size)
     optimizer = torch.optim.SGD([nn.Parameter(torch.zeros(1))], lr=args.lr)
     scheduler, _ = create_scheduler(args, optimizer)
@@ -117,7 +117,7 @@ def test_schedule(epochs, warmup_epochs, batch_size):
 
 
 def test_optimizer(defaults):
-    """Our optimizer against timm's factory, called as in reference/deit/main.py L352: every single
+    """Our optimizer against timm's factory, called as in reference/deit/main.py.txt L352: every single
     parameter must get the same weight decay, learning rate and Adam settings."""
     ours_model, reference_model = ViT(**common.MODELS["tiny"]), timm_vit(**common.MODELS["tiny"])
     ours = train_torch.make_optimizer(ours_model, defaults.lr, defaults.weight_decay)
@@ -149,7 +149,7 @@ def test_training(data, epochs=4, warmup_epochs=2, batch_size=256, images=1024):
     args = deit_args(epochs, warmup_epochs, batch_size)
     model = timm_vit(**common.MODELS["tiny"])
     model.load_state_dict(to_timm(torch.load(os.path.join(out, "init.pt"))))
-    optimizer = create_optimizer(args, model)  # reference/deit/main.py L352
+    optimizer = create_optimizer(args, model)  # reference/deit/main.py.txt L352
     scheduler, _ = create_scheduler(args, optimizer)  # L355
     criterion = LabelSmoothingCrossEntropy(smoothing=0.1)  # L363
 
@@ -160,7 +160,7 @@ def test_training(data, epochs=4, warmup_epochs=2, batch_size=256, images=1024):
     for epoch in range(epochs):
         scheduler.step(epoch)  # DeiT calls this after the epoch (L432); see REPORT.md, "One deliberate difference"
         for idx in common.batches(len(train_x), batch_size, data_order):
-            loss = criterion(model(train_x[idx]), train_y[idx])  # reference/deit/engine.py L46-68
+            loss = criterion(model(train_x[idx]), train_y[idx])  # reference/deit/engine.py.txt L46-68
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()

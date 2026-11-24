@@ -99,7 +99,7 @@ notices them. `broken_copies.py` repeats this whole experiment.
   timm 0.3.2. The parts DeiT calls (schedule, weight-decay rule, loss) were compared by reading;
   they are the same. The old files are in `reference/timm_0.3.3/`.
 - **DeiT's own script.** It is not executed. Its settings were typed into `deit_args` in the
-  test by hand; compare them with `reference/deit/main.py` L56-92.
+  test by hand; compare them with `reference/deit/main.py.txt` L56-92.
 - **Other hardware or number formats.** Everything ran on a CPU in 32-bit floating point.
 - **Whether the training is any good.** The test only shows that two implementations agree.
 
@@ -110,7 +110,7 @@ notices them. `broken_copies.py` repeats this whole experiment.
    mean pooling works as well as a class token, but needs a different learning rate. We keep
    DeiT's learning rate, which was chosen for a class token, so it may not be the best one for
    our model. The reference model in the test is set up with mean pooling too, in the way the
-   ViT authors' code does it (`reference/vit_jax/models_vit.py` L206 and L289-290).
+   ViT authors' code does it (`reference/vit_jax/models_vit.py.txt` L206 and L289-290).
 3. **No augmentation, stochastic depth, weight averaging or mixed precision.**
 4. **Batch size 512 and 200 epochs by default.** Neither paper trains from scratch on 32x32
    images, so these defaults are our own choice. Both can be set with `--batch-size` and
@@ -127,30 +127,30 @@ Paths in the last column are inside `reference/`.
 
 | Setting | Value | Our code | Paper | Reference code |
 |---|---|---|---|---|
-| Model sizes | 12 layers; width 192 / 384 / 768; 3 / 6 / 12 heads; MLP 4x width | `common.py` L14-16 | DeiT Table 1, §3; ViT Table 1 | `deit/models.py` L65, L80, L95 |
+| Model sizes | 12 layers; width 192 / 384 / 768; 3 / 6 / 12 heads; MLP 4x width | `common.py` L14-16 | DeiT Table 1, §3; ViT Table 1 | `deit/models.py.txt` L65, L80, L95 |
 | Patch embedding | Linear layer on flattened patches | `model_torch.py` L50, L76-82 | ViT §3.1, Eq. 1 | |
 | Position embedding | Learned | `model_torch.py` L54 | ViT §3.1 | |
 | Block | LayerNorm before attention and before MLP | `model_torch.py` L42-43 | ViT Eq. 2-3 | |
-| Attention scale | 1 / sqrt(head dimension) | `model_torch.py` L25 | ViT Appendix A, Eq. 6 | `timm_0.3.3/vision_transformer.py` L104 |
-| Bias on q, k, v | Yes | `model_torch.py` L18 | Not in the papers | `deit/models.py` L65 |
-| Activation | GELU, exact form | `model_torch.py` L39 | ViT §3.1; DeiT §3 | `timm_0.3.3/vision_transformer.py` L80 |
-| LayerNorm epsilon | 1e-6 | `model_torch.py` L36, L38, L57 | Not in the papers | `deit/models.py` L66 |
-| Pooling | Mean over tokens, after the final LayerNorm | `model_torch.py` L71-72 | ViT Appendix D.3 | `vit_jax/models_vit.py` L206, L289-290 |
+| Attention scale | 1 / sqrt(head dimension) | `model_torch.py` L25 | ViT Appendix A, Eq. 6 | `timm_0.3.3/vision_transformer.py.txt` L104 |
+| Bias on q, k, v | Yes | `model_torch.py` L18 | Not in the papers | `deit/models.py.txt` L65 |
+| Activation | GELU, exact form | `model_torch.py` L39 | ViT §3.1; DeiT §3 | `timm_0.3.3/vision_transformer.py.txt` L80 |
+| LayerNorm epsilon | 1e-6 | `model_torch.py` L36, L38, L57 | Not in the papers | `deit/models.py.txt` L66 |
+| Pooling | Mean over tokens, after the final LayerNorm | `model_torch.py` L71-72 | ViT Appendix D.3 | `vit_jax/models_vit.py.txt` L206, L289-290 |
 | Classifier | One linear layer | `model_torch.py` L58 | DeiT §5.1 | |
-| Optimizer | AdamW | `train_torch.py` L41 | DeiT Table 9 | `deit/main.py` L56 |
-| Adam betas | 0.9 and 0.999 | `train_torch.py` L44 | ViT §4.1 | `deit/main.py` L60 |
-| Adam epsilon | 1e-8 | `train_torch.py` L45 | Not in the papers | `deit/main.py` L58 |
-| Weight decay | 0.05 | `common.py` L55 | DeiT Table 9 | `deit/main.py` L66 |
-| No weight decay on | Biases, LayerNorm, position embedding | `train_torch.py` L39-40 | Not in the papers | `timm_0.3.3/optim_factory.py` L31; `timm_0.3.3/vision_transformer.py` L255-256 |
-| Peak learning rate | 0.0005 x batch size / 512 | `common.py` L54; `train_torch.py` L67 | DeiT Table 9, §6 | `deit/main.py` L71, L350 |
-| Warmup | Linear, 5 epochs | `common.py` L56, L70-71 | DeiT Table 9; ViT §4.1 | `deit/main.py` L86; `timm_0.3.3/cosine_lr.py` L63, L70 |
-| Warmup start | 1e-6 | `common.py` L26 | Not in the papers | `deit/main.py` L79 |
-| Decay | Cosine, towards 1e-5 | `common.py` L27, L72 | DeiT Table 9 (cosine only) | `deit/main.py` L81; `timm_0.3.3/cosine_lr.py` L90 |
-| Learning rate changes | Once per epoch | `train_torch.py` L75 | Not in the papers | `timm_0.3.3/scheduler_factory.py` L35 |
-| Label smoothing | 0.1, spread over all classes | `train_torch.py` L83 | DeiT Table 9, §4 | `deit/main.py` L101, L363; `timm_0.3.3/cross_entropy.py` L18-25 |
-| Normalisation | ImageNet mean and standard deviation | `common.py` L23-24 | Not in the papers | `deit/datasets.py` L108 |
-| Batch order | New random order each epoch, last incomplete batch dropped | `common.py` L42-43 | Not in the papers | `deit/main.py` L233, L241 |
-| Dropout, gradient clipping | None | | DeiT Table 9 | `deit/main.py` L44, L62 |
+| Optimizer | AdamW | `train_torch.py` L41 | DeiT Table 9 | `deit/main.py.txt` L56 |
+| Adam betas | 0.9 and 0.999 | `train_torch.py` L44 | ViT §4.1 | `deit/main.py.txt` L60 |
+| Adam epsilon | 1e-8 | `train_torch.py` L45 | Not in the papers | `deit/main.py.txt` L58 |
+| Weight decay | 0.05 | `common.py` L55 | DeiT Table 9 | `deit/main.py.txt` L66 |
+| No weight decay on | Biases, LayerNorm, position embedding | `train_torch.py` L39-40 | Not in the papers | `timm_0.3.3/optim_factory.py.txt` L31; `timm_0.3.3/vision_transformer.py.txt` L255-256 |
+| Peak learning rate | 0.0005 x batch size / 512 | `common.py` L54; `train_torch.py` L67 | DeiT Table 9, §6 | `deit/main.py.txt` L71, L350 |
+| Warmup | Linear, 5 epochs | `common.py` L56, L70-71 | DeiT Table 9; ViT §4.1 | `deit/main.py.txt` L86; `timm_0.3.3/cosine_lr.py.txt` L63, L70 |
+| Warmup start | 1e-6 | `common.py` L26 | Not in the papers | `deit/main.py.txt` L79 |
+| Decay | Cosine, towards 1e-5 | `common.py` L27, L72 | DeiT Table 9 (cosine only) | `deit/main.py.txt` L81; `timm_0.3.3/cosine_lr.py.txt` L90 |
+| Learning rate changes | Once per epoch | `train_torch.py` L75 | Not in the papers | `timm_0.3.3/scheduler_factory.py.txt` L35 |
+| Label smoothing | 0.1, spread over all classes | `train_torch.py` L83 | DeiT Table 9, §4 | `deit/main.py.txt` L101, L363; `timm_0.3.3/cross_entropy.py.txt` L18-25 |
+| Normalisation | ImageNet mean and standard deviation | `common.py` L23-24 | Not in the papers | `deit/datasets.py.txt` L108 |
+| Batch order | New random order each epoch, last incomplete batch dropped | `common.py` L42-43 | Not in the papers | `deit/main.py.txt` L233, L241 |
+| Dropout, gradient clipping | None | | DeiT Table 9 | `deit/main.py.txt` L44, L62 |
 | Batch size, epochs | 512 and 200 by default, configurable | `common.py` L52-53 | Own choice | |
 
 One wording difference: the DeiT paper (§4) describes label smoothing as 0.9 for the true class
