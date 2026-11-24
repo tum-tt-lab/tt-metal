@@ -1,0 +1,39 @@
+ok    normalisation constants: difference 0.0e+00 (allowed 0e+00)
+ok    model tiny: class scores: difference 2.6e-07 (allowed 1e-05)
+ok    model tiny: gradients: difference 1.1e-06 (allowed 1e-04)
+ok    model small: class scores: difference 4.3e-07 (allowed 1e-05)
+ok    model small: gradients: difference 1.8e-06 (allowed 1e-04)
+ok    model base: class scores: difference 3.6e-07 (allowed 1e-05)
+ok    model base: gradients: difference 1.9e-06 (allowed 1e-04)
+ok    schedule (200 epochs, 5 warmup, batch size 512): difference 0.0e+00 (allowed 1e-12)
+ok    schedule (300 epochs, 5 warmup, batch size 1024): difference 0.0e+00 (allowed 1e-12)
+ok    schedule (4 epochs, 2 warmup, batch size 256): difference 0.0e+00 (allowed 1e-12)
+ok    optimizer: settings of the 151 parameters: difference 0.0e+00 (allowed 0e+00)
+ViT-tiny: 5.38M parameters
+epoch   1  train_loss 4.6321  test_loss 4.6351  test_acc 0.0088  71 img/s
+epoch   2  train_loss 4.5498  test_loss 4.5029  test_acc 0.0312  76 img/s
+  step     10  loss 4.4408  lr 1.30e-04
+epoch   3  train_loss 4.4445  test_loss 4.4615  test_acc 0.0293  77 img/s
+epoch   4  train_loss 4.3943  test_loss 4.4478  test_acc 0.0352  77 img/s
+  step   learning rate   loss ours   loss reference
+     1   1.000e-06       4.636306    4.636306
+     2   1.000e-06       4.642881    4.642881
+     3   1.000e-06       4.629287    4.629287
+     4   1.000e-06       4.620094    4.620094
+     5   1.255e-04       4.635264    4.635264
+     6   1.255e-04       4.517015    4.517015
+     7   1.255e-04       4.531260    4.531260
+     8   1.255e-04       4.515632    4.515632
+     9   1.300e-04       4.463341    4.463341
+    10   1.300e-04       4.440835    4.440835
+    11   1.300e-04       4.451523    4.451523
+    12   1.300e-04       4.422336    4.422335
+    13   4.515e-05       4.360052    4.360052
+    14   4.515e-05       4.426240    4.426241
+    15   4.515e-05       4.384258    4.384258
+    16   4.515e-05       4.406622    4.406621
+ok    training: number of steps: difference 0.0e+00 (allowed 0e+00)
+ok    training: learning rate of every step: difference 8.3e-08 (allowed 1e-06)
+ok    training: loss of every step: difference 9.2e-07 (allowed 1e-05)
+ok    training: final weights: difference 5.9e-07 (allowed 1e-05)
+ALL OK

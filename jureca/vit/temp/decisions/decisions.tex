@@ -1,0 +1,88 @@
+\documentclass[10pt,a4paper]{article}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{longtable,booktabs,array}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+
+\begin{document}
+
+\subsection*{PyTorch reference baseline}
+
+As the reference for our Tenstorrent implementation we train a Vision Transformer from scratch on CIFAR-100~\cite{krizhevsky2009} in plain PyTorch. The baseline is meant to be simple and fully specified, not accurate. The architecture follows ViT~\cite{vit}; what the ViT paper leaves open (the smaller model sizes, the initialisation, which parameters receive weight decay) follows DeiT~\cite{deit} and its implementation in the timm library~\cite{timm}. Appendix~\ref{app:trace} gives the source of every choice.
+
+\paragraph{Model.}
+Each $32\times32$ image is cut into $4\times4$ patches. The resulting 64 tokens are embedded by a linear layer plus a learned position embedding and pass through 12 pre-norm Transformer blocks (\cite{vit}, \S3.1). Instead of a class token we average the output tokens after the final layer normalisation; ViT reports that both variants work similarly well (Appendix~D.3), and 64 tokens are a multiple of the 32-element tiles the hardware computes on~\cite{baselinepdf}. A single linear layer produces the class scores. Weights are drawn from a truncated normal distribution with standard deviation 0.02 and biases start at zero, as in timm. Table~\ref{tab:models} lists the model sizes; Small is the project's baseline and Tiny serves for debugging.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrrr}
+\toprule
+Model & Layers & Width $D$ & Heads & MLP width & Parameters \\
+\midrule
+Tiny  & 12 & 192 &  3 &  768 &  5.4\,M \\
+Small & 12 & 384 &  6 & 1536 & 21.4\,M \\
+Base  & 12 & 768 & 12 & 3072 & 85.2\,M \\
+\bottomrule
+\end{tabular}
+\caption{Model sizes, from DeiT (Tiny, Small) and ViT (Base). Parameter counts are those of our implementation.}
+\label{tab:models}
+\end{table}
+
+\paragraph{Training.}
+The recipe is that of DeiT (\cite{deit}, Table~9): AdamW~\cite{adamw} with weight decay 0.05 on the weight matrices, a peak learning rate of $5\cdot10^{-4}$ with linear warmup over five epochs and cosine decay to zero, and label smoothing of 0.1. Batch size 512 and 200 epochs are taken from the project's baseline document~\cite{baselinepdf}.
+
+\paragraph{Simplifications.}
+We omit DeiT's augmentation and regularisation (RandAugment, Mixup, CutMix, random erasing, stochastic depth) and use no data augmentation at all. The model is therefore expected to overfit. We accept this, because what matters here is that two implementations agree, and without augmentation every batch is determined by the random seed alone. For the comparison, the reference run saves its initial weights and logs the loss of every step, and both implementations take the data order, the hyperparameters and the learning-rate schedule from one shared module. The reference runs in 32-bit floating point, whereas the Tenstorrent runs are planned in BF16~\cite{baselinepdf}, so the two loss curves can agree only approximately.
+
+\appendix
+\section{Where each choice is implemented and where it comes from}
+\label{app:trace}
+
+{\sloppy Code locations refer to the files in \code{jureca/vit/} as of the date of this document (\textbf{c}: \code{common.py}, \textbf{m}: \code{model_torch.py}, \textbf{t}: \code{train_torch.py}). timm paths are relative to \code{python_env/lib/python3.12/site-packages/timm/} (version 1.0.31); \code{vt.py} stands for \code{models/vision_transformer.py}. ``JAX'' is \code{vit_jax/models_vit.py} in the ViT authors' repository~\cite{vitjax}, and ``DeiT code'' is~\cite{deitcode}; both are cited at a fixed commit, so the line numbers are stable. Section and table numbers of papers refer to the arXiv versions.\par}
+
+{\small
+\begin{longtable}{@{}L{3.9cm} L{2.2cm} L{9.6cm}@{}}
+\toprule
+Choice & Code & Source \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+CIFAR-100, 100 fine labels & c L10--11, L32 & \cite{krizhevsky2009}; project document~\cite{baselinepdf} \S1, \S2.2 \\
+Normalisation constants & c L22--23, L31 & Mean and standard deviation of the training set, per channel. DeiT code \code{datasets.py} L9, L82, L108 uses the ImageNet values. \\
+No augmentation & -- & Usual augmentation: \cite{he2016} \S4.2; DeiT code \code{datasets.py} L94--96; \cite{deit} Table~9 \\
+Model sizes & c L13--17 & \cite{deit} Table~1; \cite{vit} Table~1; timm \code{vt.py} L3413, L3449, L3497. MLP width $4D$: \cite{deit} \S3; timm \code{vt.py} L767, L898, L234 \\
+Patch size 4, 64 tokens & c L18--19 & \cite{baselinepdf} \S2.4 \\
+Linear patch embedding & m L50, L76--82 & \cite{vit} \S3.1, Eq.~1. Same operation as the convolution in JAX L263--269 and timm \code{layers/patch_embed.py} L62 \\
+Learned position embedding & m L54, L69 & \cite{vit} \S3.1, Eq.~1, Appendix~D.4 \\
+Average pooling, no class token & m L72 & \cite{vit} Appendix~D.3, Fig.~9; JAX L289--290; \cite{baselinepdf} \S2.4 \\
+Normalisation before pooling & m L71--72 & \cite{vit} Eq.~4; JAX L206, L290. timm differs: \code{vt.py} L839, L1339--1340 \\
+Pre-norm block & m L41--44 & \cite{vit} Eq.~2--3; timm \code{vt.py} L250--251; JAX L138--156 \\
+Self-attention & m L11--28 & \cite{vit} Appendix~A, Eq.~5--8; timm \code{layers/attention.py} L99--139; bias on q, k, v: \code{vt.py} L768 \\
+MLP with GELU & m L39 & \cite{vit} \S3.1; \cite{deit} \S3; timm \code{layers/mlp.py} L40--52 \\
+LayerNorm $\epsilon = 10^{-6}$ & m L36, L38, L57 & timm \code{layers/norm.py} L78 \\
+Linear classifier & m L58 & \cite{deit} \S5.1 \\
+Initialisation & m L60--65 & \cite{deit} \S6; timm \code{vt.py} L1363--1366, L971; JAX L192 (``from BERT''). Classifier set to zero in JAX L303--307 \\
+AdamW, $\beta$, $\epsilon$ & t L55--58 & \cite{deit} Table~9; DeiT code \code{main.py} L56--60; \cite{adamw} Algorithm~2 \\
+Weight decay 0.05 & c L51 & \cite{deit} Table~9; DeiT code \code{main.py} L66 \\
+Parameters without weight decay & t L52--54 & timm \code{optim/_param_groups.py} L53; \code{vt.py} L1001--1003, used at \code{optim/_optim_factory.py} L273 \\
+Peak learning rate & c L50 & \cite{deit} Table~9; DeiT code \code{main.py} L71, L350 \\
+Warmup and cosine decay & c L62--67; t L72--74 & \cite{deit} Table~9; \cite{sgdr} Eq.~5; \cite{goyal2017} \S2.2. DeiT code details: \code{main.py} L79, L81, L432 \\
+Label smoothing 0.1 & t L76 & \cite{szegedy2016} \S7; \cite{deit} Table~9; DeiT code \code{main.py} L101 \\
+Batch size 512, 200 epochs & c L48--49 & \cite{baselinepdf} \S2.6 \\
+Shuffling, last batch dropped & c L36--41 & DeiT code \code{main.py} L233, L236--241 \\
+No dropout, stochastic depth, gradient clipping, weight averaging & -- & DeiT code \code{main.py} L44 (dropout 0), L46 (stochastic depth 0.1), L62 (no clipping), L49--51 (averaging on); \cite{deit} \S6 \\
+Separate seed for batch order & t L64 & No external source \\
+Saved initial weights, per-step log & t L50, L83; c L70--93 & No external source \\
+\end{longtable}
+}
+
+\bibliographystyle{plain}
+\bibliography{decisions}
+\end{document}
