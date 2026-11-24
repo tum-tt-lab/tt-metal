@@ -1,6 +1,6 @@
 # PyTorch reference baseline
 
-As the reference for our Tenstorrent implementation, we train a Vision Transformer from scratch on [CIFAR-100](https://www.cs.toronto.edu/~kriz/learning-features-2009-TR.pdf) in plain PyTorch. The baseline is meant to be simple and fully specified, not accurate. The architecture follows [ViT](https://arxiv.org/abs/2010.11929); what the ViT paper leaves open (the smaller model sizes, the initialization, which parameters receive weight decay) follows [DeiT](https://arxiv.org/abs/2012.12877) and its implementation in the [timm library](https://github.com/huggingface/pytorch-image-models).
+As the reference for our Tenstorrent implementation, we train a Vision Transformer from scratch on CIFAR-100 in plain PyTorch. The baseline is meant to be simple and fully specified, not accurate. The architecture follows [ViT](https://arxiv.org/abs/2010.11929); what the ViT paper leaves open (the smaller model sizes, the initialization, which parameters receive weight decay) follows [DeiT](https://arxiv.org/abs/2012.12877) and its implementation in the [timm library](https://github.com/huggingface/pytorch-image-models).
 
 ## Model
 
@@ -16,9 +16,11 @@ Model sizes, from DeiT (Tiny, Small) and ViT (Base). Parameter counts are those 
 
 ## Training
 
-The recipe is that of DeiT (Table 9)[^table9]: [AdamW](https://arxiv.org/abs/1711.05101) with weight decay 0.05 on the weight matrices, a peak learning rate of $5\cdot10^{-4} \cdot \frac{\text{batchsize}}{512}$ with linear warmup[^warmup] over five epochs and cosine decay towards $10^{-5}$, and label smoothing of 0.1. It uses no dropout or gradient clipping. Adam $\beta_1 = 0.9$ and $\beta_2 = 0.999$ (ViT, under 4.1, Paragraph Training and Fine-tuning). The batch size (default 512) and the number of epochs (default 200) are configurable.
+The recipe is that of DeiT (Table 9)[^table9]: AdamW with weight decay 0.05 on the weight matrices, a peak learning rate of $5\cdot10^{-4} \cdot \frac{\text{batchsize}}{512}$ with linear warmup[^warmup] over five epochs and cosine decay towards $10^{-5}$, and label smoothing of 0.1. It uses no dropout or gradient clipping. Adam $\beta_1 = 0.9$ and $\beta_2 = 0.999$ (ViT, under 4.1, Paragraph Training and Fine-tuning). The batch size (default 512) and the number of epochs (default 200) are configurable.
 
 What neither paper mentions is taken from the DeiT code; `test/REPORT.md` lists these details with their sources.
+
+The ViT paper mentions mean-pooling as a viable alternative to having a CLS token, but mentions that the learning rate then is different. This means, the learning rate from DeiT could be wrong. This can be fixed by having a CLS token, which would make it 65 tokens and thus could mess with the 32x32 tiles of tenstorrent.
 
 ## Simplifications
 
