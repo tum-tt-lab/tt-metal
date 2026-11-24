@@ -1,4 +1,0 @@
-{
-  "arch": "K2HorizonForCausalLM",
-  "main_class": "models.demos.k2_horizon_7b_qb2.tt.generator_vllm:K2HorizonForCausalLM"
-}

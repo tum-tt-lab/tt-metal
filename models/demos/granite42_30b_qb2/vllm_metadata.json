@@ -1,4 +1,0 @@
-{
-  "arch": "GraniteForCausalLM",
-  "main_class": "models.demos.granite42_30b_qb2.tt.generator_vllm:GraniteForCausalLM"
-}
