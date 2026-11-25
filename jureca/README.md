@@ -35,3 +35,4 @@ re-download). Sysroot, uv Python and CPM sources (build trees use them directly)
 **wandb:** compute nodes have no internet, so jobs log with `WANDB_MODE=offline` into their run
 directory (`WANDB_DIR`) and you upload afterwards from a login node: `wandb login` once (key goes to
 `~/.netrc`), then `jureca/wandb_sync.sh` after each job. Already-synced runs are skipped.
+Runs go to the lab team `tum-tt-lab-runs` (`WANDB_ENTITY` in `env.sh`): ask to be invited there first.

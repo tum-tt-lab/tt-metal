@@ -10,7 +10,8 @@
 #   mkdir -p $TT_BASE/logs && sbatch -o $TT_BASE/logs/%x-%j.log tt-train/sources/examples/vit/train_vit.sbatch
 # Smoke test:  ARGS="--max-steps 50 --eval-batches 2" sbatch -t 00:15:00 -o ... <this file>
 # wandb: offline in the job (no internet on compute nodes), upload later from a login node with
-#   jureca/wandb_sync.sh.   Project: WANDB_PROJECT (default ttml-vit), team: WANDB_ENTITY, off: NO_WANDB=1
+#   jureca/wandb_sync.sh.   Project: WANDB_PROJECT (default ttml-vit), off: NO_WANDB=1,
+#   team: WANDB_ENTITY (default tum-tt-lab-runs, set in jureca/env.sh)
 set -eo pipefail
 source jureca/env.sh
 echo "host: $(hostname)  chip: $TT_VISIBLE_DEVICES  args: ${ARGS:-<defaults>}"

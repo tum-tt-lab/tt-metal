@@ -30,6 +30,6 @@ sbatch -t 04:00:00 -o $TT_BASE/logs/%x-%j.log tt-train/sources/examples/vit/trai
 ```
 
 Metrics go to `$TT_BASE/runs/vit-<jobid>/metrics.csv` and to an offline wandb run in the same
-directory (project `ttml-vit`; set `WANDB_PROJECT` / `WANDB_ENTITY` to change it, `NO_WANDB=1` to
+directory (team `tum-tt-lab-runs`, project `ttml-vit`; set `WANDB_PROJECT` / `WANDB_ENTITY` to change it, `NO_WANDB=1` to
 turn it off). Upload with `jureca/wandb_sync.sh` from a login node. `--help` lists the model and
 training flags.
