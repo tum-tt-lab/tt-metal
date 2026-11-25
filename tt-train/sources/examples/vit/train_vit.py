@@ -11,8 +11,9 @@ Example (1 chip, smoke test):
 from __future__ import annotations
 
 import argparse
-import csv
+import dataclasses
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -20,6 +21,7 @@ from pathlib import Path
 import numpy as np
 import ttnn
 import ttml
+from ttml.common.run_logger import RunLogger
 from ttml.common.utils import no_grad, set_seed
 from ttml.models.vit import ViT, ViTConfig, patchify
 
@@ -52,7 +54,20 @@ def parse_args() -> argparse.Namespace:
     o.add_argument("--eval-batches", type=int, default=0, help="> 0 limits eval to N batches")
     o.add_argument("--log-every", type=int, default=20)
     o.add_argument("--metrics", type=Path, default=None, help="CSV file for step/loss/lr/accuracy")
+    o.add_argument("--wandb-project", default=None, help="log to this wandb project (off if unset)")
+    o.add_argument("--wandb-name", default=None, help="wandb run name (default: vit-<slurm job id>)")
     return p.parse_args()
+
+
+METRIC_COLUMNS = [
+    "epoch",
+    "train/loss",
+    "train/loss_device_bf16",
+    "train/lr",
+    "train/img_per_s",
+    "test/loss",
+    "test/acc",
+]
 
 
 def to_device(x_uint8: np.ndarray, y: np.ndarray, config: ViTConfig):
@@ -147,60 +162,64 @@ def main() -> None:
         warmup_steps = int(args.warmup_epochs * steps_per_epoch)
         print(f"{total_steps} steps ({steps_per_epoch}/epoch), batch {args.batch_size}, warmup {warmup_steps}")
 
-        metrics = None
-        if args.metrics:
-            args.metrics.parent.mkdir(parents=True, exist_ok=True)
-            metrics = csv.writer(
-                open(args.metrics, "w", newline="", buffering=1)
-            )  # line-buffered: rows survive a timeout
-            metrics.writerow(["step", "epoch", "lr", "train_loss", "test_loss", "test_acc", "img_per_s"])
+        job_id = os.environ.get("SLURM_JOB_ID")
+        logger = RunLogger(
+            csv_path=args.metrics,
+            columns=METRIC_COLUMNS,
+            wandb_project=args.wandb_project,
+            run_name=args.wandb_name or (f"vit-{job_id}" if job_id else None),
+            config={**vars(args), **{f"model/{k}": v for k, v in dataclasses.asdict(config).items()}},
+            tags=["vit", "cifar10"],
+        )
+        logger.summary(n_params=n_params, total_steps=total_steps)
+        with logger:
+            model.train()
+            step, epoch, last_log_step = 0, 0, 0
+            t0 = time.time()
+            while step < total_steps:
+                perm = rng.permutation(len(x_train))
+                for b in range(steps_per_epoch):
+                    if step >= total_steps:
+                        break
+                    idx = perm[b * args.batch_size : (b + 1) * args.batch_size]
+                    xb = x_train[idx] if args.no_augment else dataset.augment(x_train[idx], rng)
+                    tt_x, tt_y = to_device(xb, y_train[idx], config)
 
-        model.train()
-        step, epoch, last_log_step = 0, 0, 0
-        t0 = time.time()
-        while step < total_steps:
-            perm = rng.permutation(len(x_train))
-            for b in range(steps_per_epoch):
-                if step >= total_steps:
-                    break
-                idx = perm[b * args.batch_size : (b + 1) * args.batch_size]
-                xb = x_train[idx] if args.no_augment else dataset.augment(x_train[idx], rng)
-                tt_x, tt_y = to_device(xb, y_train[idx], config)
+                    lr = lr_at(step, total_steps, warmup_steps, args.lr, args.min_lr_factor)
+                    optimizer.set_lr(lr)
+                    optimizer.zero_grad()
+                    logits = model(tt_x)
+                    loss = ttml.ops.loss.cross_entropy_loss(logits, tt_y, ttml.ops.ReduceType.MEAN)
+                    loss.backward(False)
+                    if args.clip_grad_norm > 0:
+                        ttml.core.clip_grad_norm(params, args.clip_grad_norm, 2.0, False)
+                    optimizer.step()
+                    ctx.reset_graph()
+                    step += 1
 
-                lr = lr_at(step, total_steps, warmup_steps, args.lr, args.min_lr_factor)
-                optimizer.set_lr(lr)
-                optimizer.zero_grad()
-                logits = model(tt_x)
-                loss = ttml.ops.loss.cross_entropy_loss(logits, tt_y, ttml.ops.ReduceType.MEAN)
-                loss.backward(False)
-                if args.clip_grad_norm > 0:
-                    ttml.core.clip_grad_norm(params, args.clip_grad_norm, 2.0, False)
-                optimizer.step()
-                ctx.reset_graph()
-                step += 1
+                    if step % args.log_every == 0 or step == 1:
+                        loss_val = host_cross_entropy(host_logits(logits, config), y_train[idx])
+                        device_loss = float(loss.to_numpy().item())
+                        ips = (step - last_log_step) * args.batch_size / (time.time() - t0) if step > 1 else 0.0
+                        t0, last_log_step = time.time(), step
+                        print(
+                            f"step {step:6d}  epoch {epoch}  lr {lr:.2e}  loss {loss_val:.4f} (device bf16 {device_loss:.4f})  {ips:7.1f} img/s",
+                            flush=True,
+                        )
+                        row = {"train/loss": loss_val, "train/loss_device_bf16": device_loss, "train/lr": lr}
+                        if step > 1:
+                            row["train/img_per_s"] = ips
+                        logger.log({"epoch": epoch, **row}, step=step)
 
-                if step % args.log_every == 0 or step == 1:
-                    loss_val = host_cross_entropy(host_logits(logits, config), y_train[idx])
-                    device_loss = float(loss.to_numpy().item())
-                    ips = (step - last_log_step) * args.batch_size / (time.time() - t0) if step > 1 else 0.0
-                    t0, last_log_step = time.time(), step
+                epoch += 1
+                if epoch % args.eval_every == 0 or step >= total_steps:
+                    test_loss, test_acc = evaluate(model, x_test, y_test, config, args.batch_size, args.eval_batches)
                     print(
-                        f"step {step:6d}  epoch {epoch}  lr {lr:.2e}  loss {loss_val:.4f} (device bf16 {device_loss:.4f})  {ips:7.1f} img/s",
+                        f"== epoch {epoch}  step {step}  test loss {test_loss:.4f}  test acc {test_acc * 100:.2f}%",
                         flush=True,
                     )
-                    if metrics:
-                        metrics.writerow([step, epoch, lr, loss_val, "", "", ips])
-
-            epoch += 1
-            if epoch % args.eval_every == 0 or step >= total_steps:
-                test_loss, test_acc = evaluate(model, x_test, y_test, config, args.batch_size, args.eval_batches)
-                print(
-                    f"== epoch {epoch}  step {step}  test loss {test_loss:.4f}  test acc {test_acc * 100:.2f}%",
-                    flush=True,
-                )
-                if metrics:
-                    metrics.writerow([step, epoch, "", "", test_loss, test_acc, ""])
-                t0, last_log_step = time.time(), step
+                    logger.log({"epoch": epoch, "test/loss": test_loss, "test/acc": test_acc}, step=step)
+                    t0, last_log_step = time.time(), step
     finally:
         ctx.close_device()
 

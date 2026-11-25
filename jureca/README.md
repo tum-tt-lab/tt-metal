@@ -14,6 +14,7 @@ Done when `$TT_BASE/logs/tt-train-test-<id>.log` ends with `ALL TT-TRAIN SMOKE T
 | `build.sbatch` | Compute node: hwloc sysroot, venv, `build_metal.sh --build-tt-train`, lib64/ fix, `ttml` .pth files |
 | `test.sbatch` | Compute node, 1 chip: import, tiny autograd step, `test_gelu.py` |
 | `env.sh` | `source jureca/env.sh` in every job: paths, caches, venv |
+| `wandb_sync.sh` | Login node: upload offline wandb runs from `$TT_BASE/runs/*/wandb/` |
 
 **Your own jobs:** copy the `#SBATCH` header of `test.sbatch`, then `source jureca/env.sh`.
 `--gres=gpu:N` gives you N chips (Slurm sets `TT_VISIBLE_DEVICES`).
@@ -30,3 +31,7 @@ changes need no rebuild.
 re-download). Sysroot, uv Python and CPM sources (build trees use them directly) in `$TT_BASE`
 (default `/p/project1/training2661/$USER`). Several clones can share both. PROJECT has a shared
 3M-file quota for all of training2661: check it with `jutil project dataquota -p training2661`.
+
+**wandb:** compute nodes have no internet, so jobs log with `WANDB_MODE=offline` into their run
+directory (`WANDB_DIR`) and you upload afterwards from a login node: `wandb login` once (key goes to
+`~/.netrc`), then `jureca/wandb_sync.sh` after each job. Already-synced runs are skipped.

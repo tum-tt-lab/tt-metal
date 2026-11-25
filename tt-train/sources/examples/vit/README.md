@@ -7,7 +7,7 @@ Trains a Vision Transformer from scratch on CIFAR-10 with ttml autograd on one d
 | `ttml/models/vit/` (in `sources/ttml/`) | `ViT`, `ViTConfig`, `patchify`, `select_first_token` |
 | `train_vit.py` | training loop: AdamW, warmup + cosine LR, grad clipping, test eval each epoch |
 | `dataset.py` | CIFAR-10 binary loader, crop/flip augmentation; run it directly to download |
-| `train_vit.sbatch` | JURECA eval-ttbh job (1 chip) |
+| `train_vit.sbatch` | JURECA eval-ttbh job (1 chip); logs to CSV and offline wandb |
 
 ## Model
 
@@ -24,9 +24,12 @@ with 4x4 patches. Details (see the module docstring):
 ```bash
 python tt-train/sources/examples/vit/dataset.py      # once, on a login node (compute nodes have no internet)
 # JURECA, from the repo root:
-ARGS="--max-steps 50 --eval-batches 2" TEST=1 sbatch -t 00:20:00 -o $TT_BASE/logs/%x-%j.log \
-    tt-train/sources/examples/vit/train_vit.sbatch          # tests + smoke run
+ARGS="--max-steps 50 --eval-batches 2" sbatch -t 00:15:00 -o $TT_BASE/logs/%x-%j.log \
+    tt-train/sources/examples/vit/train_vit.sbatch          # smoke run
 sbatch -t 04:00:00 -o $TT_BASE/logs/%x-%j.log tt-train/sources/examples/vit/train_vit.sbatch
 ```
 
-Metrics go to `$TT_BASE/runs/vit-<jobid>/metrics.csv`. `--help` lists the model and training flags.
+Metrics go to `$TT_BASE/runs/vit-<jobid>/metrics.csv` and to an offline wandb run in the same
+directory (project `ttml-vit`; set `WANDB_PROJECT` / `WANDB_ENTITY` to change it, `NO_WANDB=1` to
+turn it off). Upload with `jureca/wandb_sync.sh` from a login node. `--help` lists the model and
+training flags.

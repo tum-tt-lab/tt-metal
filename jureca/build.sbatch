@@ -34,7 +34,7 @@ if [ ! -f "$VENV_OK" ]; then
     touch "$VENV_OK"
 fi
 source $PYTHON_ENV_DIR/bin/activate
-uv pip install cmake ninja
+uv pip install cmake ninja wandb
 
 # 3) build
 ./build_metal.sh --toolchain-path $TT_METAL_HOME/jureca/clang-toolchain.cmake \
