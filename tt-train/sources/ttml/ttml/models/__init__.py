@@ -95,6 +95,7 @@ from .nanogpt import NanoGPT, NanoGPTConfig, create_nanogpt
 from .llama import Llama, LlamaConfig
 from .deepseek import DeepSeek, DeepSeekConfig
 from .qwen3 import Qwen3, Qwen3Config
+from .vit import ViT, ViTConfig, create_vit
 
 __all__ = [
     # C++ enums / classes
@@ -119,6 +120,9 @@ __all__ = [
     "NanoGPTConfig",
     "Qwen3",
     "Qwen3Config",
+    "ViT",
+    "ViTConfig",
     "create_linear_regression_model",
     "create_nanogpt",
+    "create_vit",
 ]

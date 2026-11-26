@@ -29,6 +29,9 @@ export PIP_CACHE_DIR=$TT_CACHE/pip
 export HF_HOME=$TT_CACHE/huggingface
 export TORCH_HOME=$TT_CACHE/torch
 export TT_METAL_CACHE=$TT_CACHE/tt-metal-cache
+export WANDB_CACHE_DIR=$TT_CACHE/wandb       # wandb defaults to ~/.cache, ~/.local/share
+export WANDB_DATA_DIR=$TT_CACHE/wandb
+export WANDB_ENTITY=${WANDB_ENTITY:-tum-tt-lab-runs}  # shared lab team on wandb.ai
 # Stays in PROJECT: build trees compile straight from the CPM sources, and venvs link to the uv Python
 # -> a scratch purge would silently break existing builds/venvs.
 export UV_PYTHON_INSTALL_DIR=$TT_BASE/.uv-python
