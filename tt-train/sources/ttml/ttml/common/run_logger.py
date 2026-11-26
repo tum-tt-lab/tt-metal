@@ -41,6 +41,9 @@ class RunLogger:
         run_name: wandb run name; ``None`` lets wandb pick one.
         config: Hyperparameters stored with the wandb run.
         tags: wandb tags.
+        step_metric: A logged key that wandb charts use as their default x-axis instead of the step
+            (e.g. images seen, so runs with different batch sizes line up). Every ``log`` call should
+            contain it.
     """
 
     def __init__(
@@ -51,6 +54,7 @@ class RunLogger:
         run_name: str | None = None,
         config: Mapping[str, Any] | None = None,
         tags: Iterable[str] | None = None,
+        step_metric: str | None = None,
     ) -> None:
         self._csv_file = None
         self._csv = None
@@ -71,6 +75,9 @@ class RunLogger:
             self._wandb_run = wandb.init(
                 project=wandb_project, name=run_name, config=run_config, tags=list(tags) if tags else None
             )
+            if step_metric is not None:
+                self._wandb_run.define_metric(step_metric)
+                self._wandb_run.define_metric("*", step_metric=step_metric)
 
     def log(self, metrics: Mapping[str, Any], step: int) -> None:
         if self._csv is not None:
