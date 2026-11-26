@@ -69,3 +69,10 @@ Throughput (ViT-Tiny, 128 images per chip, JURECA jrc0950, 2026-11-26):
 | 2 | 4850 | 1.9x | ~10 ms |
 | 4 | 9690 | 3.8x | ~10 ms |
 | 8 | 17900 | 7.1x | ~13 ms |
+
+Full run, default hyperparameters (lr 1e-3, 100 epochs): 8 chips (global batch 1024) reach **82.6%**
+test accuracy in 5 min 40 s, vs 81.1% in 36 min on 1 chip (batch 128).
+
+If the job exits with "no N-chip Ethernet line", the assigned chips are not linked that way (e.g. chips
+12-23 contained no 8-chip line); resubmit with more chips in `--gres` or pin known-good `CHIPS`
+(chips 0-7 worked as the line 0,1,2,3,7,6,5,4).
