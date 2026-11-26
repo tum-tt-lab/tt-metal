@@ -91,7 +91,8 @@ def host_cross_entropy(logits: np.ndarray, y: np.ndarray) -> float:
 
 
 def lr_at(step: int, total: int, warmup: int, base: float, min_factor: float) -> float:
-    """Linear warmup, then cosine decay to base * min_factor."""
+    """Linear warmup, then cosine decay to base * min_factor. Warmup is capped at the run length."""
+    warmup = min(warmup, total)
     if step < warmup:
         return base * (step + 1) / warmup
     progress = min(1.0, (step - warmup) / max(1, total - warmup))

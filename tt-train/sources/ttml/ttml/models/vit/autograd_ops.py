@@ -31,3 +31,46 @@ class SelectFirstToken(ttml.autograd.Function):
 def select_first_token(x: ttml.autograd.Tensor) -> ttml.autograd.Tensor:
     """Return token 0 (the [CLS] token) of a (B, H, S, E) tensor, keeping the S dim."""
     return SelectFirstToken.apply(x)
+
+
+class MeanTokens(ttml.autograd.Function):
+    """Weighted sum over the token dim: (B, H, S, E), weights (1, 1, S, E) -> (B, H, 1, E).
+
+    With weights 1/N on the N real rows and 0 on padding rows this is the mean over the real tokens.
+    Forward: sum(x * w, dim=2). Backward: dL/dx = w * dL/dy repeated over S.
+    """
+
+    @staticmethod
+    def forward(ctx, x, weights):
+        value = x.get_value()
+        ctx.weights = weights
+        ctx.seq_len = list(value.shape)[2]
+        return ttnn.sum(ttnn.multiply(value, weights), dim=2, keepdim=True)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return ttnn.multiply(ttnn.repeat(grad_output, [1, 1, ctx.seq_len, 1]), ctx.weights)
+
+
+def mean_tokens(x: ttml.autograd.Tensor, weights: ttnn.Tensor) -> ttml.autograd.Tensor:
+    """Global average pooling over the tokens selected by `weights` (see :class:`MeanTokens`)."""
+    return MeanTokens.apply(x, weights)
+
+
+class Tanh(ttml.autograd.Function):
+    """tanh with autograd. Backward: dL/dx = dL/dy * (1 - y^2)."""
+
+    @staticmethod
+    def forward(ctx, x):
+        y = ttnn.tanh(x.get_value())
+        ctx.y = y
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        one_minus_y2 = ttnn.add(ttnn.neg(ttnn.multiply(ctx.y, ctx.y)), 1.0)
+        return ttnn.multiply(grad_output, one_minus_y2)
+
+
+def tanh(x: ttml.autograd.Tensor) -> ttml.autograd.Tensor:
+    return Tanh.apply(x)
