@@ -9,7 +9,6 @@ Trains a Vision Transformer from scratch on CIFAR-10 with ttml autograd on one d
 | `train_vit.py` | training loop: AdamW, warmup + cosine LR, grad clipping, test eval each epoch, DDP |
 | `dataset.py` | CIFAR-10 binary loader, crop/flip augmentation; run it directly to download |
 | `train_vit.sbatch` | JURECA eval-ttbh job (1 chip, or `NDEV=N` chips); logs to CSV and offline wandb |
-| `jureca/pick_line.py` (repo root) | picks N Ethernet-linked chips among the Slurm-assigned ones |
 
 ## Model
 
@@ -29,7 +28,7 @@ python tt-train/sources/examples/vit/dataset.py      # once, on a login node (co
 ARGS="--max-steps 50 --eval-batches 2" sbatch -t 00:15:00 -o $TT_BASE/logs/%x-%j.log \
     tt-train/sources/examples/vit/train_vit.sbatch          # smoke run
 sbatch -t 04:00:00 -o $TT_BASE/logs/%x-%j.log tt-train/sources/examples/vit/train_vit.sbatch
-NDEV=8 sbatch --gres=gpu:12 -t 00:20:00 -o $TT_BASE/logs/%x-%j.log \
+NDEV=8 sbatch --gres=gpu:8 -t 00:20:00 -o $TT_BASE/logs/%x-%j.log \
     tt-train/sources/examples/vit/train_vit.sbatch          # DDP on 8 chips
 ```
 
@@ -56,10 +55,10 @@ training flags.
 - Learning rate and warmup are **not** rescaled automatically: the global batch grows with N, so
   steps per epoch shrink by N (warmup is in epochs, so it shrinks too). Tune `--lr` for large N.
 
-The fabric needs a mesh graph descriptor matching the chips: the sbatch lets `jureca/pick_line.py`
-choose N chips that form an Ethernet line among the Slurm-assigned ones, writes a 1xN descriptor to the
-run dir and sets `TT_MESH_GRAPH_DESC_PATH`. Ask Slurm for a few spare chips (`--gres=gpu:6` for 4,
-`gpu:12` for 8; consecutive chip ids are not always linked), or pin them with `CHIPS=a,b,...`.
+The fabric needs a mesh graph descriptor: the sbatch writes a 1xN LINE descriptor to the run dir and
+sets `TT_MESH_GRAPH_DESC_PATH`; tt-metal then places that line on the Slurm-assigned chips itself (the
+order of `TT_VISIBLE_DEVICES` does not matter). Request exactly N chips (`--gres=gpu:N`): on an idle
+node Slurm hands out the lowest ids, which form a line (0-3, 0-7 and 0-15 all worked).
 
 Throughput (ViT-Tiny, 128 images per chip, JURECA jrc0950, 2026-11-26):
 
@@ -73,6 +72,6 @@ Throughput (ViT-Tiny, 128 images per chip, JURECA jrc0950, 2026-11-26):
 Full run, default hyperparameters (lr 1e-3, 100 epochs): 8 chips (global batch 1024) reach **82.6%**
 test accuracy in 5 min 40 s, vs 81.1% in 36 min on 1 chip (batch 128).
 
-If the job exits with "no N-chip Ethernet line", the assigned chips are not linked that way (e.g. chips
-12-23 contained no 8-chip line); resubmit with more chips in `--gres` or pin known-good `CHIPS`
-(chips 0-7 worked as the line 0,1,2,3,7,6,5,4).
+On a busy node the free chips may not contain an N-chip line; the job then fails within seconds at
+device open (fabric placement error, e.g. "no PGD grouping ... no embeddable MGD fallback"). Resubmit
+when the node is less busy.
