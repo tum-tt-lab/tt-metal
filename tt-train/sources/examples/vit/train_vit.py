@@ -82,6 +82,7 @@ def parse_args() -> argparse.Namespace:
 
 METRIC_COLUMNS = [
     "epoch",
+    "images_seen",
     "train/loss",
     "train/loss_device_bf16",
     "train/lr",
@@ -306,6 +307,8 @@ def main() -> None:
                 **{f"model/{k}": v for k, v in dataclasses.asdict(config).items()},
             },
             tags=["vit", "cifar10"] + (["ddp", f"{args.num_devices}dev"] if args.num_devices > 1 else []),
+            # x-axis: training images seen; steps are not comparable across device counts (global batch N x 128)
+            step_metric="images_seen",
         )
         logger.summary(n_params=n_params, total_steps=total_steps)
         with logger:
@@ -358,7 +361,7 @@ def main() -> None:
                             row["train/img_per_s"] = ips
                         if devices.n > 1 and step % args.log_every == 0:
                             row["train/grad_sync_ms"] = sync_ms
-                        logger.log({"epoch": epoch, **row}, step=step)
+                        logger.log({"epoch": epoch, "images_seen": step * global_batch, **row}, step=step)
 
                 epoch += 1
                 if epoch % args.eval_every == 0 or step >= total_steps:
@@ -369,7 +372,15 @@ def main() -> None:
                         f"== epoch {epoch}  step {step}  test loss {test_loss:.4f}  test acc {test_acc * 100:.2f}%",
                         flush=True,
                     )
-                    logger.log({"epoch": epoch, "test/loss": test_loss, "test/acc": test_acc}, step=step)
+                    logger.log(
+                        {
+                            "epoch": epoch,
+                            "images_seen": step * global_batch,
+                            "test/loss": test_loss,
+                            "test/acc": test_acc,
+                        },
+                        step=step,
+                    )
                     t0, last_log_step = time.time(), step
     finally:
         if pool is not None:
